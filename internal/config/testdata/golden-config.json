@@ -1,0 +1,177 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "server": "223.5.5.5",
+        "tag": "local",
+        "type": "udp"
+      },
+      {
+        "domain_resolver": "local",
+        "server": "8.8.8.8",
+        "tag": "remote",
+        "tls": {
+          "enabled": true,
+          "server_name": "8.8.8.8"
+        },
+        "type": "https"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": [
+          "geosite-cn"
+        ],
+        "server": "local"
+      }
+    ],
+    "final": "remote",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "password": "p1",
+      "server": "1.1.1.1",
+      "server_port": 443,
+      "tag": "hk-01",
+      "tls": {
+        "enabled": true,
+        "server_name": "1.1.1.1"
+      },
+      "type": "trojan"
+    },
+    {
+      "server": "2.2.2.2",
+      "server_port": 443,
+      "tag": "us-01",
+      "tls": {
+        "enabled": true,
+        "server_name": "2.2.2.2"
+      },
+      "type": "vless",
+      "uuid": "u2"
+    },
+    {
+      "interval": "300s",
+      "outbounds": [
+        "hk-01",
+        "us-01"
+      ],
+      "tag": "Auto",
+      "type": "urltest",
+      "url": "http://www.gstatic.com/generate_204"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "port": [
+          53
+        ],
+        "action": "hijack-dns"
+      },
+      {
+        "action": "sniff"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "geosite-cn"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "geoip-cn"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "geosite-telegram",
+          "geoip-telegram"
+        ],
+        "outbound": "Auto"
+      },
+      {
+        "rule_set": [
+          "geosite-category-ai-!cn"
+        ],
+        "outbound": "Auto"
+      },
+      {
+        "rule_set": [
+          "acl-Netflix"
+        ],
+        "outbound": "Auto"
+      },
+      {
+        "action": "reject"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geosite-cn",
+        "format": "binary",
+        "url": "https://example.com/cn.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-cn",
+        "format": "binary",
+        "url": "https://example.com/geoip-cn.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-telegram",
+        "format": "binary",
+        "url": "https://example.com/tg.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-telegram",
+        "format": "binary",
+        "url": "https://example.com/tgip.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "acl-Netflix",
+        "format": "binary",
+        "url": "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR/Netflix.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-category-ai-!cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ai-!cn.srs"
+      }
+    ],
+    "default_domain_resolver": "local",
+    "auto_detect_interface": true
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090"
+    }
+  }
+}

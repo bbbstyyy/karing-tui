@@ -1,0 +1,16 @@
+[Unit]
+Description=Karing TUI headless sing-box supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/karing _service
+ExecStop=/usr/local/bin/karing stop
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+Environment=KARING_HOME=%h/.local/share/karing-tui
+
+[Install]
+WantedBy=default.target

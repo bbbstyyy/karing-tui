@@ -1,0 +1,27 @@
+# golangci-lint v2；CI 使用当前项目的 Go 工具链从源码安装固定版本。
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - misspell
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - ^sing-box/
+      - ^karing/
+
+formatters:
+  enable:
+    - gofmt

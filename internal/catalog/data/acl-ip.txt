@@ -1,0 +1,36 @@
+# 含 IP 类条件（ip_cidr/ip_is_private）的 ACL4SSR 分类码
+# 由 scripts/gen-catalog.sh 经 sing-box rule-set decompile 逐个判定生成，请勿手工编辑
+# geosite 全量 1899 个实测均不含 IP 条件；geoip 一律含 IP 条件——两者无需清单
+Amazon
+AmazonIp
+Apple
+BanEasyList
+BanEasyListChina
+BanEasyPrivacy
+BanProgramAD
+BilibiliHMT
+ChinaCompanyIp
+ChinaDNS
+ChinaDomain
+ChinaIp
+ChinaIpV6
+ChinaMedia
+Facebook
+Google
+GoogleCNProxyIP
+GoogleFCM
+Iqiyi
+KakaoTalk
+Line
+LocalAreaNetwork
+NaSDDNS
+NetEaseMusic
+Netflix
+NetflixIP
+ProxyLite
+ProxyMedia
+TeamViewer
+Telegram
+Wechat
+Whatsapp
+Youku

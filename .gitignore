@@ -1,0 +1,49 @@
+# Local reference checkouts (not submodules or release inputs)
+/karing/
+/sing-box/
+
+# Local development and release notes
+/AGENTS.md
+/plan.md
+/checklist.md
+/docs/releasing.md
+
+# Local runtime state and generated data
+/var/
+/runtime/
+/cache/
+/logs/
+/backups/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.log.*
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+
+# Local release/build output
+/dist/
+/bin/
+/build/
+/internal/core/embedded/sing-box-*.bin.gz
+
+# Go build/test artifacts
+*.test
+coverage.out
+coverage.html
+
+# OS and editor state
+.DS_Store
+._*
+.idea/
+.vscode/
+/.claude/
+/.codex/
+/.agents/
