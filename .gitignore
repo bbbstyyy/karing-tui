@@ -1,12 +1,14 @@
 # Local reference checkouts (not submodules or release inputs)
 /karing/
 /sing-box/
+/gh-dash/
 
 # Local development and release notes
 /AGENTS.md
 /plan.md
 /checklist.md
 /docs/releasing.md
+/.workbuddy/
 
 # Local runtime state and generated data
 /var/

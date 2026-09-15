@@ -4,12 +4,14 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"github.com/bbbstyyy/karing-tui/internal/validation"
 	"strings"
 	"time"
 
 	"github.com/bbbstyyy/karing-tui/internal/config"
 	"github.com/bbbstyyy/karing-tui/internal/core"
 	"github.com/bbbstyyy/karing-tui/internal/platform"
+	"github.com/bbbstyyy/karing-tui/internal/redact"
 	"github.com/bbbstyyy/karing-tui/internal/storage"
 	"github.com/bbbstyyy/karing-tui/internal/subscription"
 )
@@ -50,6 +52,36 @@ func (m *Manager) AddFromLinks(content string) (int, error) {
 		m.Logf("手动导入 %d 个节点", added)
 	}
 	return added, nil
+}
+
+type LinkResult struct {
+	Index int
+	Name  string
+	Err   error
+}
+
+// AddFromLinksDetailed accounts for every supplied link, including parse and
+// persistence failures. Raw links (which contain credentials) stay out of results.
+func (m *Manager) AddFromLinksDetailed(content string) []LinkResult {
+	links := strings.Fields(content)
+	results := make([]LinkResult, 0, len(links))
+	for i, link := range links {
+		res := LinkResult{Index: i + 1}
+		nodes, err := subscription.ParseContent(link)
+		if err == nil && len(nodes) != 1 {
+			err = fmt.Errorf("每项应包含一条有效分享链接")
+		}
+		if err == nil {
+			n := nodes[0]
+			n.SubscriptionID = config.ManualSubscriptionID
+			n.Enabled = true
+			res.Name = n.Name
+			err = m.DB.CreateNode(n)
+		}
+		res.Err = redact.Error(err)
+		results = append(results, res)
+	}
+	return results
 }
 
 // SaveManual 保存手动节点（表单录入/编辑）。ID 为 0 新建，否则更新。
@@ -96,30 +128,33 @@ func validateManualProtocol(n *config.Node) error {
 	}
 	switch n.Protocol {
 	case "shadowsocks":
-		if str("method") == "" || str("password") == "" {
-			return fmt.Errorf("shadowsocks 节点缺少加密方法或密码")
+		if str("method") == "" {
+			return validation.New("method", "shadowsocks 节点缺少加密方法")
+		}
+		if str("password") == "" {
+			return validation.New("cred", "shadowsocks 节点缺少密码")
 		}
 	case "vmess", "vless":
 		if str("uuid") == "" {
-			return fmt.Errorf("%s 节点缺少 UUID", n.Protocol)
+			return validation.New("cred", "%s 节点缺少 UUID", n.Protocol)
 		}
 	case "trojan", "hysteria2", "anytls", "shadowtls":
 		if str("password") == "" {
-			return fmt.Errorf("%s 节点缺少密码", n.Protocol)
+			return validation.New("cred", "%s 节点缺少密码", n.Protocol)
 		}
 	case "tuic":
 		if str("uuid") == "" {
-			return fmt.Errorf("tuic 节点缺少 UUID")
+			return validation.New("uuid", "tuic 节点缺少 UUID")
 		}
 	case "ssh":
 		if str("user") == "" && str("username") == "" {
-			return fmt.Errorf("ssh 节点缺少用户名")
+			return validation.New("user", "ssh 节点缺少用户名")
 		}
 	case "socks", "socks5", "http", "hysteria", "naive":
 	case "tor":
-		return fmt.Errorf("tor 节点不支持手动录入")
+		return validation.New("protocol", "tor 节点不支持手动录入")
 	default:
-		return fmt.Errorf("协议 %q 不支持手动录入", n.Protocol)
+		return validation.New("protocol", "协议 %q 不支持手动录入", n.Protocol)
 	}
 	return nil
 }
@@ -158,15 +193,36 @@ func (m *Manager) SetEnabled(id int64, enabled bool) error {
 // TestLatency 批量测速并写回数据库；返回 节点ID→延迟毫秒（失败为 -1）。
 // url 为空用默认测速地址；timeoutMS 为单节点超时（为 0 用 3000）。
 func (m *Manager) TestLatency(ctx context.Context, ids []int64, url string, timeoutMS int) (map[int64]int64, error) {
+	return m.TestLatencyProgress(ctx, ids, url, timeoutMS, nil)
+}
+
+type NodeTestResult struct {
+	ID        int64
+	Name      string
+	LatencyMS int64
+	Err       error
+}
+
+// TestLatencyProgress reports each attempted node while the batch is running.
+// The callback can run concurrently and must not mutate a TUI model.
+func (m *Manager) TestLatencyProgress(ctx context.Context, ids []int64, url string, timeoutMS int, report func(NodeTestResult)) (map[int64]int64, error) {
 	nodes := make([]*config.Node, 0, len(ids))
+	seen := map[int64]bool{}
 	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
 		n, err := m.DB.GetNode(id)
 		if err != nil {
+			if report != nil {
+				report(NodeTestResult{ID: id, Name: fmt.Sprintf("节点 %d", id), LatencyMS: -1, Err: err})
+			}
 			continue
 		}
 		nodes = append(nodes, n)
 	}
-	results, err := m.testNodes(ctx, nodes, url, timeoutMS)
+	results, err := m.testNodes(ctx, nodes, url, timeoutMS, report)
 	if err != nil {
 		return nil, err
 	}

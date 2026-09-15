@@ -1,10 +1,12 @@
 package pages
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -12,7 +14,6 @@ import (
 	"github.com/bbbstyyy/karing-tui/internal/config"
 	"github.com/bbbstyyy/karing-tui/internal/headless"
 	"github.com/bbbstyyy/karing-tui/internal/tui/components"
-	"github.com/bbbstyyy/karing-tui/internal/tui/styles"
 )
 
 // SettingsPage 展示并编辑应用设置，并提供备份导出/导入。
@@ -25,24 +26,30 @@ type SettingsPage struct {
 	importForm components.Form
 	importMode bool
 	importPath string
+	prepared   *application.PreparedRestore
 	confirm    components.Confirm
 	restoring  bool
 	busy       bool
 	status     string
 	err        error
+	section    int
+	list       components.SimpleList
 }
 
 // NewSettings 创建 Settings 页。
 func NewSettings(app *application.App) *SettingsPage {
 	p := &SettingsPage{base: base{app: app}}
 	p.form = newSettingsForm()
+	configureSettingsForm(&p.form)
 	return p
 }
 
-func (s *SettingsPage) Title() string { return "Settings" }
+func (s *SettingsPage) Title() string { return "设置" }
 
 // Editing 处于表单编辑状态时拦截全局键位。
-func (s *SettingsPage) Editing() bool { return s.editing }
+func (s *SettingsPage) Editing() bool {
+	return s.detailActive || s.editing || s.importMode || s.confirm.Active || s.restoring
+}
 
 func (s *SettingsPage) Init() tea.Cmd { return nil }
 
@@ -80,26 +87,61 @@ func (s *SettingsPage) loadForm() {
 }
 
 func (s *SettingsPage) Update(msg tea.Msg) (Page, tea.Cmd) {
+	if !s.Editing() {
+		if handled, cmd := s.handleRetry(msg); handled {
+			return s, cmd
+		}
+	}
+	if s.detailActive || !s.Editing() {
+		if s.handleDetails(msg, s.err) {
+			return s, nil
+		}
+	}
 	if msg, ok := msg.(tea.WindowSizeMsg); ok {
 		s.SetSize(msg.Width, msg.Height)
 		return s, nil
 	}
 	switch msg := msg.(type) {
+	case ActivateMsg:
+		s.reloadSettings()
+		return s, nil
 	case components.ConfirmMsg:
 		return s.onConfirm(msg)
 	case actionDoneMsg:
+		if !s.accept(msg) {
+			if msg.Restore != nil {
+				_ = msg.Restore.Close()
+			}
+			return s, nil
+		}
 		s.busy = false
-		switch {
-		case msg.Err != nil:
-			s.err, s.status = msg.Err, ""
-		case msg.Action == "backup":
-			s.err = nil
+		s.restoring = false
+		s.err = msg.Err
+		if msg.Err != nil {
+			s.status = ""
+			return s, nil
+		}
+		switch msg.Action {
+		case "restore":
+			s.status = "备份已恢复，请重新启动 karing"
+			return s, tea.Quit
+		case "backup":
 			s.status = "备份已导出: " + msg.Data
+		case "restore-preflight":
+			s.prepared = msg.Restore
+			s.confirm = components.NewConfirm("restore-backup", fmt.Sprintf("预检通过：%d 个订阅，%d 个节点。用 %s 覆盖当前全部数据？确认后停止核心并恢复，应用会退出，请重新启动。", s.prepared.Subscriptions, s.prepared.Nodes, s.importPath))
 		}
 		return s, nil
 	}
+
 	key, ok := msg.(tea.KeyMsg)
 	if !ok {
+		if s.importMode {
+			return s, s.importForm.Update(msg)
+		}
+		if s.editing {
+			return s, s.form.Update(msg)
+		}
 		return s, nil
 	}
 
@@ -114,39 +156,56 @@ func (s *SettingsPage) Update(msg tea.Msg) (Page, tea.Cmd) {
 		return s, nil
 	}
 	if s.importMode {
-		switch key.String() {
-		case "esc":
+		action, cmd := s.importForm.Handle(msg)
+		switch action {
+		case "cancel":
 			s.importMode = false
 			s.err = nil
-			return s, nil
-		case "enter":
-			s.submitImportPath()
-			return s, nil
+		case "save":
+			return s, s.submitImportPath()
 		}
-		s.importForm.Update(msg)
-		return s, nil
+		return s, cmd
 	}
 	if s.editing {
-		switch key.String() {
-		case "esc":
+		action, cmd := s.form.Handle(msg)
+		switch action {
+		case "cancel":
 			s.editing = false
 			s.err = nil
-			return s, nil
-		case "enter":
+		case "save":
 			s.submit()
-			return s, nil
 		}
-		s.form.Update(msg)
-		return s, nil
+		return s, cmd
+	}
+	if consumed, cmd := s.list.Update(msg); consumed {
+		return s, cmd
 	}
 
 	switch key.String() {
-	case "e":
-		// Reset 清空并把焦点移回第一个字段，再填入当前值（避免沿用上次编辑的焦点位置）
-		s.form.Reset()
-		s.loadForm()
-		s.editing = true
-		s.status, s.err = "", nil
+	case "e", "enter":
+		selected := s.list.SelectedKey()
+		if selected == "backup" {
+			return s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+		}
+		if selected == "restore" {
+			return s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+		}
+		if selected == "paths" {
+			s.openDetails("数据目录", s.settingsPreview())
+			return s, nil
+		}
+		s.editSetting(selected)
+	case "E":
+		s.editSetting("")
+	case "alt+enter":
+		s.openDetails("设置详情", s.settingsPreview())
+	case "[", "]":
+		delta := 1
+		if key.String() == "[" {
+			delta = -1
+		}
+		s.section = (s.section + delta + len(settingGroups)) % len(settingGroups)
+		s.reloadSettings()
 	case "b":
 		if !s.busy {
 			s.busy = true
@@ -165,66 +224,84 @@ func (s *SettingsPage) Update(msg tea.Msg) (Page, tea.Cmd) {
 		s.importMode = true
 		s.status, s.err = "", nil
 	case "r":
-		s.status, s.err = "", nil
+		s.reloadSettings()
 	}
 	return s, nil
 }
 
 // submitImportPath 校验路径并弹出确认。
-func (s *SettingsPage) submitImportPath() {
+func (s *SettingsPage) submitImportPath() tea.Cmd {
 	path := strings.TrimSpace(s.importForm.ValueByKey("path"))
 	if path == "" {
 		s.err = fmt.Errorf("请填写备份文件路径")
-		return
+		return nil
+	}
+	if s.busy {
+		s.err = fmt.Errorf("请等待当前备份任务完成")
+		return nil
 	}
 	if _, err := os.Stat(path); err != nil {
-		s.err = fmt.Errorf("备份文件不存在: %s", path)
-		return
+		s.err = fmt.Errorf("备份文件不可读: %w", err)
+		return nil
 	}
 	s.importPath = path
 	s.importMode = false
-	s.err = nil
-	s.confirm = components.NewConfirm("restore-backup",
-		fmt.Sprintf("用 %s 恢复将覆盖当前全部数据，恢复后应用会退出（请重新启动）。确认？", path))
+	s.busy = true
+	s.status, s.err = "正在预检归档、数据库与迁移…", nil
+	s.retryTask = func() tea.Cmd { s.importForm.SetValueByKey("path", path); return s.submitImportPath() }
+	return s.task("备份预检", func() tea.Msg {
+		prepared, err := application.PrepareRestore(s.app.Paths, path)
+		return actionDoneMsg{Action: "restore-preflight", Restore: prepared, Err: err}
+	})
 }
 
-// onConfirm 处理恢复确认。
 func (s *SettingsPage) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 	s.confirm.Active = false
-	if !msg.Confirmed || msg.ID != "restore-backup" {
+	if msg.ID != "restore-backup" {
 		return s, nil
 	}
-	serviceLock, err := headless.Acquire(s.app.Paths)
-	if err != nil {
-		s.err = fmt.Errorf("无法恢复: %w（请先停止 headless 服务）", err)
+	prepared := s.prepared
+	s.prepared = nil
+	if prepared == nil {
+		s.err = fmt.Errorf("备份预检结果已失效，请重新选择备份")
 		return s, nil
 	}
-	defer serviceLock.Close()
-	// 停核心 → 关闭数据库 → 恢复文件 → 退出（重启后生效）
-	_ = s.app.StopCore()
-	_ = s.app.DB.Close()
-	if err := application.RestoreArchive(s.app.Paths, s.importPath); err != nil {
-		restoreErr := err
-		if reopenErr := s.app.ReopenDB(); reopenErr != nil {
-			err = fmt.Errorf("%v；重新打开数据库失败: %w", restoreErr, reopenErr)
+	if !msg.Confirmed {
+		_ = prepared.Close()
+		s.status = "已取消恢复，当前数据和核心保持不变"
+		return s, nil
+	}
+	s.restoring, s.busy = true, true
+	return s, s.startTask("备份恢复", 0, false, func(func(itemResult)) tea.Msg {
+		defer prepared.Close()
+		serviceLock, err := headless.Acquire(s.app.Paths)
+		if err != nil {
+			return actionDoneMsg{Action: "restore", Err: fmt.Errorf("无法恢复: %w（请先停止 headless 服务）", err)}
 		}
-		s.err = err
-		s.restoring = false
-		s.app.AppLog.AppendLine("备份恢复失败: " + err.Error())
-		return s, nil
-	}
-	s.restoring = true
-	s.status = "备份已恢复，应用即将退出，请重新启动 karing"
-	s.app.AppLog.AppendLine("备份已恢复: " + s.importPath + "，应用退出")
-	return s, tea.Quit
+		defer serviceLock.Close()
+		ctx, cancel := context.WithTimeout(s.app.BackgroundContext(), 30*time.Second)
+		defer cancel()
+		err = s.app.RestorePrepared(ctx, prepared)
+		if err != nil {
+			s.app.AppLog.AppendLine("备份恢复失败: " + err.Error())
+		}
+		return actionDoneMsg{Action: "restore", Err: err}
+	})
 }
 
 // exportBackup 异步导出备份。
 func (s *SettingsPage) exportBackup() tea.Cmd {
-	return func() tea.Msg {
+	s.busy = true
+	s.retryTask = s.exportBackup
+	return s.taskN("备份导出", 1, func(report func(itemResult)) tea.Msg {
 		dest, err := s.app.Backup("")
-		return actionDoneMsg{Action: "backup", Data: dest, Err: err}
-	}
+		result := itemResult{Name: "当前配置与数据库", State: "成功", Detail: dest}
+		if err != nil {
+			result.State, result.Detail = "失败", err.Error()
+		}
+		report(result)
+		return actionDoneMsg{Action: "backup", Data: dest, Err: err, Results: []itemResult{result}}
+	})
 }
 
 // submit 解析表单并保存设置。
@@ -286,7 +363,8 @@ func (s *SettingsPage) submit() {
 	s.app.Bin.SetProxy(set.DownloadProxy)
 	s.editing = false
 	s.err = nil
-	s.status = "设置已保存；端口/日志级别等需重新生成配置（g）并重启（r）生效，自动更新间隔需重启应用生效"
+	s.app.MarkConfigDirty()
+	s.status = "设置已保存；Ctrl+A 应用核心配置。自动更新间隔需重启应用生效。"
 }
 
 func validLogLevel(l string) bool {
@@ -298,69 +376,18 @@ func validLogLevel(l string) bool {
 }
 
 func (s *SettingsPage) View() string {
+	if s.detailActive {
+		return s.detailsView()
+	}
 	if s.confirm.Active {
-		return s.confirm.View()
+		return s.confirmView(&s.confirm)
 	}
 	if s.importMode {
-		view := s.importForm.View()
-		if s.err != nil {
-			view += "\n" + styles.Err.Render(s.err.Error())
-		}
-		return view
+		return s.formView(&s.importForm, s.err)
 	}
 	if s.editing {
-		view := s.form.View()
-		if s.err != nil {
-			view += "\n" + styles.Err.Render(s.err.Error())
-		}
-		return view
+		return s.formView(&s.form, s.err)
 	}
 
-	set := s.app.GetSettings()
-	allowLAN := "关闭"
-	if set.AllowLAN {
-		allowLAN = "开启"
-	}
-	dlProxy := set.DownloadProxy
-	if dlProxy == "" {
-		dlProxy = "直连"
-	}
-	clashAPI := "关闭"
-	if set.ClashAPIPort > 0 {
-		clashAPI = fmt.Sprintf("127.0.0.1:%d", set.ClashAPIPort)
-		if set.ClashAPISecret != "" {
-			clashAPI += "（已设密钥）"
-		}
-	}
-	autoUpdate := "关闭"
-	if set.AutoUpdateMinutes > 0 {
-		autoUpdate = fmt.Sprintf("%d 分钟", set.AutoUpdateMinutes)
-	}
-	privateDirect := "关闭"
-	if set.PrivateDirect {
-		privateDirect = "开启"
-	}
-	resolveIPRules := "关闭（IP 规则仅对 IP 目标生效）"
-	if set.ResolveIPRules {
-		resolveIPRules = "开启（代理侧收到 IP 而非域名）"
-	}
-
-	body := fmt.Sprintf(
-		"mixed 监听端口:  %d\n允许局域网:      %s\nClash API:       %s\n下载代理:        %s\n核心日志级别:    %s\n订阅自动更新:    %s\n"+
-			"内网直连:        %s\nIP 规则解析域名: %s\n\n"+
-			"数据库:          %s\n运行时目录:      %s\n缓存目录:        %s\n日志目录:        %s\nsing-box 路径:   %s\n",
-		set.MixedPort, allowLAN, clashAPI, dlProxy, set.LogLevel, autoUpdate,
-		privateDirect, resolveIPRules,
-		s.app.Paths.DB, s.app.Paths.Runtime, s.app.Paths.Cache, s.app.Paths.Logs, s.app.Paths.CoreBin,
-	)
-
-	foot := "\ne 编辑 · b 导出备份 · i 导入恢复 · r 清除提示"
-	if s.restoring {
-		foot = "\n" + styles.Ok.Render(s.status)
-	} else if s.err != nil {
-		foot = "\n" + styles.Err.Render(s.err.Error()) + foot
-	} else if s.status != "" {
-		foot = "\n" + styles.Ok.Render(s.status) + foot
-	}
-	return styles.Title.Render("设置") + "\n" + body + styles.Dim.Render(foot)
+	return s.settingsView()
 }

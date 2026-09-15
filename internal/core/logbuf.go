@@ -1,6 +1,7 @@
 package core
 
 import (
+	"github.com/bbbstyyy/karing-tui/internal/redact"
 	"strings"
 	"sync"
 )
@@ -33,6 +34,7 @@ func (b *LogBuf) Write(p []byte) (int, error) {
 
 // AppendLine 追加一行日志。
 func (b *LogBuf) AppendLine(line string) {
+	line = redact.Text(line)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if len(b.lines) >= b.max {
@@ -40,6 +42,14 @@ func (b *LogBuf) AppendLine(line string) {
 		b.drop++
 	}
 	b.lines = append(b.lines, line)
+}
+
+// Snapshot returns absolute line identities and content under the same lock.
+// Anchors remain stable when new lines arrive or the ring buffer wraps.
+func (b *LogBuf) Snapshot() (first int, lines []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.drop, append([]string(nil), b.lines...)
 }
 
 // Tail 返回最近 n 行日志；n <= 0 表示全部。

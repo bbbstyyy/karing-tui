@@ -14,7 +14,7 @@ import (
 	"github.com/bbbstyyy/karing-tui/internal/catalog"
 	"github.com/bbbstyyy/karing-tui/internal/config"
 	"github.com/bbbstyyy/karing-tui/internal/tui/components"
-	"github.com/bbbstyyy/karing-tui/internal/tui/styles"
+	"github.com/bbbstyyy/karing-tui/internal/validation"
 )
 
 // rulesMode Rules 页的视图模式。
@@ -33,11 +33,16 @@ const (
 // 内置分类库浏览与挑选。
 type Rules struct {
 	base
-	mode   rulesMode
-	groups []*config.RoutingGroup
-	cur    *config.RoutingGroup
-	sets   []*config.RuleSet
-	list   components.SimpleList
+	mode            rulesMode
+	groups          []*config.RoutingGroup
+	cur             *config.RoutingGroup
+	sets            []*config.RuleSet
+	list            components.SimpleList
+	groupList       components.SimpleList
+	setList         components.SimpleList
+	catalogBackList components.SimpleList
+	catBefore       string
+	catBeforeList   components.SimpleList
 
 	// 内置分类库浏览态
 	catKind   string          // 当前种类（geosite/geoip/acl）
@@ -51,6 +56,7 @@ type Rules struct {
 	catRefsInUse []catalog.Ref
 
 	form     components.Form
+	logical  *logicalEditor
 	formKind string // add-rg / edit-rg / add-rule / edit-rule / add-rs
 	editID   int64  // edit-rg / edit-rs 目标 ID
 	editRule int    // edit-rule 的规则下标
@@ -69,14 +75,26 @@ func NewRules(app *application.App) *Rules {
 	return &Rules{base: base{app: app}}
 }
 
-func (r *Rules) Title() string { return "Rules" }
+func (r *Rules) Title() string { return "分流规则" }
 
 // Editing 表单输入与分类库搜索输入状态时拦截全局键位。
-func (r *Rules) Editing() bool { return r.mode == rulesForm || (r.mode == rulesCatalog && r.catTyping) }
+func (r *Rules) Editing() bool {
+	return r.detailActive || r.mode == rulesForm || r.mode == rulesConfirm || (r.mode == rulesCatalog && r.catTyping)
+}
 
 func (r *Rules) Init() tea.Cmd { return nil }
 
 func (r *Rules) Update(msg tea.Msg) (Page, tea.Cmd) {
+	if !r.Editing() {
+		if handled, cmd := r.handleRetry(msg); handled {
+			return r, cmd
+		}
+	}
+	if r.detailActive || !r.Editing() {
+		if r.handleDetails(msg, r.err) {
+			return r, nil
+		}
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		r.SetSize(msg.Width, msg.Height)
@@ -85,6 +103,9 @@ func (r *Rules) Update(msg tea.Msg) (Page, tea.Cmd) {
 		r.reload()
 		return r, nil
 	case actionDoneMsg:
+		if !r.accept(msg) {
+			return r, nil
+		}
 		r.busy = false
 		if msg.Err != nil {
 			r.err = msg.Err
@@ -93,7 +114,7 @@ func (r *Rules) Update(msg tea.Msg) (Page, tea.Cmd) {
 			r.err = nil
 			switch msg.Action {
 			case "download-rulesets":
-				r.status = "规则集下载完成"
+				r.status = "规则集下载：" + resultSummary(msg.Results) + " · v 详情"
 			case "download-catalog":
 				r.status = msg.Data + " 已缓存"
 			}
@@ -109,23 +130,56 @@ func (r *Rules) Update(msg tea.Msg) (Page, tea.Cmd) {
 	case tea.KeyMsg:
 		return r.handleKey(msg)
 	}
+	if r.mode == rulesForm {
+		return r, r.form.Update(msg)
+	}
 	return r, nil
 }
 
 func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
-	key := msg.String()
+	key := commandKey(r, msg)
+	if !r.Editing() && key == "r" {
+		r.reload()
+		return r, nil
+	}
+	if (key == "[" || key == "]") && (r.mode == rulesGroups || r.mode == rulesSets) {
+		if r.mode == rulesGroups {
+			r.groupList = r.list
+			r.list = r.setList
+			r.mode = rulesSets
+		} else {
+			r.setList = r.list
+			r.list = r.groupList
+			r.mode = rulesGroups
+		}
+		r.reload()
+		return r, nil
+	}
 	switch r.mode {
 	case rulesForm:
-		switch key {
-		case "esc":
-			r.mode = r.formBackMode()
-			return r, nil
-		case "enter":
-			r.submitForm()
-			return r, nil
+		if r.logical != nil {
+			action, cmd := r.logical.update(msg)
+			if action == "save" {
+				r.form.SetValueByKey("value", r.logical.value())
+				r.logical = nil
+				r.err = nil
+			}
+			if action == "cancel" {
+				r.logical = nil
+			}
+			return r, cmd
 		}
-		r.form.Update(msg)
-		return r, nil
+		action, cmd := r.form.Handle(msg)
+		configureRuleValue(r.app, &r.form)
+		switch action {
+		case "conditions":
+			r.logical = newLogicalEditor(r.app, r.form.ValueByKey("value"))
+		case "cancel":
+			r.mode = r.formBackMode()
+		case "save":
+			r.submitForm()
+		}
+		return r, cmd
 
 	case rulesConfirm:
 		if consumed, cmd := r.confirm.Update(msg); consumed {
@@ -141,8 +195,15 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 			return r, cmd
 		}
 		switch key {
-		case "esc":
+		case "enter", "alt+enter":
+			if rs, ok := r.selectedSet(); ok {
+				r.openDetails("规则集详情", fmt.Sprintf("名称: %s\nTag: %s\n格式: %s\nURL: %s\n启用: %v", rs.Name, rs.Tag, rs.Format, rs.URL, rs.Enabled))
+			} else if ref, ok := r.selectedSetCatalog(); ok {
+				r.openDetails("内置分类详情", fmt.Sprintf("分类: %s\nTag: %s", ref.String(), ref.Tag()))
+			}
+		case "esc", "[":
 			r.mode = rulesGroups
+			r.list = r.groupList
 			r.reload()
 		case "a":
 			r.openForm("add-rs")
@@ -166,9 +227,7 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 			if !r.busy {
 				ids := make([]int64, 0, len(r.sets))
 				for _, rs := range r.sets {
-					if rs.Enabled {
-						ids = append(ids, rs.ID)
-					}
+					ids = append(ids, rs.ID)
 				}
 				return r, r.downloadAll(ids)
 			}
@@ -176,6 +235,8 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 			if rs, ok := r.selectedSet(); ok {
 				if err := r.app.Rules.SetEnabled(rs.ID, !rs.Enabled); err != nil {
 					r.err = err
+				} else {
+					r.app.MarkConfigDirty()
 				}
 				r.reload()
 			}
@@ -183,12 +244,19 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 		return r, nil
 
 	case rulesGroupRl:
+		if key == "enter" || key == "alt+enter" {
+			if idx, ok := r.selectedRuleIdx(); ok {
+				r.openDetails("规则详情", ruleDetails(r.cur.Rules[idx]))
+			}
+			return r, nil
+		}
 		if consumed, cmd := r.list.Update(msg); consumed {
 			return r, cmd
 		}
 		switch key {
 		case "esc":
 			r.mode = rulesGroups
+			r.list = r.groupList
 			r.reload()
 		case "a":
 			r.openForm("add-rule")
@@ -198,17 +266,12 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 			if idx, ok := r.selectedRuleIdx(); ok {
 				r.openFormEditRule(idx)
 			}
-		case "D":
+		case "D", "d":
 			if idx, ok := r.selectedRuleIdx(); ok {
-				r.cur.Rules = append(r.cur.Rules[:idx], r.cur.Rules[idx+1:]...)
-				if err := r.app.Rout.UpdateGroup(r.cur, r.cur.Rules); err != nil {
-					r.err = err
-					r.reloadGroupRules()
-				} else {
-					r.err = nil
-					r.status = "规则已删除"
-					r.reloadGroupRules()
-				}
+				rule := r.cur.Rules[idx]
+				r.confirm = components.NewConfirm("delete-rule", fmt.Sprintf("从分流组 %q 删除规则 %s = %s？", r.cur.Name, rule.Type, rule.Value))
+				r.confirmID, r.confirmKind = rule.ID, "delete-rule"
+				r.mode = rulesConfirm
 			}
 		case " ":
 			if idx, ok := r.selectedRuleIdx(); ok {
@@ -217,6 +280,7 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 					r.err = err
 				} else {
 					r.err = nil
+					r.app.MarkConfigDirty()
 				}
 				r.reloadGroupRules()
 			}
@@ -230,11 +294,8 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 					r.err = err
 				} else {
 					r.err = nil
-					// 移动后光标跟随
-					nxt := idx + delta
-					if nxt >= 0 && nxt < len(r.cur.Rules) {
-						r.list.Cursor = nxt
-					}
+					r.app.MarkConfigDirty()
+					r.status = "规则顺序已保存，光标保持在同一规则"
 				}
 				r.reloadGroupRules()
 			}
@@ -246,6 +307,10 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 			return r, cmd
 		}
 		switch key {
+		case "alt+enter":
+			if group, ok := r.selectedGroup(); ok {
+				r.openDetails("分流组详情", fmt.Sprintf("名称: %s\n目标: %s\n规则: %d 条\n启用: %v", group.Name, group.Target, len(group.Rules), group.Enabled))
+			}
 		case "a":
 			r.openForm("add-rg")
 		case "e":
@@ -261,6 +326,8 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 			}
 		case "enter":
 			if g, ok := r.selectedGroup(); ok {
+				r.groupList = r.list
+				r.list = components.SimpleList{}
 				r.cur = g
 				r.mode = rulesGroupRl
 				r.reloadGroupRules()
@@ -269,10 +336,14 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 			if g, ok := r.selectedGroup(); ok {
 				if err := r.app.Rout.SetEnabled(g.ID, !g.Enabled); err != nil {
 					r.err = err
+				} else {
+					r.app.MarkConfigDirty()
 				}
 				r.reload()
 			}
-		case "R":
+		case "]":
+			r.groupList = r.list
+			r.list = components.SimpleList{}
 			r.mode = rulesSets
 			r.reload()
 		case "r":
@@ -290,14 +361,37 @@ func (r *Rules) reload() {
 		return
 	}
 	groups, err := r.app.DB.ListRoutingGroups()
-	r.groups, r.err = groups, err
+	r.groups = groups
+	if err != nil {
+		r.err = err
+	}
 	sets, err := r.app.DB.ListRuleSets()
 	if err == nil {
 		r.sets = sets
 	}
-	if r.mode == rulesSets {
+	viewMode := r.mode
+	if viewMode == rulesForm {
+		viewMode = r.formBackMode()
+	}
+	if viewMode == rulesConfirm {
+		switch r.confirmKind {
+		case "delete-rule":
+			viewMode = rulesGroupRl
+		case "delete-rs":
+			viewMode = rulesSets
+		default:
+			viewMode = rulesGroups
+		}
+	}
+	if viewMode == rulesGroupRl {
+		r.reloadGroupRules()
+		return
+	}
+	selected := r.list.SelectedKey()
+	if viewMode == rulesSets {
 		r.list.Height = 0
 		r.list.Items = nil
+		r.list.Keys = nil
 		for _, rs := range r.sets {
 			cached := "未缓存"
 			if rs.CachedPath != "" {
@@ -312,6 +406,7 @@ func (r *Rules) reload() {
 			}
 			r.list.Items = append(r.list.Items,
 				fmt.Sprintf("%-24s %-28s %-4s %-12s %s", rs.Tag, rs.Name, rs.Format, cached, state))
+			r.list.Keys = append(r.list.Keys, fmt.Sprintf("set:%d", rs.ID))
 		}
 		// 被规则引用的内置分类：不在 rulesets 表里，但同样会进生成的配置——
 		// 一并列出（只读，标 [内置]），否则用户在此页看不到自己正在用的规则集。
@@ -324,15 +419,17 @@ func (r *Rules) reload() {
 				}
 				r.list.Items = append(r.list.Items,
 					fmt.Sprintf("%-24s %-28s %-4s %-12s %s", ref.Tag(), ref.String(), "srs", cached, "[内置]"))
+				r.list.Keys = append(r.list.Keys, ref.String())
 			}
 		} else {
 			r.catRefsInUse = nil
 		}
-		r.clampCursor(len(r.sets) + len(r.catRefsInUse))
+		r.list.SelectKey(selected)
 		return
 	}
 	r.list.Height = 0
 	r.list.Items = nil
+	r.list.Keys = nil
 	for _, g := range groups {
 		state := "启用"
 		if !g.Enabled {
@@ -340,8 +437,9 @@ func (r *Rules) reload() {
 		}
 		r.list.Items = append(r.list.Items,
 			fmt.Sprintf("%-14s → %-10s %2d 条规则  %s", g.Name, g.Target, len(g.Rules), state))
+		r.list.Keys = append(r.list.Keys, fmt.Sprintf("group:%d", g.ID))
 	}
-	r.clampCursor(len(groups))
+	r.list.SelectKey(selected)
 }
 
 // reloadGroupRules 重建当前分流组的规则列表。
@@ -349,6 +447,7 @@ func (r *Rules) reloadGroupRules() {
 	if r.cur == nil {
 		return
 	}
+	selected := r.list.SelectedKey()
 	if g, err := r.app.Rout.DB.ListRoutingGroups(); err == nil {
 		for _, gg := range g {
 			if gg.ID == r.cur.ID {
@@ -358,6 +457,7 @@ func (r *Rules) reloadGroupRules() {
 		}
 	}
 	r.list.Items = nil
+	r.list.Keys = nil
 	for _, rule := range r.cur.Rules {
 		state := "启用"
 		if !rule.Enabled {
@@ -378,8 +478,9 @@ func (r *Rules) reloadGroupRules() {
 		}
 		r.list.Items = append(r.list.Items,
 			fmt.Sprintf("%-15s %s%-40s %s", typ, mark, val, state))
+		r.list.Keys = append(r.list.Keys, fmt.Sprintf("rule:%d", rule.ID))
 	}
-	r.clampCursor(len(r.cur.Rules))
+	r.list.SelectKey(selected)
 }
 
 func (r *Rules) selectedGroup() (*config.RoutingGroup, bool) {
@@ -414,27 +515,20 @@ func (r *Rules) selectedRuleIdx() (int, bool) {
 	return r.list.Cursor, true
 }
 
-func (r *Rules) clampCursor(n int) {
-	if r.list.Cursor >= n {
-		r.list.Cursor = n - 1
-	}
-	if r.list.Cursor < 0 {
-		r.list.Cursor = 0
-	}
-}
-
 // --- 内置分类库（4.3）---
 
 // openCatalog 进入内置分类库浏览。back 是退出后返回的模式：
 // 从规则列表进入时选中分类可直接加为当前分流组的规则，从规则集管理进入时仅浏览。
 func (r *Rules) openCatalog(back rulesMode) {
+	r.catalogBackList = r.list
+	r.list = components.SimpleList{}
 	r.catBack = back
 	if r.catKind == "" {
 		r.catKind = catalog.KindGeosite
 	}
 	r.catSearch = textinput.New()
 	r.catSearch.Placeholder = "输入关键词过滤，Enter 确认，Esc 清空"
-	r.catSearch.CharLimit = 64
+	r.catSearch.CharLimit = 0
 	r.catSearch.SetValue(r.catQuery)
 	r.catTyping = false
 	r.err = nil
@@ -445,6 +539,7 @@ func (r *Rules) openCatalog(back rulesMode) {
 
 // reloadCatalog 按当前种类与搜索词重建分类列表，并标注缓存与引用状态。
 func (r *Rules) reloadCatalog() {
+	selected := r.list.SelectedKey()
 	r.catHits = catalog.Search(r.catKind, r.catQuery, 0)
 
 	// 已被规则引用的分类（用于标注），失败不致命
@@ -457,11 +552,12 @@ func (r *Rules) reloadCatalog() {
 
 	r.list.Height = r.catalogViewHeight()
 	r.list.Items = nil
+	r.list.Keys = nil
 	for _, ref := range r.catHits {
 		cached := r.app.Rules.CatalogCached(ref)
 		mark := "  "
 		if referenced[ref.Tag()] {
-			mark = "✓ " // 已被规则引用
+			mark = "* " // 已被规则引用
 		}
 		state := "未缓存"
 		if cached {
@@ -473,8 +569,9 @@ func (r *Rules) reloadCatalog() {
 		}
 		r.list.Items = append(r.list.Items,
 			fmt.Sprintf("%s%-42s %-8s%s", mark, ref.String(), state, ipHint))
+		r.list.Keys = append(r.list.Keys, ref.String())
 	}
-	r.clampCursor(len(r.catHits))
+	r.list.SelectKey(selected)
 }
 
 // catalogViewHeight 分类列表可见行数：给标题/搜索框/状态栏/帮助行留出空间。
@@ -509,7 +606,10 @@ func (r *Rules) handleCatalogKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 		case "esc":
 			r.catTyping = false
 			r.catSearch.Blur()
+			r.catQuery = r.catBefore
+			r.list = r.catBeforeList
 			r.catSearch.SetValue(r.catQuery)
+			r.reloadCatalog()
 			return r, nil
 		}
 		var cmd tea.Cmd
@@ -527,22 +627,27 @@ func (r *Rules) handleCatalogKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 	switch key {
 	case "esc":
 		r.mode = r.catBack
-		r.list.Height = 0
-		r.list.Cursor = 0
+		r.list = r.catalogBackList
 		if r.catBack == rulesGroupRl {
 			r.reloadGroupRules()
 		} else {
 			r.reload()
 		}
 	case "/":
+		r.catBefore = r.catQuery
+		r.catBeforeList = r.list
 		r.catTyping = true
 		r.catSearch.Focus()
 		return r, textinput.Blink
-	case "tab":
+	case "]", "[":
 		// 循环切换 geosite → geoip → acl
 		for i, k := range catalog.Kinds {
 			if k == r.catKind {
-				r.catKind = catalog.Kinds[(i+1)%len(catalog.Kinds)]
+				delta := 1
+				if key == "[" {
+					delta = len(catalog.Kinds) - 1
+				}
+				r.catKind = catalog.Kinds[(i+delta)%len(catalog.Kinds)]
 				break
 			}
 		}
@@ -551,7 +656,9 @@ func (r *Rules) handleCatalogKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 	case "enter":
 		// 加为当前分流组的 rule_set 规则（仅从规则列表进入时可用）
 		if r.catBack != rulesGroupRl || r.cur == nil {
-			r.status = "浏览模式：分类无需添加，在分流组规则里按 c 挑选即可直接加为规则"
+			if ref, ok := r.selectedCatalogRef(); ok {
+				r.openDetails("内置分类详情", r.catalogDetails(ref))
+			}
 			return r, nil
 		}
 		ref, ok := r.selectedCatalogRef()
@@ -564,6 +671,14 @@ func (r *Rules) handleCatalogKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 		if ref, ok := r.selectedCatalogRef(); ok && !r.busy {
 			return r, r.downloadCatalog(ref)
 		}
+	case "alt+enter":
+		if ref, ok := r.selectedCatalogRef(); ok {
+			r.openDetails("内置分类详情", r.catalogDetails(ref))
+		}
+	case "c":
+		r.catQuery = ""
+		r.catSearch.SetValue("")
+		r.reloadCatalog()
 	}
 	return r, nil
 }
@@ -590,23 +705,13 @@ func (r *Rules) addCatalogRule(ref catalog.Ref) {
 	}
 	r.err = nil
 	r.status = fmt.Sprintf("已添加 %s → 分流组 %q（缺缓存会在生成配置时自动下载）", ref, r.cur.Name)
+	r.app.MarkConfigDirty()
 	r.reloadCatalog()
 }
 
 // downloadCatalog 异步下载单个分类的规则集缓存。
 func (r *Rules) downloadCatalog(ref catalog.Ref) tea.Cmd {
-	r.busy = true
-	r.status = fmt.Sprintf("正在下载 %s…", ref)
-	r.err = nil
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-		return actionDoneMsg{
-			Action: "download-catalog",
-			Data:   ref.String(),
-			Err:    r.app.Rules.DownloadCatalog(ctx, ref),
-		}
-	}
+	return r.downloadWork(nil, []catalog.Ref{ref}, false)
 }
 
 // --- 表单 ---
@@ -632,6 +737,7 @@ func (r *Rules) openForm(kind string) {
 	}
 	r.form.Reset()
 	r.err = nil
+	r.configureForm()
 	r.mode = rulesForm
 }
 
@@ -645,6 +751,7 @@ func (r *Rules) openFormEditGroup(g *config.RoutingGroup) {
 	r.form.SetValueByKey("name", g.Name)
 	r.form.SetValueByKey("target", g.Target)
 	r.err = nil
+	r.configureForm()
 	r.mode = rulesForm
 }
 
@@ -664,6 +771,7 @@ func (r *Rules) openFormEditRule(idx int) {
 	}
 	r.form.SetValueByKey("invert", strconv.FormatBool(rule.Invert))
 	r.err = nil
+	r.configureForm()
 	r.mode = rulesForm
 }
 
@@ -691,9 +799,16 @@ func (r *Rules) submitForm() {
 
 func (r *Rules) submitGroupForm() {
 	name := r.form.ValueByKey("name")
-	target := strings.ToUpper(strings.TrimSpace(r.form.ValueByKey("target")))
+	target := strings.TrimSpace(r.form.ValueByKey("target"))
+	if strings.EqualFold(target, "DIRECT") || strings.EqualFold(target, "BLOCK") {
+		target = strings.ToUpper(target)
+	}
 	if name == "" || target == "" {
-		r.err = fmt.Errorf("名称与目标为必填项")
+		field := "name"
+		if name != "" {
+			field = "target"
+		}
+		r.err = validation.New(field, "名称与目标为必填项")
 		return
 	}
 	if r.formKind == "add-rg" {
@@ -717,6 +832,7 @@ func (r *Rules) submitGroupForm() {
 		r.status = "分流组已保存"
 	}
 	r.err = nil
+	r.app.MarkConfigDirty()
 	r.mode = rulesGroups
 	r.reload()
 }
@@ -725,10 +841,10 @@ func (r *Rules) submitRuleForm() {
 	typ := strings.ToLower(strings.TrimSpace(r.form.ValueByKey("type")))
 	value := strings.TrimSpace(r.form.ValueByKey("value"))
 	invert := false
-	if v := strings.TrimSpace(r.form.ValueByKey("invert")); v != "" {
+	if v := strings.TrimSpace(r.form.ValueByKey("invert")); v != "" && typ != "final" {
 		var err error
 		if invert, err = strconv.ParseBool(v); err != nil {
-			r.err = fmt.Errorf("反转须为 true 或 false")
+			r.err = validation.New("invert", "反转须为 true 或 false")
 			return
 		}
 	}
@@ -736,12 +852,13 @@ func (r *Rules) submitRuleForm() {
 	if typ == "logical" {
 		mode, conds, err := config.ParseLogicalExpr(value)
 		if err != nil {
-			r.err = err
+			r.err = validation.At("value", err)
 			return
 		}
 		rule.Value, rule.Mode, rule.Conditions = "", mode, conds
 	}
 	if r.formKind == "edit-rule" {
+		rule.ID = r.cur.Rules[r.editRule].ID
 		rule.Enabled = r.cur.Rules[r.editRule].Enabled
 		r.cur.Rules[r.editRule] = rule
 	} else {
@@ -755,6 +872,7 @@ func (r *Rules) submitRuleForm() {
 	}
 	r.err = nil
 	r.status = "规则已保存"
+	r.app.MarkConfigDirty()
 	r.mode = rulesGroupRl
 	r.reloadGroupRules()
 }
@@ -770,6 +888,7 @@ func (r *Rules) submitRulesetForm() {
 	}
 	r.err = nil
 	r.status = "规则集已添加，按 u 下载缓存"
+	r.app.MarkConfigDirty()
 	r.mode = rulesSets
 	r.reload()
 }
@@ -777,54 +896,114 @@ func (r *Rules) submitRulesetForm() {
 // --- 异步下载 ---
 
 func (r *Rules) downloadRuleSets(ids []int64, doing string) tea.Cmd {
-	r.busy = true
-	r.status = doing
-	r.err = nil
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-		var firstErr error
-		for _, id := range ids {
-			if err := r.app.Rules.Download(ctx, id); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-		return actionDoneMsg{Action: "download-rulesets", Err: firstErr}
-	}
+	return r.downloadWork(ids, nil, false)
 }
 
-// downloadAll 更新全部启用的自定义规则集，以及被规则引用到的内置分类缓存。
 func (r *Rules) downloadAll(ids []int64) tea.Cmd {
 	refs, err := r.app.Rules.ReferencedCatalog()
 	if err != nil {
 		r.err = err
 		return nil
 	}
-	if len(ids) == 0 && len(refs) == 0 {
+	return r.downloadWork(ids, refs, true)
+}
+
+func (r *Rules) downloadWork(ids []int64, refs []catalog.Ref, enabledOnly bool) tea.Cmd {
+	if r.busy {
+		return nil
+	}
+	if len(ids)+len(refs) == 0 {
 		r.status = "没有需要下载的规则集"
 		return nil
 	}
 	r.busy = true
-	r.status = fmt.Sprintf("正在下载 %d 个自定义规则集 + %d 个内置分类…", len(ids), len(refs))
 	r.err = nil
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-		defer cancel()
-		var firstErr error
-		for _, id := range ids {
-			if err := r.app.Rules.Download(ctx, id); err != nil && firstErr == nil {
-				firstErr = err
+	r.status = "规则集下载进行中"
+	r.retryTask = func() tea.Cmd {
+		var retryIDs []int64
+		var retryRefs []catalog.Ref
+		for _, result := range r.taskResults {
+			if result.State != "失败" {
+				continue
+			}
+			if result.ID != 0 {
+				retryIDs = append(retryIDs, result.ID)
+			} else if ref, ok := catalog.Parse(result.Key); ok {
+				retryRefs = append(retryRefs, ref)
 			}
 		}
-		if err := r.app.Rules.UpdateCatalogCached(ctx); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		return actionDoneMsg{Action: "download-rulesets", Err: firstErr}
+		return r.downloadWork(retryIDs, retryRefs, true)
 	}
+	return r.taskN("规则集下载", len(ids)+len(refs), func(report func(itemResult)) tea.Msg {
+		ctx, cancel := context.WithTimeout(r.app.BackgroundContext(), 30*time.Minute)
+		defer cancel()
+		var results []itemResult
+		record := func(row itemResult, err error) {
+			if err != nil {
+				row.State, row.Detail = "失败", err.Error()
+			} else if row.State == "成功" {
+				row.Detail = "缓存已更新；应用配置后生效"
+				r.app.MarkConfigDirty()
+			}
+			results = append(results, row)
+			report(row)
+		}
+		for _, id := range ids {
+			row := itemResult{ID: id, Name: fmt.Sprintf("规则集 %d", id), State: "成功"}
+			sets, err := r.app.DB.ListRuleSets()
+			var rs *config.RuleSet
+			if err == nil {
+				for _, candidate := range sets {
+					if candidate.ID == id {
+						rs = candidate
+						break
+					}
+				}
+				if rs == nil {
+					err = fmt.Errorf("规则集已删除，请刷新列表")
+				}
+			}
+			if err == nil {
+				row.Name = rs.Name
+				if enabledOnly && !rs.Enabled {
+					row.State, row.Detail = "跳过", "规则集已停用，未发起下载"
+				} else {
+					err = r.app.Rules.Download(ctx, id)
+				}
+			}
+			record(row, err)
+		}
+		for _, ref := range refs {
+			record(itemResult{Key: ref.String(), Name: ref.String(), State: "成功"}, r.app.Rules.DownloadCatalog(ctx, ref))
+		}
+		return actionDoneMsg{Action: "download-rulesets", Results: results, Err: resultError(results)}
+	})
 }
 
 func (r *Rules) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 	if r.mode != rulesConfirm {
+		return r, nil
+	}
+	if msg.ID == "delete-rule" {
+		r.mode = rulesGroupRl
+		if msg.Confirmed {
+			r.reloadGroupRules()
+			for i, rule := range r.cur.Rules {
+				if rule.ID == r.confirmID {
+					rules := append([]config.Rule(nil), r.cur.Rules[:i]...)
+					rules = append(rules, r.cur.Rules[i+1:]...)
+					if err := r.app.Rout.UpdateGroup(r.cur, rules); err != nil {
+						r.err = err
+					} else {
+						r.err = nil
+						r.status = "规则已删除"
+						r.app.MarkConfigDirty()
+					}
+					break
+				}
+			}
+		}
+		r.reloadGroupRules()
 		return r, nil
 	}
 	backTo := rulesGroups
@@ -840,6 +1019,7 @@ func (r *Rules) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 			} else {
 				r.err = nil
 				r.status = "分流组已删除"
+				r.app.MarkConfigDirty()
 			}
 		case "delete-rs":
 			if err := r.app.Rules.DeleteRuleSet(r.confirmID); err != nil {
@@ -847,6 +1027,7 @@ func (r *Rules) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 			} else {
 				r.err = nil
 				r.status = "规则集已删除"
+				r.app.MarkConfigDirty()
 			}
 		}
 	}
@@ -857,91 +1038,70 @@ func (r *Rules) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 // --- 渲染 ---
 
 func (r *Rules) View() string {
+	r.table()
+	r.preview = r.selectionDetails()
+	if r.detailActive {
+		return r.detailsView()
+	}
 	switch r.mode {
 	case rulesForm:
-		// 表单态也要渲染校验错误，否则提交被拒时用户看不到原因
-		// （如 domain_regex 正则非法、规则集不存在）
-		view := r.form.View()
-		if r.err != nil {
-			view += "\n" + styles.Err.Render(r.err.Error())
+		if r.logical != nil {
+			return r.logical.view(r.width, r.height)
 		}
-		return view
+		return r.formView(&r.form, r.err)
 	case rulesConfirm:
-		return r.confirm.View()
+		return r.confirmView(&r.confirm)
 	case rulesCatalog:
 		return r.catalogView()
 	case rulesSets:
-		head := styles.Title.Render("规则集") +
-			styles.Dim.Render(fmt.Sprintf(" — 自定义 %d · 引用中的内置分类 %d", len(r.sets), len(r.catRefsInUse))) + "\n"
-		body := r.list.View("暂无规则集。按 c 浏览内置分类库。")
-		return head + body + r.statusLine() +
-			styles.Dim.Render("\nc 内置分类库 · u 下载选中 · U 全部更新 · a 添加自定义 · d 删除 · space 启停 · esc 返回")
+		return r.listView(&r.list, "分流组  [规则集] · [/] 切换", "暂无规则集，c 浏览分类库。", r.statusLine(), Hints(r))
 	case rulesGroupRl:
-		title := styles.Title.Render("规则") +
-			styles.Dim.Render(fmt.Sprintf(" — %s → %s（%d 条，顺序即优先级）", r.cur.Name, r.cur.Target, len(r.cur.Rules)))
-		body := r.list.View("暂无规则，按 a 添加。")
-		return title + "\n" + body + r.statusLine() +
-			styles.Dim.Render("\na 添加 · c 分类库挑选 · e 编辑 · D 删除 · space 启停 · J 下移 · K 上移 · esc 返回")
+		return r.listView(&r.list, fmt.Sprintf("分流 / %s → %s · 顺序即优先级", r.cur.Name, r.cur.Target),
+			"暂无规则，a 添加。", r.statusLine(), Hints(r))
 	default:
-		head := styles.Title.Render("分流规则") + "\n"
-		body := r.list.View("暂无分流组。")
-		return head + body + r.statusLine() +
-			styles.Dim.Render("\na 新建分流组 · e 编辑 · enter 规则 · space 启停 · R 规则集管理 · r 刷新")
+		return r.listView(&r.list, "[分流组]  规则集 · [/] 切换", "暂无分流组，a 新建。", r.statusLine(), Hints(r))
 	}
 }
 
-// catalogView 渲染内置分类库：种类标签页 + 搜索框 + 分类列表。
 func (r *Rules) catalogView() string {
-	// 视窗高度在这里取，进入分类库时由根布局同步给所有页面。
-	// 可能还是旧值（甚至为 0）；View 在每次重绘前执行，取到的是最新尺寸。
-	r.list.Height = r.catalogViewHeight()
-
-	var b strings.Builder
-	b.WriteString(styles.Title.Render("内置分类库"))
-
-	// 种类标签页
-	tabs := make([]string, 0, len(catalog.Kinds))
-	for _, k := range catalog.Kinds {
-		label := fmt.Sprintf("%s(%d)", k, catalog.Count(k))
-		if k == r.catKind {
-			tabs = append(tabs, styles.Accent.Render("["+label+"]"))
-		} else {
-			tabs = append(tabs, styles.Dim.Render(" "+label+" "))
-		}
-	}
-	b.WriteString(" " + strings.Join(tabs, " ") + "\n")
-
-	// 搜索框
-	if r.catTyping {
-		b.WriteString("搜索: " + r.catSearch.View() + "\n")
-	} else if r.catQuery != "" {
-		b.WriteString(styles.Dim.Render("搜索: ") + r.catQuery +
-			styles.Dim.Render(fmt.Sprintf("  （%d 条匹配，按 / 修改）", len(r.catHits))) + "\n")
-	} else {
-		b.WriteString(styles.Dim.Render(fmt.Sprintf("按 / 搜索  共 %d 条", len(r.catHits))) + "\n")
-	}
-
-	empty := "无匹配分类，按 / 换个关键词。"
-	b.WriteString(r.list.View(empty))
-	b.WriteString(r.statusLine())
-
-	help := "\n/ 搜索 · Tab 切换种类 · u 下载缓存 · esc 返回"
+	head := fmt.Sprintf("分类库 / [%s] · %d 条 · [/] 种类 · %s", r.catKind, len(r.catHits), r.catQuery)
 	if r.catBack == rulesGroupRl && r.cur != nil {
-		help = fmt.Sprintf("\nEnter 加入分流组 %q · / 搜索 · Tab 切换种类 · u 下载缓存 · esc 返回", r.cur.Name)
+		head += "\n添加到: " + r.cur.Name + " → " + r.cur.Target
 	}
-	b.WriteString(styles.Dim.Render(help))
-	return b.String()
+	if r.catTyping {
+		r.catSearch.Width = max(5, r.width-10)
+		head += "\n搜索: " + r.catSearch.View()
+	}
+	hint := "/ 搜索 · [/] 种类 · u 下载 · Esc 返回"
+	if r.catBack == rulesGroupRl && r.cur != nil {
+		hint = "Enter 加入 " + r.cur.Name + " · " + hint
+	}
+	return r.listView(&r.list, head, "无匹配分类，/ 修改搜索。", r.statusLine(), hint)
 }
 
 func (r *Rules) statusLine() string {
-	var b string
-	if r.busy {
-		b += "\n" + styles.Accent.Render(r.status)
-	} else if r.status != "" {
-		b += "\n" + styles.Ok.Render(r.status)
+	return r.feedback(r.status, r.err)
+}
+
+func (r *Rules) configureForm() {
+	r.form.SetChoices("type", ruleTypeChoices(true))
+	r.form.SetChoices("target", proxyChoices(r.app, true))
+	configureRuleValue(r.app, &r.form)
+	for _, key := range []string{"name", "tag", "target"} {
+		if field := r.form.Field(key); field != nil {
+			field.Validate = required(field.Label)
+		}
 	}
-	if r.err != nil {
-		b += "\n" + styles.Err.Render("错误: "+r.err.Error())
+	if field := r.form.Field("target"); field != nil {
+		field.Validate = func(value string) error {
+			if strings.EqualFold(value, "DIRECT") || strings.EqualFold(value, "BLOCK") {
+				r.form.SetValueByKey("target", strings.ToUpper(value))
+			}
+			return required("目标")(value)
+		}
 	}
-	return b
+	if field := r.form.Field("url"); field != nil {
+		field.Validate = httpURL(false)
+	}
+	r.form.Begin()
 }

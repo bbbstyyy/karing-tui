@@ -4,6 +4,7 @@ package dns
 
 import (
 	"fmt"
+	"github.com/bbbstyyy/karing-tui/internal/validation"
 	"net"
 	"net/url"
 	"strconv"
@@ -256,17 +257,17 @@ func (m *Manager) SetServerEnabled(id int64, enabled bool) error {
 
 func (m *Manager) validateServer(s *config.DNSServer, selfID int64) error {
 	if s.Tag == "" {
-		return fmt.Errorf("DNS 标签不能为空")
+		return validation.New("tag", "DNS 标签不能为空")
 	}
 	if !serverTypes[s.Type] {
-		return fmt.Errorf("类型 %q 不支持（udp/tcp/tls/https/quic/h3/local）", s.Type)
+		return validation.New("type", "类型 %q 不支持（udp/tcp/tls/https/quic/h3/local）", s.Type)
 	}
 	if s.Type != "local" && s.Address == "" {
-		return fmt.Errorf("服务器地址不能为空")
+		return validation.New("address", "服务器地址不能为空")
 	}
 	if s.Type != "local" {
 		if err := validateServerAddress(s.Type, s.Address); err != nil {
-			return fmt.Errorf("DNS 服务器地址非法: %w", err)
+			return validation.New("address", "DNS 服务器地址非法: %w", err)
 		}
 	}
 	// Tag 唯一
@@ -276,23 +277,42 @@ func (m *Manager) validateServer(s *config.DNSServer, selfID int64) error {
 	}
 	for _, e := range existing {
 		if e.ID != selfID && e.Tag == s.Tag {
-			return fmt.Errorf("DNS 标签 %q 已存在", s.Tag)
+			return validation.New("tag", "DNS 标签 %q 已存在", s.Tag)
 		}
 	}
 	// AddressResolver 必须指向存在且启用的 DNS tag；禁用的解析器不会出现在生成配置中。
+	if s.Detour != "" && !strings.EqualFold(s.Detour, "direct") {
+		groups, err := m.DB.ListProxyGroups()
+		if err != nil {
+			return err
+		}
+		found := false
+		for _, g := range groups {
+			if g.Name == s.Detour {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return validation.New("detour", "出站代理组 %q 不存在，请选择已有代理组", s.Detour)
+		}
+	}
 	if s.AddressResolver != "" {
 		if s.AddressResolver == s.Tag {
-			return fmt.Errorf("DNS 服务器 %q 不能将自身作为 address_resolver", s.Tag)
+			return validation.New("resolver", "DNS 服务器 %q 不能将自身作为 address_resolver", s.Tag)
 		}
 		for _, e := range existing {
 			if e.Tag == s.AddressResolver {
+				if e.ID == selfID {
+					return validation.New("resolver", "DNS 服务器不能将自身作为域名解析 DNS")
+				}
 				if s.Enabled && !e.Enabled {
-					return fmt.Errorf("AddressResolver %q 已停用", s.AddressResolver)
+					return validation.New("resolver", "AddressResolver %q 已停用", s.AddressResolver)
 				}
 				return nil
 			}
 		}
-		return fmt.Errorf("AddressResolver %q 不是已存在的 DNS 服务器 Tag", s.AddressResolver)
+		return validation.New("resolver", "AddressResolver %q 不是已存在的 DNS 服务器 Tag", s.AddressResolver)
 	}
 	return nil
 }
@@ -444,13 +464,13 @@ func (m *Manager) MoveRule(id int64, delta int) error {
 
 func (m *Manager) validateRule(r *config.DNSRule) error {
 	if !ruleTypes[r.Type] {
-		return fmt.Errorf("类型 %q 不支持（domain/domain_suffix/domain_keyword/rule_set）", r.Type)
+		return validation.New("type", "类型 %q 不支持（domain/domain_suffix/domain_keyword/rule_set）", r.Type)
 	}
 	if r.Value == "" {
-		return fmt.Errorf("规则值不能为空")
+		return validation.New("value", "规则值不能为空")
 	}
 	if r.Server == "" {
-		return fmt.Errorf("必须指定 DNS 服务器")
+		return validation.New("server", "必须指定 DNS 服务器")
 	}
 	servers, err := m.DB.ListDNSServers()
 	if err != nil {
@@ -459,12 +479,12 @@ func (m *Manager) validateRule(r *config.DNSRule) error {
 	for _, s := range servers {
 		if s.Tag == r.Server {
 			if !s.Enabled {
-				return fmt.Errorf("DNS 服务器 %q 已停用", r.Server)
+				return validation.New("server", "DNS 服务器 %q 已停用", r.Server)
 			}
 			return nil
 		}
 	}
-	return fmt.Errorf("DNS 服务器 %q 不存在", r.Server)
+	return validation.New("server", "DNS 服务器 %q 不存在", r.Server)
 }
 
 // --- 全局配置（settings 键） ---
@@ -518,15 +538,15 @@ func (m *Manager) SaveOptions(strategy string, fakeIPEnabled bool, fakeIPRange, 
 	switch strategy {
 	case "prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only":
 	default:
-		return fmt.Errorf("strategy 非法（prefer_ipv4/prefer_ipv6/ipv4_only/ipv6_only）")
+		return validation.New("strategy", "strategy 非法（prefer_ipv4/prefer_ipv6/ipv4_only/ipv6_only）")
 	}
 	if fakeIPEnabled {
 		fakeIPRange = strings.TrimSpace(fakeIPRange)
 		if fakeIPRange == "" {
-			return fmt.Errorf("启用 FakeIP 时必须填写网段")
+			return validation.New("range", "启用 FakeIP 时必须填写网段")
 		}
 		if _, network, err := net.ParseCIDR(fakeIPRange); err != nil || network.IP.To4() == nil {
-			return fmt.Errorf("FakeIP IPv4 网段非法: %q", fakeIPRange)
+			return validation.New("range", "FakeIP IPv4 网段非法: %q", fakeIPRange)
 		}
 	}
 	if final != "" {
@@ -542,7 +562,7 @@ func (m *Manager) SaveOptions(strategy string, fakeIPEnabled bool, fakeIPRange, 
 			}
 		}
 		if !found {
-			return fmt.Errorf("final %q 不是已启用的 DNS 服务器", final)
+			return validation.New("final", "final %q 不是已启用的 DNS 服务器", final)
 		}
 	}
 	pairs := map[string]string{

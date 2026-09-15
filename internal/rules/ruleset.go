@@ -6,6 +6,7 @@ package rules
 import (
 	"context"
 	"fmt"
+	"github.com/bbbstyyy/karing-tui/internal/validation"
 	"os"
 	"path/filepath"
 	"sort"
@@ -91,16 +92,16 @@ func (m *Manager) AddRuleSet(name, tag, rawURL, format string) (*config.RuleSet,
 		Enabled:    true,
 	}
 	if rs.Name == "" || rs.Tag == "" {
-		return nil, fmt.Errorf("名称与 Tag 为必填项")
+		return nil, validation.New("name", "名称与 Tag 为必填项")
 	}
 	if rs.Format == "" {
 		rs.Format = "srs"
 	}
 	if rs.Format != "srs" && rs.Format != "json" {
-		return nil, fmt.Errorf("格式仅支持 srs/json")
+		return nil, validation.New("format", "格式仅支持 srs/json")
 	}
 	if rs.URL == "" {
-		return nil, fmt.Errorf("远程规则集必须提供 URL")
+		return nil, validation.New("url", "远程规则集必须提供 URL")
 	}
 	existing, err := m.DB.ListRuleSets()
 	if err != nil {
@@ -108,13 +109,13 @@ func (m *Manager) AddRuleSet(name, tag, rawURL, format string) (*config.RuleSet,
 	}
 	for _, e := range existing {
 		if e.Tag == rs.Tag {
-			return nil, fmt.Errorf("规则集 Tag %q 已存在", rs.Tag)
+			return nil, validation.New("tag", "规则集 Tag %q 已存在", rs.Tag)
 		}
 	}
 	// tag 与内置分类的派生 tag 冲突时，规则里写这个 tag 会优先解析为自定义规则集，
 	// 分类引用被静默遮蔽——写入前就拒绝，避免用户困惑。
 	if ref, ok := catalog.Parse(rs.Tag); ok && ref.Tag() == rs.Tag {
-		return nil, fmt.Errorf("规则集 Tag %q 与内置分类 %s 冲突，请换一个（内置分类无需添加，规则里直接写 %s 即可）", rs.Tag, ref, ref)
+		return nil, validation.New("tag", "规则集 Tag %q 与内置分类 %s 冲突，请换一个（内置分类无需添加，规则里直接写 %s 即可）", rs.Tag, ref, ref)
 	}
 	if err := m.DB.CreateRuleSet(rs); err != nil {
 		return nil, err

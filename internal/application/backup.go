@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/bbbstyyy/karing-tui/internal/platform"
-	"github.com/bbbstyyy/karing-tui/internal/storage"
 )
 
 const maxRestoreDatabaseSize = 512 << 20 // 512 MiB；防止恶意归档耗尽磁盘。
@@ -104,103 +103,12 @@ func writeBackupZip(dest, snapshotDB, configFile string) error {
 // 当前数据库先备份为 karing.db.pre-restore；恢复后立即打开校验（含迁移），
 // 失败时回滚。要求调用前已停止核心并关闭数据库（无其他实例占用）。
 func RestoreArchive(paths *platform.Paths, archive string) error {
-	r, err := zip.OpenReader(archive)
+	prepared, err := PrepareRestore(paths, archive)
 	if err != nil {
-		return fmt.Errorf("打开备份归档失败: %w", err)
+		return err
 	}
-	defer r.Close()
-
-	var dbFile *zip.File
-	for _, f := range r.File {
-		if f.Name == "karing.db" {
-			dbFile = f
-			break
-		}
-	}
-	if dbFile == nil {
-		return fmt.Errorf("归档中缺少 karing.db，不是有效的 karing 备份")
-	}
-	if dbFile.UncompressedSize64 > maxRestoreDatabaseSize {
-		return fmt.Errorf("归档内数据库超过 %d MiB 上限", maxRestoreDatabaseSize>>20)
-	}
-
-	// 解压到同目录临时文件（保证 rename 原子性）
-	staging := paths.DB + ".restoring"
-	src, err := dbFile.Open()
-	if err != nil {
-		return fmt.Errorf("读取归档内数据库失败: %w", err)
-	}
-	defer src.Close()
-	dst, err := os.OpenFile(staging, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("写入临时恢复文件失败: %w", err)
-	}
-	if _, err := io.Copy(dst, io.LimitReader(src, maxRestoreDatabaseSize+1)); err != nil {
-		dst.Close()
-		os.Remove(staging)
-		return fmt.Errorf("解压数据库失败: %w", err)
-	}
-	dst.Close()
-	if info, err := os.Stat(staging); err != nil {
-		os.Remove(staging)
-		return fmt.Errorf("检查临时恢复文件失败: %w", err)
-	} else if info.Size() > maxRestoreDatabaseSize {
-		os.Remove(staging)
-		return fmt.Errorf("归档内数据库超过 %d MiB 上限", maxRestoreDatabaseSize>>20)
-	}
-	if err := os.Chmod(staging, 0o600); err != nil {
-		os.Remove(staging)
-		return fmt.Errorf("设置临时恢复文件权限失败: %w", err)
-	}
-
-	// 校验 SQLite 文件头
-	header := make([]byte, 16)
-	if f, err := os.Open(staging); err == nil {
-		_, _ = f.Read(header)
-		f.Close()
-	}
-	if string(header) != "SQLite format 3\x00" {
-		os.Remove(staging)
-		return fmt.Errorf("归档内数据库不是有效的 SQLite 文件")
-	}
-
-	// 备份当前数据库（存在时）
-	preRestore := paths.DB + ".pre-restore"
-	haveCurrent := false
-	if _, err := os.Stat(paths.DB); err == nil {
-		if err := copyFile(preRestore, paths.DB); err != nil {
-			os.Remove(staging)
-			return fmt.Errorf("备份当前数据库失败: %w", err)
-		}
-		haveCurrent = true
-	}
-
-	// 替换：清除 wal/shm → 移入新库
-	rollback := func() {
-		os.Remove(paths.DB)
-		// 校验新库时 SQLite 可能创建 WAL/SHM；回滚前必须清掉，
-		// 否则重新打开旧库时可能重放新库的日志。
-		os.Remove(paths.DB + "-wal")
-		os.Remove(paths.DB + "-shm")
-		if haveCurrent {
-			_ = os.Rename(preRestore, paths.DB)
-		}
-	}
-	_ = os.Remove(paths.DB + "-wal")
-	_ = os.Remove(paths.DB + "-shm")
-	if err := os.Rename(staging, paths.DB); err != nil {
-		rollback()
-		return fmt.Errorf("替换数据库失败: %w", err)
-	}
-
-	// 打开校验（执行迁移）；失败回滚
-	check, err := storage.Open(paths)
-	if err != nil {
-		rollback()
-		return fmt.Errorf("恢复后的数据库校验失败: %w", err)
-	}
-	check.Close()
-	return nil
+	defer prepared.Close()
+	return prepared.Apply(paths)
 }
 
 func copyFile(dest, src string) error {
@@ -214,6 +122,11 @@ func copyFile(dest, src string) error {
 		return err
 	}
 	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	return out.Close()
 }

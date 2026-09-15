@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -23,7 +24,7 @@ type DB struct {
 func Open(paths *platform.Paths) (*DB, error) {
 	// _time_format=sqlite 让时间类型按 SQLite 原生存储，便于跨驱动读取；
 	// foreign_keys(1) 启用外键级联（SQLite 默认关闭）。
-	dsn := "file:" + paths.DB + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_time_format=sqlite"
+	dsn := (&url.URL{Scheme: "file", Path: paths.DB}).String() + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_time_format=sqlite"
 	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库 %s 失败: %w", paths.DB, err)
@@ -58,13 +59,22 @@ func (d *DB) VacuumInto(path string) error {
 	return nil
 }
 
-// EnsureIdle 尝试获取独占事务，确认没有其他实例正在写入（恢复前检查）。
+// EnsureIdle 确认没有写事务，并将 WAL 完整写回主文件后清空。
+// 活动读事务可能允许 BEGIN EXCLUSIVE，却阻止 WAL 清空；恢复前必须拒绝
+// 这种情况，否则仅复制主文件会丢失尚在 WAL 中的已提交数据。
 func (d *DB) EnsureIdle() error {
 	if _, err := d.db.Exec("BEGIN EXCLUSIVE"); err != nil {
 		return fmt.Errorf("数据库可能正被其他实例使用: %w", err)
 	}
 	if _, err := d.db.Exec("COMMIT"); err != nil {
 		return fmt.Errorf("结束独占事务失败: %w", err)
+	}
+	var busy, frames, checkpointed int
+	if err := d.db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &frames, &checkpointed); err != nil {
+		return fmt.Errorf("恢复前同步数据库失败: %w", err)
+	}
+	if busy != 0 || (frames >= 0 && frames != checkpointed) {
+		return fmt.Errorf("数据库仍有读取事务，无法完成恢复前同步；请稍后重试，当前服务保持运行")
 	}
 	return nil
 }
@@ -108,6 +118,9 @@ func (d *DB) migrate() error {
 	if err := conn.QueryRowContext(context.Background(), "PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("读取 schema 版本失败: %w", err)
 	}
+	if version > len(migrations) {
+		return fmt.Errorf("数据库版本 v%d 高于本程序支持的 v%d", version, len(migrations))
+	}
 
 	for i, m := range migrations {
 		v := i + 1
@@ -128,4 +141,51 @@ func (d *DB) migrate() error {
 	}
 	committed = true
 	return nil
+}
+
+// CheckBackupFile verifies that an archive contains a Karing database before
+// migrations can initialize missing tables in an unrelated SQLite file.
+func CheckBackupFile(path string) error {
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: path}).String()+"?mode=ro")
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if version < 1 || version > len(migrations) {
+		return fmt.Errorf("不支持的备份数据库版本 v%d", version)
+	}
+	for _, table := range []string{"subscriptions", "nodes", "proxy_groups", "routing_groups", "rules", "settings"} {
+		var count int
+		if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&count); err != nil {
+			return err
+		}
+		if count != 1 {
+			return fmt.Errorf("备份数据库缺少 %s 表", table)
+		}
+	}
+	return nil
+}
+
+// IntegrityCheck covers page corruption and references after staged migration.
+func (d *DB) IntegrityCheck() error {
+	var result string
+	if err := d.db.QueryRow("PRAGMA integrity_check").Scan(&result); err != nil {
+		return err
+	}
+	if result != "ok" {
+		return fmt.Errorf("数据库完整性检查失败: %s", result)
+	}
+	rows, err := d.db.Query("PRAGMA foreign_key_check")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return fmt.Errorf("数据库存在无效的外键引用")
+	}
+	return rows.Err()
 }

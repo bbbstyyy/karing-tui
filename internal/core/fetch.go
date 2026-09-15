@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"github.com/bbbstyyy/karing-tui/internal/redact"
 	"io"
 	"net/http"
 	"net/url"
@@ -13,14 +14,15 @@ import (
 const DefaultUserAgent = "karing-tui/0.1"
 
 // FetchHTTP 通过可选代理抓取 URL 内容，读取上限 limit 字节（<=0 用 10 MiB）。
-// proxyURL 为空时走环境变量代理或直连。供订阅、规则集等下载共用。
+// proxyURL 为空时直连，不读取环境代理。供订阅、规则集等下载共用。
 func FetchHTTP(ctx context.Context, rawURL, proxyURL, userAgent string, limit int64) ([]byte, error) {
 	body, _, err := FetchHTTPMeta(ctx, rawURL, proxyURL, userAgent, limit)
 	return body, err
 }
 
 // FetchHTTPMeta additionally returns response headers useful to subscription clients.
-func FetchHTTPMeta(ctx context.Context, rawURL, proxyURL, userAgent string, limit int64) ([]byte, http.Header, error) {
+func FetchHTTPMeta(ctx context.Context, rawURL, proxyURL, userAgent string, limit int64) (_ []byte, _ http.Header, err error) {
+	defer func() { err = redact.Error(err) }()
 	if limit <= 0 {
 		limit = 10 << 20
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/bbbstyyy/karing-tui/internal/config"
 	"github.com/bbbstyyy/karing-tui/internal/storage"
+	"github.com/bbbstyyy/karing-tui/internal/validation"
 )
 
 // Manager 编排订阅的增删改查与更新（下载 → 解析 → 入池）。
@@ -43,17 +45,15 @@ func (m *Manager) AddWithStrategy(ctx context.Context, name, rawURL, userAgent, 
 	name = strings.TrimSpace(name)
 	rawURL = strings.TrimSpace(rawURL)
 	if name == "" {
-		return nil, fmt.Errorf("订阅名称不能为空")
+		return nil, validation.New("name", "订阅名称不能为空")
 	}
-	if rawURL == "" {
-		return nil, fmt.Errorf("订阅 URL 不能为空")
-	}
-	if !strings.Contains(rawURL, "://") {
-		rawURL = "https://" + rawURL
-	}
-	strategy, err := config.NormalizeDownloadStrategy(strategy)
-	if err != nil {
+	var err error
+	if rawURL, err = normalizeSubscriptionURL(rawURL); err != nil {
 		return nil, err
+	}
+	strategy, err = config.NormalizeDownloadStrategy(strategy)
+	if err != nil {
+		return nil, validation.At("download_strategy", err)
 	}
 	s := &config.Subscription{Name: name, URL: rawURL, UserAgent: strings.TrimSpace(userAgent), DownloadStrategy: strategy}
 	if err := m.DB.CreateSubscription(s); err != nil {
@@ -66,18 +66,48 @@ func (m *Manager) AddWithStrategy(ctx context.Context, name, rawURL, userAgent, 
 // Edit 更新订阅的可编辑字段（名称/URL/UA/启用状态）。
 func (m *Manager) Edit(s *config.Subscription) error {
 	if strings.TrimSpace(s.Name) == "" {
-		return fmt.Errorf("订阅名称不能为空")
+		return validation.New("name", "订阅名称不能为空")
 	}
 	strategy, err := config.NormalizeDownloadStrategy(s.DownloadStrategy)
 	if err != nil {
+		return validation.At("download_strategy", err)
+	}
+	rawURL, err := normalizeSubscriptionURL(s.URL)
+	if err != nil {
 		return err
 	}
+	if err := ValidateNodeFilter(s.NodeFilter); err != nil {
+		return err
+	}
+	s.Name, s.URL = strings.TrimSpace(s.Name), rawURL
 	s.DownloadStrategy = strategy
 	if err := m.DB.UpdateSubscription(s); err != nil {
 		return err
 	}
 	m.Logf("修改订阅 %q", s.Name)
 	return nil
+}
+
+func normalizeSubscriptionURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", validation.New("url", "订阅 URL 不能为空")
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return "", validation.New("url", "请填写有效的 HTTP/HTTPS 订阅 URL")
+	}
+	return raw, nil
+}
+
+// ValidateNodeFilter uses the same grammar as subscription updates, so an
+// invalid filter is rejected before any subscription fields are saved.
+func ValidateNodeFilter(expr string) error {
+	_, err := applyNodePolicy(nil, expr, "name")
+	return validation.At("filter", err)
 }
 
 // SetEnabled 启用/停用订阅。

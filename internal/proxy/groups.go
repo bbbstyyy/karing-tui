@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"github.com/bbbstyyy/karing-tui/internal/validation"
 	"strconv"
 	"strings"
 
@@ -118,6 +119,19 @@ func (m *Manager) SetGroupSelected(groupID int64, memberKey string) error {
 	if g.Type != "select" {
 		return fmt.Errorf("代理组 %q 不是 select 类型", g.Name)
 	}
+	if memberKey == "all" {
+		return fmt.Errorf("全部节点是动态成员范围，请选择展开后的具体节点")
+	}
+	if strings.HasPrefix(memberKey, "node:") {
+		id, err := strconv.ParseInt(strings.TrimPrefix(memberKey, "node:"), 10, 64)
+		if err != nil {
+			return fmt.Errorf("节点引用无效")
+		}
+		n, err := m.DB.GetNode(id)
+		if err != nil || !m.nodeUsable(n) {
+			return fmt.Errorf("节点不存在、已禁用或所属订阅已停用")
+		}
+	}
 	if memberKey != "" && !m.memberExists(g, memberKey) {
 		if err := m.checkAllGroupNode(g, memberKey); err != nil {
 			return err
@@ -128,6 +142,57 @@ func (m *Manager) SetGroupSelected(groupID int64, memberKey string) error {
 	}
 	m.Logf("代理组 %q 选中 %s", g.Name, memberDisplayKey(memberKey))
 	return nil
+}
+
+// EffectiveMembers expands the dynamic all placeholder exactly at the node
+// boundary. Nested groups remain selectable groups; disabled subscriptions and
+// nodes are omitted just as in application.buildSnapshot/config.Generate.
+func (m *Manager) EffectiveMembers(id int64) ([]config.ProxyGroupMember, error) {
+	g, err := m.DB.GetProxyGroup(id)
+	if err != nil {
+		return nil, err
+	}
+	nodes, err := m.DB.ListNodes(0)
+	if err != nil {
+		return nil, err
+	}
+	subs, err := m.DB.ListSubscriptions()
+	if err != nil {
+		return nil, err
+	}
+	enabledSubs := map[int64]bool{config.ManualSubscriptionID: true}
+	for _, s := range subs {
+		enabledSubs[s.ID] = s.Enabled
+	}
+	usable := map[int64]bool{}
+	for _, n := range nodes {
+		usable[n.ID] = n.Enabled && enabledSubs[n.SubscriptionID]
+	}
+	var result []config.ProxyGroupMember
+	seen := map[string]bool{}
+	add := func(mem config.ProxyGroupMember) {
+		if !seen[mem.MemberKey()] {
+			seen[mem.MemberKey()] = true
+			result = append(result, mem)
+		}
+	}
+	for _, mem := range g.Members {
+		switch mem.Type {
+		case "all":
+			for _, n := range nodes {
+				if usable[n.ID] {
+					add(config.ProxyGroupMember{Type: "node", ID: n.ID})
+				}
+			}
+		case "node":
+			if usable[mem.ID] {
+				add(mem)
+			}
+		case "group":
+			add(mem)
+		}
+	}
+	return result, nil
 }
 
 // checkAllGroupNode 校验动态"全部节点"组的节点选中项：节点及所属订阅须启用。
@@ -169,13 +234,13 @@ func (m *Manager) hasAllMember(g *config.ProxyGroup) bool {
 // validateGroup 校验组字段、成员合法性与环引用。
 func (m *Manager) validateGroup(g *config.ProxyGroup, selfID int64) error {
 	if g.Name == "" {
-		return fmt.Errorf("代理组名称不能为空")
+		return validation.New("name", "代理组名称不能为空")
 	}
 	if !groupTypes[g.Type] {
-		return fmt.Errorf("组类型 %q 不支持（仅 select/urltest，sing-box 无 fallback/loadbalance）", g.Type)
+		return validation.New("type", "组类型 %q 不支持（仅 select/urltest，sing-box 无 fallback/loadbalance）", g.Type)
 	}
 	if g.Type == "urltest" && g.IntervalS < 0 {
-		return fmt.Errorf("测速间隔非法")
+		return validation.New("interval", "测速间隔非法")
 	}
 	// 名称唯一（组间）+ 保留标签
 	groups, err := m.DB.ListProxyGroups()
@@ -184,11 +249,11 @@ func (m *Manager) validateGroup(g *config.ProxyGroup, selfID int64) error {
 	}
 	for _, other := range groups {
 		if other.ID != selfID && other.Name == g.Name {
-			return fmt.Errorf("代理组名称 %q 已存在", g.Name)
+			return validation.New("name", "代理组名称 %q 已存在", g.Name)
 		}
 	}
 	if reservedTags[strings.ToLower(g.Name)] {
-		return fmt.Errorf("名称 %q 是保留出站标签", g.Name)
+		return validation.New("name", "名称 %q 是保留出站标签", g.Name)
 	}
 	// 成员合法性
 	for _, mem := range g.Members {
@@ -196,17 +261,17 @@ func (m *Manager) validateGroup(g *config.ProxyGroup, selfID int64) error {
 		case "all":
 		case "node":
 			if _, err := m.DB.GetNode(mem.ID); err != nil {
-				return fmt.Errorf("成员节点 %d 不存在", mem.ID)
+				return validation.New("members", "成员节点 %d 不存在", mem.ID)
 			}
 		case "group":
 			if mem.ID == selfID {
-				return fmt.Errorf("代理组不能嵌套自身")
+				return validation.New("members", "代理组不能嵌套自身")
 			}
 			if _, err := m.DB.GetProxyGroup(mem.ID); err != nil {
-				return fmt.Errorf("成员代理组 %d 不存在", mem.ID)
+				return validation.New("members", "成员代理组 %d 不存在", mem.ID)
 			}
 		default:
-			return fmt.Errorf("未知成员类型 %q", mem.Type)
+			return validation.New("members", "未知成员类型 %q", mem.Type)
 		}
 	}
 	return m.checkCycle(g, selfID)

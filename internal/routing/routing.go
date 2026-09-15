@@ -4,6 +4,7 @@ package routing
 
 import (
 	"fmt"
+	"github.com/bbbstyyy/karing-tui/internal/validation"
 	"regexp"
 	"strings"
 
@@ -144,10 +145,10 @@ func (m *Manager) MoveRule(groupID int64, ruleID int64, delta int) error {
 // validate 校验分流组：名称唯一、目标合法、规则合法。
 func (m *Manager) validate(g *config.RoutingGroup, selfID int64) error {
 	if g.Name == "" {
-		return fmt.Errorf("分流组名称不能为空")
+		return validation.New("name", "分流组名称不能为空")
 	}
 	if g.Target == "" {
-		return fmt.Errorf("分流目标不能为空")
+		return validation.New("target", "分流目标不能为空")
 	}
 	// 名称唯一
 	existing, err := m.DB.ListRoutingGroups()
@@ -156,13 +157,13 @@ func (m *Manager) validate(g *config.RoutingGroup, selfID int64) error {
 	}
 	for _, e := range existing {
 		if e.ID != selfID && e.Name == g.Name {
-			return fmt.Errorf("分流组名称 %q 已存在", g.Name)
+			return validation.New("name", "分流组名称 %q 已存在", g.Name)
 		}
 	}
 	if g.Enabled && hasActiveFinal(g) {
 		for _, e := range existing {
 			if e.ID != selfID && e.Enabled && hasActiveFinal(e) {
-				return fmt.Errorf("活动 final 分流组只能有一个（已有分流组 %q）", e.Name)
+				return validation.New("type", "活动 final 分流组只能有一个（已有分流组 %q）", e.Name)
 			}
 		}
 	}
@@ -180,18 +181,18 @@ func (m *Manager) validate(g *config.RoutingGroup, selfID int64) error {
 			}
 		}
 		if !found {
-			return fmt.Errorf("目标 %q 不是 DIRECT/BLOCK，也不是已存在的代理组", g.Target)
+			return validation.New("target", "目标 %q 不是 DIRECT/BLOCK，也不是已存在的代理组", g.Target)
 		}
 	}
 	// 规则合法性
 	for i := range g.Rules {
 		r := &g.Rules[i]
 		if !ruleTypes[r.Type] {
-			return fmt.Errorf("未知规则类型 %q", r.Type)
+			return validation.New("type", "未知规则类型 %q", r.Type)
 		}
 		if r.Type == "final" {
 			if len(g.Rules) != 1 || i != len(g.Rules)-1 {
-				return fmt.Errorf("final 规则必须是组内唯一规则")
+				return validation.New("type", "final 规则必须是组内唯一规则")
 			}
 			continue
 		}
@@ -202,7 +203,7 @@ func (m *Manager) validate(g *config.RoutingGroup, selfID int64) error {
 			continue
 		}
 		if strings.TrimSpace(r.Value) == "" {
-			return fmt.Errorf("规则 %s 的值不能为空", r.Type)
+			return validation.New("value", "规则 %s 的值不能为空", r.Type)
 		}
 		if r.Type == "domain_regex" {
 			if err := checkRegex(r.Value); err != nil {
@@ -233,17 +234,17 @@ func hasActiveFinal(g *config.RoutingGroup) bool {
 // validateLogical 校验逻辑规则的组合方式与子条件。
 func (m *Manager) validateLogical(r *config.Rule) error {
 	if r.Mode != "and" && r.Mode != "or" {
-		return fmt.Errorf("逻辑规则组合方式须为 and 或 or，当前 %q", r.Mode)
+		return validation.New("type", "逻辑规则组合方式须为 and 或 or，当前 %q", r.Mode)
 	}
 	if len(r.Conditions) == 0 {
-		return fmt.Errorf("逻辑规则至少需要一个子条件")
+		return validation.New("value", "逻辑规则至少需要一个子条件")
 	}
 	for _, c := range r.Conditions {
 		if !config.CondTypeValid(c.Type) {
-			return fmt.Errorf("未知逻辑条件类型 %q", c.Type)
+			return validation.New("type", "未知逻辑条件类型 %q", c.Type)
 		}
 		if strings.TrimSpace(c.Value) == "" {
-			return fmt.Errorf("逻辑条件 %s 的值不能为空", c.Type)
+			return validation.New("value", "逻辑条件 %s 的值不能为空", c.Type)
 		}
 		if c.Type == "domain_regex" {
 			if err := checkRegex(c.Value); err != nil {
@@ -259,12 +260,17 @@ func (m *Manager) validateLogical(r *config.Rule) error {
 	return nil
 }
 
+// ValidateCondition uses the same checks as saving a logical routing rule.
+func (m *Manager) ValidateCondition(condition config.RuleCondition) error {
+	return m.validateLogical(&config.Rule{Type: "logical", Mode: "and", Conditions: []config.RuleCondition{condition}})
+}
+
 // checkRegex 校验 domain_regex 的值可编译；非法正则会让 sing-box 启动失败，
 // 在写入前就拒绝。Go 的 regexp 与 sing-box 同为 RE2 语法，校验结果一致。
 func checkRegex(value string) error {
 	if _, err := regexp.Compile(strings.TrimSpace(value)); err != nil {
 		// 用 %s 而非 %q：正则里的反斜杠会被 %q 二次转义，难以对照
-		return fmt.Errorf("正则表达式 %s 非法: %w", value, err)
+		return validation.New("value", "正则表达式 %s 非法: %w", value, err)
 	}
 	return nil
 }
@@ -290,9 +296,9 @@ func (m *Manager) checkRuleSetTags(value string) error {
 			continue
 		}
 		if kind, code, found := strings.Cut(v, ":"); found && catalog.KindValid(strings.ToLower(kind)) {
-			return fmt.Errorf("内置分类 %q 中没有 %q 这个分类码", strings.ToLower(kind), code)
+			return validation.New("value", "内置分类 %q 中没有 %q 这个分类码", strings.ToLower(kind), code)
 		}
-		return fmt.Errorf("规则集 %q 不存在：请在规则集管理中添加，或使用内置分类（如 geosite:cn / geoip:jp / acl:ChinaDomain）", v)
+		return validation.New("value", "规则集 %q 不存在：请在规则集管理中添加，或使用内置分类（如 geosite:cn / geoip:jp / acl:ChinaDomain）", v)
 	}
 	return nil
 }

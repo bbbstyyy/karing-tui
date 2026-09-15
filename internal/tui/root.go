@@ -1,219 +1,350 @@
-// Package tui 实现主框架：页面路由、全局键位、状态栏与帮助弹窗。
+// Package tui implements page routing, input ownership and terminal layout.
 package tui
 
 import (
 	"fmt"
+	"github.com/bbbstyyy/karing-tui/internal/tui/keys"
 	"strings"
-
-	tea "github.com/charmbracelet/bubbletea"
+	"time"
 
 	"github.com/bbbstyyy/karing-tui/internal/application"
-	"github.com/bbbstyyy/karing-tui/internal/core"
+	"github.com/bbbstyyy/karing-tui/internal/tui/components"
 	"github.com/bbbstyyy/karing-tui/internal/tui/pages"
 	"github.com/bbbstyyy/karing-tui/internal/tui/styles"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
-// RootModel 是 TUI 根模型。
+type pageMsg struct {
+	Page int
+	Msg  tea.Msg
+}
+type frameMsg time.Time
+
+func frame() tea.Cmd {
+	return tea.Tick(200*time.Millisecond, func(t time.Time) tea.Msg { return frameMsg(t) })
+}
+
 type RootModel struct {
-	app      *application.App
-	pages    []pages.Page
-	current  int
-	width    int
-	height   int
-	showHelp bool
-	quitting bool
+	app                    *application.App
+	pages                  []pages.Page
+	current, width, height int
+	showHelp, quitting     bool
+	help                   components.TextView
+	confirm                components.Confirm
+	notice                 string
+	noticeUntil            time.Time
+	showActions            bool
+	actions                []pages.Action
+	actionList             components.SimpleList
 }
 
-// NewRoot 创建根模型，装配七个页面。
 func NewRoot(app *application.App) RootModel {
-	return RootModel{
-		app: app,
-		pages: []pages.Page{
-			pages.NewDashboard(app),
-			pages.NewProfiles(app),
-			pages.NewGroups(app),
-			pages.NewRules(app),
-			pages.NewDNS(app),
-			pages.NewLogs(app),
-			pages.NewSettings(app),
-		},
+	return RootModel{app: app, pages: []pages.Page{
+		pages.NewDashboard(app), pages.NewProfiles(app), pages.NewGroups(app),
+		pages.NewRules(app), pages.NewDNS(app), pages.NewLogs(app), pages.NewSettings(app),
+	}}
+}
+
+// route preserves command ownership, including commands nested inside batches.
+func route(page int, cmd tea.Cmd) tea.Cmd {
+	if cmd == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		msg := cmd()
+		switch msg := msg.(type) {
+		case tea.BatchMsg:
+			cmds := make([]tea.Cmd, len(msg))
+			for i, c := range msg {
+				cmds[i] = route(page, c)
+			}
+			return tea.Batch(cmds...)()
+		case tea.QuitMsg:
+			return msg
+		default:
+			return pageMsg{Page: page, Msg: msg}
+		}
 	}
 }
 
-// Init 初始化当前页。
 func (m RootModel) Init() tea.Cmd {
-	return m.pages[m.current].Init()
+	cmds := []tea.Cmd{frame()}
+	for i, p := range m.pages {
+		cmds = append(cmds, route(i, p.Init()))
+	}
+	cmds = append(cmds, route(0, func() tea.Msg { return pages.ActivateMsg{} }))
+	return tea.Batch(cmds...)
 }
 
-// Update 处理全局键位并转发消息给当前页。
 func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if key, ok := msg.(tea.KeyMsg); ok {
-		switch key.String() {
-		case "ctrl+c":
-			m.quitting = true
-			return m, tea.Quit
-		case "q":
-			// 编辑控件/帮助弹窗保留各自的 q 语义；全局 q 仅在普通页面退出。
-			if !m.pages[m.current].Editing() && !m.showHelp {
-				m.quitting = true
-				return m, tea.Quit
-			}
-		}
-		// 页面处于文本输入状态时，按键直达页面（数字切页/? 帮助不拦截）。
-		if !m.pages[m.current].Editing() {
-			switch key.String() {
-			case "?":
-				m.showHelp = !m.showHelp
-				return m, nil
-			}
-			// 帮助弹窗打开时拦截其余按键，Esc 关闭。
-			if m.showHelp {
-				if key.String() == "esc" {
-					m.showHelp = false
-				}
-				return m, nil
-			}
-			// 全局页码切换 1-7。
-			if len(key.String()) == 1 && key.String()[0] >= '1' && key.String()[0] <= '7' {
-				idx := int(key.String()[0] - '1')
-				if idx != m.current {
-					m.current = idx
-					return m, m.sendActivate()
-				}
-				return m, nil
-			}
-		}
+	if _, ok := msg.(frameMsg); ok {
+		return m, frame()
 	}
-
-	// 窗口尺寸消息要同步给根布局与全部页面。
-	// 只发给当前页是不够的：非当前页收不到尺寸，其 height 会一直是 0，
-	// 切过去后依赖高度的渲染（Logs 回看行数、Rules 分类库视窗）只能走兜底值。
+	if nav, ok := msg.(pages.NavigateMsg); ok {
+		if nav.Page >= 0 && nav.Page < len(m.pages) {
+			m.current = nav.Page
+			p, cmd := m.pages[m.current].Update(pages.ActivateMsg{})
+			m.pages[m.current] = p
+			return m, route(m.current, cmd)
+		}
+		return m, nil
+	}
+	if routed, ok := msg.(pageMsg); ok {
+		if nav, ok := routed.Msg.(pages.NavigateMsg); ok {
+			return m.Update(nav)
+		}
+		if routed.Page < 0 || routed.Page >= len(m.pages) {
+			return m, nil
+		}
+		wasBusy := false
+		if task, ok := m.pages[routed.Page].(interface{ TaskStatus() (bool, string) }); ok {
+			wasBusy, _ = task.TaskStatus()
+		}
+		p, cmd := m.pages[routed.Page].Update(routed.Msg)
+		m.pages[routed.Page] = p
+		if task, ok := p.(interface{ TaskStatus() (bool, string) }); ok {
+			if active, label := task.TaskStatus(); wasBusy && !active {
+				m.notice = fmt.Sprintf("%s: %s · %d 查看", p.Title(), label, routed.Page+1)
+				m.noticeUntil = time.Now().Add(8 * time.Second)
+			}
+		}
+		return m, route(routed.Page, cmd)
+	}
 	if size, ok := msg.(tea.WindowSizeMsg); ok {
-		m.width = size.Width
-		m.height = size.Height
+		m.width, m.height = size.Width, size.Height
 		var cmds []tea.Cmd
 		for i := range m.pages {
-			var cmd tea.Cmd
-			m.pages[i], cmd = m.pages[i].Update(msg)
-			if cmd != nil {
-				cmds = append(cmds, cmd)
-			}
+			p, cmd := m.pages[i].Update(tea.WindowSizeMsg{Width: max(1, size.Width-1), Height: max(1, size.Height-3)})
+			m.pages[i] = p
+			cmds = append(cmds, route(i, cmd))
 		}
 		return m, tea.Batch(cmds...)
 	}
+	if result, ok := msg.(components.ConfirmMsg); ok {
+		if result.Confirmed {
+			switch result.ID {
+			case "quit":
+				m.quitting = true
+				return m, tea.Quit
+			case "apply":
+				cmd := m.apply()
+				return m, cmd
+			}
+		}
+		return m, nil
+	}
+	if key, ok := msg.(tea.KeyMsg); ok {
+		if m.confirm.Active {
+			_, cmd := m.confirm.Update(key)
+			return m, cmd
+		}
+		if m.showActions {
+			switch key.String() {
+			case keys.Cancel, "q", keys.Menu:
+				m.showActions = false
+			case keys.Exit:
+				cmd := m.requestQuit()
+				return m, cmd
+			case keys.Enter:
+				if m.actionList.Cursor < len(m.actions) {
+					action := m.actions[m.actionList.Cursor]
+					if action.Disabled == "" {
+						m.showActions = false
+						return m.Update(action.Message())
+					}
+				}
+			default:
+				m.actionList.Update(key)
+			}
+			return m, nil
+		}
+		if m.showHelp {
+			switch key.String() {
 
-	var cmd tea.Cmd
-	m.pages[m.current], cmd = m.pages[m.current].Update(msg)
-	return m, cmd
+			case keys.Help, keys.Cancel, keys.Quit:
+				m.showHelp = false
+			case keys.Exit:
+				cmd := m.requestQuit()
+				return m, cmd
+			default:
+				m.help.Move(key.String(), max(1, m.height-9))
+			}
+			return m, nil
+		}
+		if key.String() == keys.Exit {
+			cmd := m.requestQuit()
+			return m, cmd
+		}
+		if !m.pages[m.current].Editing() {
+			switch key.String() {
+			case keys.Menu:
+				m.actions = pages.Actions(m.pages[m.current])
+				m.actionList = components.SimpleList{}
+				for _, a := range m.actions {
+					label := a.Key + " · " + a.Label
+					if a.Disabled != "" {
+						label += "（" + a.Disabled + "）"
+					}
+					m.actionList.Items = append(m.actionList.Items, label)
+				}
+				m.showActions = true
+				return m, nil
+			case keys.Help:
+				m.showHelp = true
+				m.help.Offset = 0
+				return m, nil
+			case keys.Quit:
+				if pages.AtTop(m.pages[m.current]) {
+					cmd := m.requestQuit()
+					return m, cmd
+				}
+				msg = tea.KeyMsg{Type: tea.KeyEsc}
+			case keys.Apply:
+				if m.app.Core.IsRunning() {
+					m.confirm = components.NewConfirm("apply", "生成并校验最新配置；通过后重启核心，现有连接会中断。校验失败时保持当前核心运行。")
+					return m, nil
+				}
+				cmd := m.apply()
+				return m, cmd
+			}
+			k := key.String()
+			idx := m.current
+			if len(k) == 1 && k[0] >= '1' && k[0] <= '7' {
+				idx = int(k[0] - '1')
+			}
+			if pages.AtTop(m.pages[m.current]) {
+				if k == "left" || k == "h" {
+					idx = (idx + len(m.pages) - 1) % len(m.pages)
+				}
+				if k == "right" || k == "l" {
+					idx = (idx + 1) % len(m.pages)
+				}
+			}
+			if idx != m.current {
+				m.current = idx
+				p, cmd := m.pages[idx].Update(pages.ActivateMsg{})
+				m.pages[idx] = p
+				return m, route(idx, cmd)
+			}
+		}
+	}
+	p, cmd := m.pages[m.current].Update(msg)
+	m.pages[m.current] = p
+	return m, route(m.current, cmd)
 }
 
-// sendActivate 通知当前页已激活。
-func (m RootModel) sendActivate() tea.Cmd {
-	return func() tea.Msg { return pages.ActivateMsg{} }
+func (m *RootModel) requestQuit() tea.Cmd {
+	if m.app.Core.IsRunning() || pages.HasUnsaved(m.pages[m.current]) {
+		prompt := "退出应用？"
+		if m.app.Core.IsRunning() {
+			prompt += "退出会停止 sing-box，代理连接将中断。"
+		}
+		if pages.HasUnsaved(m.pages[m.current]) {
+			prompt += "尚未保存的输入将被放弃。"
+		}
+		m.confirm = components.NewConfirm("quit", prompt)
+		return nil
+	}
+	m.quitting = true
+	return tea.Quit
 }
 
-// View 渲染标题栏、页面内容、状态栏与帮助弹窗。
+func (m *RootModel) apply() tea.Cmd {
+	p, cmd := m.pages[0].Update(pages.ApplyConfigMsg{})
+	m.pages[0] = p
+	return route(0, cmd)
+}
+
 func (m RootModel) View() string {
 	if m.quitting {
 		return ""
 	}
-
-	var b strings.Builder
-
-	// 标题栏 + 页签
-	var tabs strings.Builder
-	tabs.WriteString(styles.Title.Render("Karing TUI") + " ")
-	for i, p := range m.pages {
-		name := fmt.Sprintf("%d %s", i+1, p.Title())
-		if i == m.current {
-			tabs.WriteString(styles.TabActive.Render(name) + " ")
-		} else {
-			tabs.WriteString(styles.TabInactive.Render(name) + " ")
-		}
+	w, h := m.width, m.height
+	if w <= 0 {
+		w = 80
 	}
-	b.WriteString(tabs.String() + "\n")
-
-	// 页面内容（留出页签 1 行 + 状态栏 1 行 + 余量）
-	contentHeight := m.height - 3
+	if h <= 0 {
+		h = 24
+	}
+	if w < 60 || h < 18 {
+		return components.Fit("窗口过小，请调整到至少 60×18；建议 80×24。\nCtrl+C 退出", w, h)
+	}
+	// Reserve the last cell: a line written at exactly the terminal width makes
+	// tmux (<= 3.2) realise the pending wrap and add a blank line, which grows
+	// the frame and pushes the fixed footer off screen.
+	w--
 	content := m.pages[m.current].View()
-	if contentHeight > 0 {
-		content = trimToHeight(content, contentHeight)
-	}
-	b.WriteString(content + "\n")
-
-	// 状态栏
-	b.WriteString(m.statusBar())
-
-	// 帮助弹窗
 	if m.showHelp {
-		b.WriteString("\n" + helpView())
+		body := strings.Join(pages.Help(m.pages[m.current]), "\n")
+		content = styles.HelpOverlay.Width(w - 2).Render("帮助 · " + m.pages[m.current].Title() + "\n" +
+			m.help.View(body, w-4, h-9) + "\n↑/↓ PgUp/PgDn 滚动 · ?/q/Esc 关闭")
 	}
-	return b.String()
+	if m.showActions {
+		m.actionList.Width, m.actionList.Height = w-4, h-7
+		content = styles.HelpOverlay.Width(w - 2).Render("操作 · " + m.pages[m.current].Title() + "\n" + m.actionList.View("暂无操作") + "\nEnter 执行 · Esc 返回")
+	}
+	if m.confirm.Active {
+		m.confirm.Width, m.confirm.Height = w, h-3
+		content = m.confirm.View()
+	}
+	return m.tabs(w) + "\n" + components.Fit(content, w, h-3) + "\n" +
+		components.Clip(m.taskLine(), w) + "\n" + m.statusBar(w)
 }
 
-func (m RootModel) statusBar() string {
-	st := m.app.Core.Status()
-	state := styles.Err.Render("停止")
-	if st.State == core.StateRunning {
-		state = styles.Ok.Render("运行")
-	}
-	left := fmt.Sprintf(" %s ", m.pages[m.current].Title())
-	mid := fmt.Sprintf("sing-box: %s", state)
-	if st.Version != "" {
-		mid += fmt.Sprintf(" · v%s", st.Version)
-	}
-	if st.State == core.StateRunning {
-		mid += fmt.Sprintf(" · %s", st.Uptime)
-	}
-	right := " 1-7 切页 · ? 帮助 · q 退出 "
-
-	pad := m.width - len([]rune(stripANSI(left+mid))) - len([]rune(right))
-	if pad < 1 {
-		pad = 1
-	}
-	return styles.StatusBar.Render(left + mid + strings.Repeat(" ", pad) + right)
-}
-
-func helpView() string {
-	lines := []string{
-		"全局键位",
-		"  1-7      切换页面 (Dashboard / Profiles / Proxy Groups / Rules / DNS / Logs / Settings)",
-		"  ?        打开/关闭本帮助",
-		"  q / C-c  退出（编辑时使用 C-c）",
-		"",
-		"Dashboard:  s 启动核心 · x 停止 · r 重启 · g 生成并校验配置 · t 组测速（运行中）",
-		"Profiles:   a 添加订阅 · e 编辑 · u 更新 · U 全部更新 · space 启停 · d 删除 · enter 查看节点",
-		"列表页:     ↑/↓ 或 j/k 移动 · r 刷新",
-		"Logs:       Tab 切换日志来源 · ↑/↓ 回看 · G 跟随",
-	}
-	return styles.HelpOverlay.Render(strings.Join(lines, "\n"))
-}
-
-// stripANSI 去掉 ANSI 转义序列，用于计算显示宽度。
-func stripANSI(s string) string {
-	var b strings.Builder
-	inEsc := false
-	for _, r := range s {
-		if r == '\x1b' {
-			inEsc = true
-			continue
+func (m RootModel) tabs(width int) string {
+	labels := make([]string, len(m.pages))
+	for i, p := range m.pages {
+		label := fmt.Sprintf("%d %s", i+1, p.Title())
+		if i == m.current {
+			labels[i] = styles.TabActive.Render("[" + label + "]")
+		} else {
+			labels[i] = styles.TabInactive.Render(label)
 		}
-		if inEsc {
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				inEsc = false
+	}
+	start, end := m.current, m.current+1
+	used := components.DisplayWidth(labels[m.current]) + 4
+	for start > 0 && used+components.DisplayWidth(labels[start-1])+1 <= width {
+		start--
+		used += components.DisplayWidth(labels[start]) + 1
+	}
+	for end < len(labels) && used+components.DisplayWidth(labels[end])+1 <= width {
+		used += components.DisplayWidth(labels[end]) + 1
+		end++
+	}
+	left, right := "", ""
+	if start > 0 {
+		left = "< "
+	}
+	if end < len(labels) {
+		right = " >"
+	}
+	return components.Clip(left+strings.Join(labels[start:end], " ")+right, width)
+}
+
+func (m RootModel) taskLine() string {
+	var active []string
+	for _, p := range m.pages {
+		if task, ok := p.(interface{ TaskStatus() (bool, string) }); ok {
+			if running, label := task.TaskStatus(); running {
+				active = append(active, p.Title()+": "+label)
 			}
-			continue
 		}
-		b.WriteRune(r)
 	}
-	return b.String()
+	if len(active) > 0 {
+		return styles.Accent.Render(strings.Join(active, " · "))
+	}
+	if time.Now().Before(m.noticeUntil) {
+		return m.notice
+	}
+	return m.app.ConfigStage() + " · Ctrl+A 应用配置"
 }
 
-// trimToHeight 将多行文本裁剪到最多 h 行。
-func trimToHeight(s string, h int) string {
-	lines := strings.Split(s, "\n")
-	if len(lines) <= h {
-		return s
+func (m RootModel) statusBar(width int) string {
+	state := "已停止"
+	if m.app.Core.IsRunning() {
+		state = "运行中"
 	}
-	return strings.Join(lines[len(lines)-h:], "\n")
+	left := m.pages[m.current].Title() + " · " + state
+	right := "1–7 切页 · Ctrl+O 操作 · ? 帮助"
+	return styles.StatusBar.Render(components.Pad(left, max(0, width-1-components.DisplayWidth(right))) + " " + right)
 }

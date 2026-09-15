@@ -226,6 +226,26 @@ func (d *DB) replaceRules(g *config.RoutingGroup) error {
 		return fmt.Errorf("开启规则事务失败: %w", err)
 	}
 	defer tx.Rollback()
+	// Keep identities stable across edits and reordering. Only IDs already owned
+	// by this group may be reused; imported/copied rules receive fresh IDs.
+	rows, err := tx.Query(`SELECT id FROM rules WHERE routing_group_id=?`, g.ID)
+	if err != nil {
+		return err
+	}
+	owned := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		owned[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
 
 	if _, err := tx.Exec(`DELETE FROM rules WHERE routing_group_id=?`, g.ID); err != nil {
 		return fmt.Errorf("清空分流组 %d 规则失败: %w", g.ID, err)
@@ -234,9 +254,14 @@ func (d *DB) replaceRules(g *config.RoutingGroup) error {
 		r := &g.Rules[i]
 		r.RoutingGroupID = g.ID
 		r.Position = i
+		var keepID any
+		if owned[r.ID] {
+			keepID = r.ID
+			delete(owned, r.ID)
+		}
 		res, err := tx.Exec(
-			`INSERT INTO rules (routing_group_id, rule_type, value, mode, invert, enabled, position) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			g.ID, r.Type, r.Value, r.Mode, boolInt(r.Invert), boolInt(r.Enabled), r.Position,
+			`INSERT INTO rules (id, routing_group_id, rule_type, value, mode, invert, enabled, position) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			keepID, g.ID, r.Type, r.Value, r.Mode, boolInt(r.Invert), boolInt(r.Enabled), r.Position,
 		)
 		if err != nil {
 			return fmt.Errorf("写入分流组 %d 规则失败: %w", g.ID, err)

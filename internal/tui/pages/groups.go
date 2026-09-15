@@ -7,12 +7,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/bbbstyyy/karing-tui/internal/application"
+	"github.com/bbbstyyy/karing-tui/internal/clashapi"
 	"github.com/bbbstyyy/karing-tui/internal/config"
 	"github.com/bbbstyyy/karing-tui/internal/tui/components"
-	"github.com/bbbstyyy/karing-tui/internal/tui/styles"
 )
 
 // groupsMode Groups 页的视图模式。
@@ -36,12 +37,21 @@ type pickCandidate struct {
 // select 组当前选中持久化、组成员测速。
 type Groups struct {
 	base
-	mode   groupsMode
-	groups []*config.ProxyGroup
-	nodes  []*config.Node
-	subs   []*config.Subscription
-	cur    *config.ProxyGroup
-	list   components.SimpleList
+	mode           groupsMode
+	groups         []*config.ProxyGroup
+	nodes          []*config.Node
+	subs           []*config.Subscription
+	cur            *config.ProxyGroup
+	list           components.SimpleList
+	groupList      components.SimpleList
+	members        []config.ProxyGroupMember
+	runtime        map[string]clashapi.ProxyInfo
+	runtimeAt      time.Time
+	pickSearch     textinput.Model
+	pickTyping     bool
+	pickQuery      string
+	pickBefore     string
+	pickBeforeList components.SimpleList
 
 	// 成员勾选状态
 	pickList  components.SimpleList
@@ -66,17 +76,37 @@ func NewGroups(app *application.App) *Groups {
 	return &Groups{base: base{app: app}}
 }
 
-func (g *Groups) Title() string { return "Proxy Groups" }
+func (g *Groups) Title() string { return "代理组" }
+
+func (g *Groups) Editing() bool {
+	return g.detailActive || g.mode == groupsForm || g.mode == groupsPick || g.mode == groupsConfirm
+}
 
 func (g *Groups) Init() tea.Cmd { return nil }
 
 func (g *Groups) Update(msg tea.Msg) (Page, tea.Cmd) {
+	if !g.Editing() {
+		if handled, cmd := g.handleRetry(msg); handled {
+			return g, cmd
+		}
+	}
+	if g.detailActive || !g.Editing() {
+		if g.handleDetails(msg, g.err) {
+			return g, nil
+		}
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		g.SetSize(msg.Width, msg.Height)
 		return g, nil
 	case ActivateMsg:
 		g.reload()
+		return g, g.fetchRuntime()
+	case groupRuntimeMsg:
+		if msg.startedAt.Equal(g.app.Core.Status().StartedAt) {
+			g.runtime = msg.proxies
+			g.runtimeAt = msg.startedAt
+		}
 		return g, nil
 	case actionDoneMsg:
 		return g.onActionDone(msg)
@@ -85,23 +115,24 @@ func (g *Groups) Update(msg tea.Msg) (Page, tea.Cmd) {
 	case tea.KeyMsg:
 		return g.handleKey(msg)
 	}
+	if g.mode == groupsForm {
+		return g, g.form.Update(msg)
+	}
 	return g, nil
 }
 
 func (g *Groups) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
-	key := msg.String()
+	key := commandKey(g, msg)
 	switch g.mode {
 	case groupsForm:
-		switch key {
-		case "esc":
+		action, cmd := g.form.Handle(msg)
+		switch action {
+		case "cancel":
 			g.mode = groupsList
-			return g, nil
-		case "enter":
+		case "save":
 			g.submitForm()
-			return g, nil
 		}
-		g.form.Update(msg)
-		return g, nil
+		return g, cmd
 
 	case groupsConfirm:
 		if consumed, cmd := g.confirm.Update(msg); consumed {
@@ -110,6 +141,25 @@ func (g *Groups) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 		return g, nil
 
 	case groupsPick:
+		if g.pickTyping {
+			switch key {
+			case "enter":
+				g.pickTyping = false
+				g.pickSearch.Blur()
+			case "esc":
+				g.pickQuery = g.pickBefore
+				g.pickSearch.SetValue(g.pickBefore)
+				g.pickList = g.pickBeforeList
+				g.refreshPickItems()
+				g.pickTyping = false
+				g.pickSearch.Blur()
+			default:
+				g.pickSearch, _ = g.pickSearch.Update(msg)
+				g.pickQuery = g.pickSearch.Value()
+				g.refreshPickItems()
+			}
+			return g, nil
+		}
 		if consumed, cmd := g.pickList.Update(msg); consumed {
 			return g, cmd
 		}
@@ -117,12 +167,21 @@ func (g *Groups) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 		case " ":
 			g.togglePick()
 			return g, nil
-		case "enter":
+		case "enter", "ctrl+s":
 			g.confirmPick()
 			return g, nil
-		case "esc":
+		case "esc", "q":
 			g.mode = groupsDetail
 			g.reloadDetail()
+		case "/":
+			g.pickBefore = g.pickQuery
+			g.pickBeforeList = g.pickList
+			g.pickTyping = true
+			g.pickSearch.Focus()
+		case "c":
+			g.pickQuery = ""
+			g.pickSearch.SetValue("")
+			g.refreshPickItems()
 		}
 		return g, nil
 
@@ -133,14 +192,15 @@ func (g *Groups) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 		switch key {
 		case "esc":
 			g.mode = groupsList
+			g.list = g.groupList
 			g.reload()
 		case "m":
 			g.openPick()
-		case "s":
+		case "t":
 			if !g.busy {
 				return g, g.testGroupMembers()
 			}
-		case " ", "enter":
+		case " ":
 			if c, ok := g.curMember(); ok {
 				if g.cur.Type != "select" {
 					g.err = fmt.Errorf("仅 select 组可手动选择当前节点")
@@ -151,10 +211,16 @@ func (g *Groups) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 					return g, nil
 				}
 				g.err = nil
-				g.status = "已选择 " + c.label
+				g.status = "已保存选择 " + c.label + "；Ctrl+A 应用后生效"
+				g.app.MarkConfigDirty()
 				g.reload()
 				g.reloadDetail()
 			}
+		case "r":
+			g.reload()
+			return g, g.fetchRuntime()
+		case "enter", "alt+enter":
+			g.openDetails("成员详情", g.memberDetails())
 		}
 		return g, nil
 
@@ -178,12 +244,19 @@ func (g *Groups) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 			}
 		case "enter", "m":
 			if grp, ok := g.selectedGroup(); ok {
+				g.groupList = g.list
+				g.list = components.SimpleList{}
 				g.cur = grp
 				g.mode = groupsDetail
 				g.reloadDetail()
 			}
+		case "alt+enter":
+			if grp, ok := g.selectedGroup(); ok {
+				g.openDetails("代理组详情", g.groupDetails(grp))
+			}
 		case "r":
 			g.reload()
+			return g, g.fetchRuntime()
 		}
 		return g, nil
 	}
@@ -193,7 +266,10 @@ func (g *Groups) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 
 func (g *Groups) reload() {
 	groups, err := g.app.DB.ListProxyGroups()
-	g.groups, g.err = groups, err
+	g.groups = groups
+	if err != nil {
+		g.err = err
+	}
 	nodes, err := g.app.DB.ListNodes(0)
 	if err == nil {
 		g.nodes = nodes
@@ -202,16 +278,26 @@ func (g *Groups) reload() {
 	if err == nil {
 		g.subs = subs
 	}
+	if g.mode == groupsDetail {
+		g.reloadDetail()
+		return
+	}
+	if g.mode == groupsPick {
+		return
+	}
+	selectedKey := g.list.SelectedKey()
 	g.list.Items = nil
+	g.list.Keys = nil
 	for _, grp := range groups {
 		selected := ""
 		if grp.Type == "select" {
 			selected = "当前:" + g.memberLabel(grp.Selected)
 		}
 		g.list.Items = append(g.list.Items,
-			fmt.Sprintf("%-16s [%-7s] %3d 成员  %s", grp.Name, grp.Type, len(grp.Members), selected))
+			fmt.Sprintf("%s [%-7s] %3d 成员  %s", components.Pad(grp.Name, max(12, g.width/4)), grp.Type, len(grp.Members), selected))
+		g.list.Keys = append(g.list.Keys, strconv.FormatInt(grp.ID, 10))
 	}
-	g.clampListCursor(len(groups))
+	g.list.SelectKey(selectedKey)
 }
 
 // reloadDetail 重建组详情视图的成员列表。
@@ -223,16 +309,25 @@ func (g *Groups) reloadDetail() {
 	if grp, err := g.app.DB.GetProxyGroup(g.cur.ID); err == nil {
 		g.cur = grp
 	}
+	selected := g.list.SelectedKey()
+	members, err := g.app.Proxy.EffectiveMembers(g.cur.ID)
+	if err != nil {
+		g.err = err
+		return
+	}
+	g.members = members
 	g.list.Items = nil
-	for _, mem := range g.cur.Members {
+	g.list.Keys = nil
+	for _, mem := range members {
 		label := g.memberLabel(mem.MemberKey())
 		marker := ""
 		if g.cur.Type == "select" && mem.MemberKey() == g.cur.Selected {
-			marker = "● 当前 "
+			marker = "[已保存] "
 		}
 		g.list.Items = append(g.list.Items, marker+label)
+		g.list.Keys = append(g.list.Keys, mem.MemberKey())
 	}
-	g.clampListCursor(len(g.cur.Members))
+	g.list.SelectKey(selected)
 }
 
 // memberLabel 把成员键解析为展示文本。
@@ -270,6 +365,10 @@ func (g *Groups) openPick() {
 		return
 	}
 	g.pickSet = map[string]bool{}
+	g.pickList = components.SimpleList{}
+	g.pickSearch = textinput.New()
+	g.pickQuery = ""
+	g.pickTyping = false
 	g.pickOrder = nil
 	for _, mem := range g.cur.Members {
 		k := mem.MemberKey()
@@ -312,57 +411,25 @@ func (g *Groups) buildCandidates() {
 
 // refreshPickItems 按勾选状态重建勾选列表项（已勾选的排前面，保持顺序）。
 func (g *Groups) refreshPickItems() {
-	g.pickList.Items = nil
-	// 已勾选的按 pickOrder 顺序
-	shown := map[string]bool{}
-	for _, k := range g.pickOrder {
-		if c, ok := g.candByKey(k); ok {
-			g.pickList.Items = append(g.pickList.Items, "[x] "+c.label)
-			shown[k] = true
-		}
-	}
+	var items, keys []string
 	for _, c := range g.cands {
-		if !shown[c.key] {
-			g.pickList.Items = append(g.pickList.Items, "[ ] "+c.label)
+		if !strings.Contains(strings.ToLower(c.label), strings.ToLower(g.pickQuery)) {
+			continue
 		}
-	}
-	g.clampPickCursor(len(g.pickList.Items))
-}
-
-func (g *Groups) candByKey(key string) (pickCandidate, bool) {
-	for _, c := range g.cands {
-		if c.key == key {
-			return c, true
+		mark := "[ ] "
+		if g.pickSet[c.key] {
+			mark = "[x] "
 		}
+		items = append(items, mark+c.label)
+		keys = append(keys, c.key)
 	}
-	return pickCandidate{}, false
+	g.pickList.SetItems(items, keys)
 }
 
 // pickCursorKey 当前光标位置对应的候选键（列表前段是已勾选项）。
 func (g *Groups) pickCursorKey() (string, bool) {
-	i := g.pickList.Cursor
-	if i < 0 || i >= len(g.pickList.Items) {
-		return "", false
-	}
-	// 前段为已勾选项（顺序同 pickOrder），其后为未勾选候选
-	if i < len(g.pickOrder) {
-		return g.pickOrder[i], true
-	}
-	idx := i - len(g.pickOrder)
-	unchecked := make([]string, 0, len(g.cands))
-	shown := map[string]bool{}
-	for _, k := range g.pickOrder {
-		shown[k] = true
-	}
-	for _, c := range g.cands {
-		if !shown[c.key] {
-			unchecked = append(unchecked, c.key)
-		}
-	}
-	if idx >= len(unchecked) {
-		return "", false
-	}
-	return unchecked[idx], true
+	key := g.pickList.SelectedKey()
+	return key, key != ""
 }
 
 func (g *Groups) togglePick() {
@@ -401,7 +468,8 @@ func (g *Groups) confirmPick() {
 		return
 	}
 	g.err = nil
-	g.status = fmt.Sprintf("代理组 %q 成员已保存（%d 项）", g.cur.Name, len(members))
+	g.status = fmt.Sprintf("代理组 %q 成员已保存（%d 项）；Ctrl+A 应用", g.cur.Name, len(members))
+	g.app.MarkConfigDirty()
 	g.mode = groupsDetail
 	g.reload() // 先刷新组缓存（memberLabel 依赖），再重建详情条目
 	g.reloadDetail()
@@ -430,6 +498,8 @@ func (g *Groups) openForm(kind string) {
 		[]string{"name", "type", "url", "interval"},
 		[]string{"如 AI / Streaming", "select 或 urltest", "urltest 用，留空用默认", "urltest 用，如 300"})
 	g.form.Reset()
+	g.form.SetOptions("type", "select", "urltest")
+	configureGroupForm(&g.form)
 	g.err = nil
 	g.mode = groupsForm
 }
@@ -443,10 +513,12 @@ func (g *Groups) openFormEdit(grp *config.ProxyGroup) {
 		[]string{"", "", "", ""})
 	g.form.SetValueByKey("name", grp.Name)
 	g.form.SetValueByKey("type", grp.Type)
+	g.form.SetOptions("type", "select", "urltest")
 	g.form.SetValueByKey("url", grp.TestURL)
 	if grp.IntervalS > 0 {
 		g.form.SetValueByKey("interval", strconv.Itoa(grp.IntervalS))
 	}
+	configureGroupForm(&g.form)
 	g.err = nil
 	g.mode = groupsForm
 }
@@ -468,8 +540,12 @@ func (g *Groups) submitForm() {
 		}
 		g.err = nil
 		g.status = "代理组已创建，请选择成员"
+		g.app.MarkConfigDirty()
 		g.reload()
 		g.cur = grp
+		g.list.SelectKey(strconv.FormatInt(grp.ID, 10))
+		g.groupList = g.list
+		g.list = components.SimpleList{}
 		g.openPick() // 新建后直接进入成员勾选
 		return
 	}
@@ -486,6 +562,7 @@ func (g *Groups) submitForm() {
 	}
 	g.err = nil
 	g.status = "代理组已保存"
+	g.app.MarkConfigDirty()
 	g.mode = groupsList
 	g.reload()
 }
@@ -506,15 +583,20 @@ func (g *Groups) testGroupMembers() tea.Cmd {
 		g.err = fmt.Errorf("组内没有可测速的节点")
 		return nil
 	}
+	return g.testMembers(ids)
+}
+
+func (g *Groups) testMembers(ids []int64) tea.Cmd {
+	if g.busy || len(ids) == 0 {
+		return nil
+	}
 	g.busy = true
 	g.status = fmt.Sprintf("正在测速 %d 个节点…", len(ids))
 	g.err = nil
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-		_, err := g.app.Proxy.TestLatency(ctx, ids, "", 3000)
-		return actionDoneMsg{Action: "test-latency", Err: err}
-	}
+	g.retryTask = func() tea.Cmd { return g.testMembers(failedIDs(g.taskResults)) }
+	return g.taskN("代理组测速", len(ids), func(report func(itemResult)) tea.Msg {
+		return latencyResults(g.app, ids, report)
+	})
 }
 
 // memberNodeIDs 收集组成员节点 ID（含 all 展开与嵌套组递归，带环保护）。
@@ -581,6 +663,9 @@ func (g *Groups) memberNodeIDs() ([]int64, error) {
 // --- 消息处理 ---
 
 func (g *Groups) onActionDone(msg actionDoneMsg) (Page, tea.Cmd) {
+	if !g.accept(msg) {
+		return g, nil
+	}
 	g.busy = false
 	if msg.Err != nil {
 		g.err = msg.Err
@@ -588,7 +673,7 @@ func (g *Groups) onActionDone(msg actionDoneMsg) (Page, tea.Cmd) {
 	} else {
 		g.err = nil
 		if msg.Action == "test-latency" {
-			g.status = "测速完成"
+			g.status = "代理组测速：" + resultSummary(msg.Results) + " · v 详情"
 		}
 	}
 	if g.mode == groupsDetail {
@@ -610,6 +695,7 @@ func (g *Groups) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 		} else {
 			g.err = nil
 			g.status = "代理组已删除"
+			g.app.MarkConfigDirty()
 		}
 		g.reload()
 	}
@@ -619,43 +705,54 @@ func (g *Groups) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 // --- 渲染 ---
 
 func (g *Groups) View() string {
+	g.table()
+	g.preview = ""
+	if g.mode == groupsDetail {
+		g.preview = g.memberDetails()
+	}
+	if g.mode == groupsList {
+		if grp, ok := g.selectedGroup(); ok {
+			g.preview = g.groupDetails(grp)
+		}
+	}
+
+	if g.detailActive {
+		return g.detailsView()
+	}
 	switch g.mode {
 	case groupsForm:
-		return g.form.View()
+		return g.formView(&g.form, g.err)
 	case groupsConfirm:
-		return g.confirm.View()
+		return g.confirmView(&g.confirm)
 	case groupsPick:
-		head := styles.Title.Render("选择成员") +
-			styles.Dim.Render(fmt.Sprintf(" — %s（space 勾选/取消 · enter 完成 · esc 放弃）", g.cur.Name))
-		return head + "\n" + g.pickList.View("没有可选择的成员。") + g.statusLine()
-	case groupsDetail:
-		head := styles.Title.Render("代理组") +
-			styles.Dim.Render(fmt.Sprintf(" — %s [%s]（%d 成员）", g.cur.Name, g.cur.Type, len(g.cur.Members)))
-		body := g.list.View("组内暂无成员，按 m 勾选。")
-		hint := "\nm 勾选成员 · s 测速组成员"
-		if g.cur.Type == "select" {
-			hint += " · space/enter 设为当前"
+		head := fmt.Sprintf("选择成员 · %s · 已选 %d 项", g.cur.Name, len(g.pickOrder))
+		if g.pickTyping {
+			g.pickSearch.Width = max(5, g.width-10)
+			head = "搜索: " + g.pickSearch.View()
 		}
-		return head + "\n" + body + g.statusLine() + styles.Dim.Render(hint+" · esc 返回")
+		return g.listView(&g.pickList, head, "没有匹配的成员；c 清除搜索", g.statusLine(), "Space 勾选 · / 搜索 · c 清除 · Ctrl+S 保存 · Esc 放弃")
+	case groupsDetail:
+		head := fmt.Sprintf("代理组 / %s [%s] · %d 个可用成员", g.cur.Name, g.cur.Type, len(g.members))
+		runtime := "未运行"
+		if g.app.Core.IsRunning() {
+			runtime = "读取中，请 r 刷新"
+			if g.runtimeAt.Equal(g.app.Core.Status().StartedAt) {
+				if info, ok := g.runtime[g.cur.Name]; ok {
+					runtime = info.Now
+				}
+			}
+		}
+		feedback := "保存选择: " + g.memberLabel(g.cur.Selected) + " · 运行实际: " + runtime + g.statusLine()
+		return g.listView(&g.list, head, "暂无可用成员；m 添加成员或启用订阅/节点。", feedback,
+			Hints(g))
 	default:
-		head := styles.Title.Render("代理组") + "\n"
-		body := g.list.View("暂无代理组。")
-		return head + body + g.statusLine() +
-			styles.Dim.Render("\na 新建 · e 编辑 · enter/m 成员与选择 · d 删除 · r 刷新")
+		return g.listView(&g.list, "代理组", "暂无代理组，a 新建。", g.statusLine(),
+			Hints(g))
 	}
 }
 
 func (g *Groups) statusLine() string {
-	var b string
-	if g.busy {
-		b += "\n" + styles.Accent.Render(g.status)
-	} else if g.status != "" {
-		b += "\n" + styles.Ok.Render(g.status)
-	}
-	if g.err != nil {
-		b += "\n" + styles.Err.Render("错误: "+g.err.Error())
-	}
-	return b
+	return g.feedback(g.status, g.err)
 }
 
 func (g *Groups) selectedGroup() (*config.ProxyGroup, bool) {
@@ -667,27 +764,30 @@ func (g *Groups) selectedGroup() (*config.ProxyGroup, bool) {
 
 func (g *Groups) curMember() (pickCandidate, bool) {
 	// 详情视图光标对应 cur.Members 的位置
-	if g.list.Cursor < 0 || g.cur == nil || g.list.Cursor >= len(g.cur.Members) {
+	if g.list.Cursor < 0 || g.cur == nil || g.list.Cursor >= len(g.members) {
 		return pickCandidate{}, false
 	}
-	key := g.cur.Members[g.list.Cursor].MemberKey()
+	key := g.members[g.list.Cursor].MemberKey()
 	return pickCandidate{key: key, label: g.memberLabel(key)}, true
 }
 
-func (g *Groups) clampListCursor(n int) {
-	if g.list.Cursor >= n {
-		g.list.Cursor = n - 1
-	}
-	if g.list.Cursor < 0 {
-		g.list.Cursor = 0
-	}
+// Runtime feedback is bound to the core instance that supplied it.
+type groupRuntimeMsg struct {
+	startedAt time.Time
+	proxies   map[string]clashapi.ProxyInfo
 }
 
-func (g *Groups) clampPickCursor(n int) {
-	if g.pickList.Cursor >= n {
-		g.pickList.Cursor = n - 1
+func (g *Groups) fetchRuntime() tea.Cmd {
+	startedAt := g.app.Core.Status().StartedAt
+	client := g.app.ClashClient()
+	if startedAt.IsZero() || client == nil {
+		g.runtime = nil
+		return nil
 	}
-	if g.pickList.Cursor < 0 {
-		g.pickList.Cursor = 0
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(g.app.BackgroundContext(), 3*time.Second)
+		defer cancel()
+		proxies, _ := client.Proxies(ctx)
+		return groupRuntimeMsg{startedAt: startedAt, proxies: proxies}
 	}
 }

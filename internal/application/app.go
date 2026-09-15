@@ -4,6 +4,7 @@ package application
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"github.com/bbbstyyy/karing-tui/internal/dns"
 	"github.com/bbbstyyy/karing-tui/internal/platform"
 	"github.com/bbbstyyy/karing-tui/internal/proxy"
+	"github.com/bbbstyyy/karing-tui/internal/redact"
 	"github.com/bbbstyyy/karing-tui/internal/routing"
 	"github.com/bbbstyyy/karing-tui/internal/rules"
 	"github.com/bbbstyyy/karing-tui/internal/storage"
@@ -41,11 +43,25 @@ type App struct {
 	// AppLog 是程序自身日志的环形缓冲，供 TUI Logs 页查看。
 	AppLog *core.LogBuf
 
-	mu              sync.Mutex
-	settingsMu      sync.RWMutex
-	configGenerated bool
-	lastCheckAt     time.Time
-	lastCheckErr    error
+	mu                             sync.Mutex
+	configOpMu                     sync.Mutex
+	operationMu                    sync.RWMutex
+	restored                       bool
+	backgroundCtx                  context.Context
+	cancelBackground               context.CancelFunc
+	configStateMu                  sync.RWMutex
+	revision                       uint64
+	generatedRevision              uint64
+	appliedRevision                uint64
+	generatedSettings              config.Settings
+	runningSettings                config.Settings
+	runningSettingsKnown           bool
+	generatedHash, appliedHash     [32]byte
+	generatedConfig, runningConfig []byte
+	settingsMu                     sync.RWMutex
+	configGenerated                bool
+	lastCheckAt                    time.Time
+	lastCheckErr                   error
 
 	logFile io.WriteCloser
 	logger  *log.Logger
@@ -142,6 +158,7 @@ func newApp(paths *platform.Paths, initializeDefaults bool) (*App, error) {
 	}
 
 	a.logf("Karing TUI 启动，数据目录: %s", paths.Root)
+	a.backgroundCtx, a.cancelBackground = context.WithCancel(context.Background())
 	return a, nil
 }
 
@@ -165,6 +182,12 @@ func NewExclusive(paths *platform.Paths) (*App, error) {
 
 // Close 停止核心、关闭日志与数据库。
 func (a *App) Close() error {
+	if a.cancelBackground != nil {
+		a.cancelBackground()
+	}
+	a.operationMu.Lock()
+	defer a.operationMu.Unlock()
+	a.restored = true
 	if err := a.Core.Stop(); err != nil {
 		a.logf("停止核心失败: %v", err)
 	}
@@ -178,6 +201,13 @@ func (a *App) Close() error {
 		return dbErr
 	}
 	return lockErr
+}
+
+func (a *App) BackgroundContext() context.Context {
+	if a.backgroundCtx != nil {
+		return a.backgroundCtx
+	}
+	return context.Background()
 }
 
 // ReopenDB 重新打开数据库，并让所有领域 manager 使用新连接。
@@ -198,7 +228,7 @@ func (a *App) ReopenDB() error {
 
 func (a *App) logf(format string, args ...any) {
 	if a.logger != nil {
-		a.logger.Printf(format, args...)
+		a.logger.Print(redact.Text(fmt.Sprintf(format, args...)))
 	}
 }
 
@@ -220,6 +250,12 @@ func (a *App) SetSettings(s config.Settings) {
 
 // GenerateConfig 由内部模型生成 sing-box 配置并写入 runtime/config.json，先备份上一份。
 func (a *App) GenerateConfig(ctx context.Context) error {
+	a.configOpMu.Lock()
+	defer a.configOpMu.Unlock()
+	return a.generateConfig(ctx)
+}
+
+func (a *App) generateConfig(ctx context.Context) error {
 	// 补全规则集本地缓存（尽力而为；失败时生成远程引用，由 sing-box 启动时下载）
 	if err := a.Rules.EnsureCached(ctx); err != nil {
 		a.logf("规则集缓存补全失败: %v", err)
@@ -227,6 +263,9 @@ func (a *App) GenerateConfig(ctx context.Context) error {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.configStateMu.RLock()
+	revision := a.revision
+	a.configStateMu.RUnlock()
 
 	snap, err := a.buildSnapshot()
 	if err != nil {
@@ -271,7 +310,15 @@ func (a *App) GenerateConfig(ctx context.Context) error {
 	if err := replaceFile(tmpPath, a.Paths.Config); err != nil {
 		return fmt.Errorf("替换配置文件失败: %w", err)
 	}
+	a.configStateMu.Lock()
 	a.configGenerated = true
+	a.generatedRevision = revision
+	a.generatedSettings = snap.Settings
+	a.generatedHash = sha256.Sum256(out)
+	a.generatedConfig = append([]byte(nil), out...)
+	a.lastCheckAt = time.Time{}
+	a.lastCheckErr = nil
+	a.configStateMu.Unlock()
 	a.logf("配置已生成: %s", a.Paths.Config)
 	return nil
 }
@@ -329,12 +376,20 @@ func (a *App) buildSnapshot() (config.Snapshot, error) {
 
 // CheckConfig 校验生成的配置；结果缓存在 App 供 Dashboard 展示。
 func (a *App) CheckConfig(ctx context.Context) error {
+	a.configOpMu.Lock()
+	defer a.configOpMu.Unlock()
+	return a.checkConfig(ctx)
+}
+
+func (a *App) checkConfig(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	err := a.Core.Check(ctx, a.Paths.Config)
+	a.configStateMu.Lock()
 	a.lastCheckAt = time.Now()
 	a.lastCheckErr = err
+	a.configStateMu.Unlock()
 	if err != nil {
 		a.logf("配置校验失败: %v", err)
 		return err
@@ -345,14 +400,65 @@ func (a *App) CheckConfig(ctx context.Context) error {
 
 // ConfigStatus 返回配置状态描述。
 func (a *App) ConfigStatus() (generated bool, lastCheckAt time.Time, lastCheckErr error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.configStateMu.RLock()
+	defer a.configStateMu.RUnlock()
 	return a.configGenerated, a.lastCheckAt, a.lastCheckErr
+}
+
+// MarkConfigDirty records a model change without waiting for network or core
+// operations. UI feedback must remain responsive while a config is checked.
+func (a *App) MarkConfigDirty() {
+	a.configStateMu.Lock()
+	a.revision++
+	a.configStateMu.Unlock()
+}
+
+func (a *App) ConfigStage() string {
+	running := a.Core.IsRunning()
+	a.configStateMu.RLock()
+	defer a.configStateMu.RUnlock()
+	if !a.configGenerated || a.revision != a.generatedRevision {
+		return "已保存 · 待生成/校验"
+	}
+	if a.lastCheckAt.IsZero() {
+		return "已生成 · 待校验"
+	}
+	if a.lastCheckErr != nil {
+		return "校验失败 · 待修正"
+	}
+	if running && a.appliedRevision == a.generatedRevision && a.runningSettingsKnown && a.generatedHash == a.appliedHash {
+		return "运行中已生效"
+	}
+	return "校验通过 · 待应用"
+}
+
+func (a *App) recordApplied() {
+	a.configStateMu.Lock()
+	defer a.configStateMu.Unlock()
+	a.appliedRevision = a.generatedRevision
+	a.appliedHash = a.generatedHash
+	a.runningConfig = append([]byte(nil), a.generatedConfig...)
+	a.runningSettings = a.generatedSettings
+	a.runningSettingsKnown = true
+}
+
+// CoreSettings returns the settings loaded by the running core, or the saved
+// settings while stopped. Saving pending settings must not change runtime views.
+func (a *App) CoreSettings() config.Settings {
+	set := a.GetSettings()
+	if a.Core.IsRunning() {
+		a.configStateMu.RLock()
+		if a.runningSettingsKnown {
+			set = a.runningSettings
+		}
+		a.configStateMu.RUnlock()
+	}
+	return set
 }
 
 // ClashClient 返回 clash API 客户端；未开启（端口为 0）时返回 nil。
 func (a *App) ClashClient() *clashapi.Client {
-	set := a.GetSettings()
+	set := a.CoreSettings()
 	if set.ClashAPIPort <= 0 || set.ClashAPIPort > 65535 {
 		return nil
 	}
@@ -363,16 +469,19 @@ func (a *App) ClashClient() *clashapi.Client {
 
 // StartCore 确保二进制存在 → 从最新数据库快照生成并校验配置 → 启动。
 func (a *App) StartCore(ctx context.Context) error {
+	a.configOpMu.Lock()
+	defer a.configOpMu.Unlock()
 	a.logf("正在启动 sing-box…")
-	if !a.Core.IsRunning() {
+	wasRunning := a.Core.IsRunning()
+	if !wasRunning {
 		if _, err := a.Bin.Ensure(ctx); err != nil {
 			a.logf("sing-box 二进制不可用: %v", err)
 			return err
 		}
-		if err := a.GenerateConfig(ctx); err != nil {
+		if err := a.generateConfig(ctx); err != nil {
 			return err
 		}
-		if err := a.CheckConfig(ctx); err != nil {
+		if err := a.checkConfig(ctx); err != nil {
 			return err
 		}
 	}
@@ -380,12 +489,17 @@ func (a *App) StartCore(ctx context.Context) error {
 		a.logf("启动失败: %v", err)
 		return err
 	}
+	if !wasRunning {
+		a.recordApplied()
+	}
 	a.logf("sing-box 已启动，mixed 端口 %d", a.GetSettings().MixedPort)
 	return nil
 }
 
 // StopCore 停止 sing-box。
 func (a *App) StopCore() error {
+	a.configOpMu.Lock()
+	defer a.configOpMu.Unlock()
 	a.logf("正在停止 sing-box…")
 	if err := a.Core.Stop(); err != nil {
 		a.logf("停止失败: %v", err)
@@ -397,20 +511,23 @@ func (a *App) StopCore() error {
 
 // RestartCore 从最新应用状态生成并校验配置后重启 sing-box。
 func (a *App) RestartCore(ctx context.Context) error {
+	a.configOpMu.Lock()
+	defer a.configOpMu.Unlock()
 	if _, err := a.Bin.Ensure(ctx); err != nil {
 		a.logf("sing-box 二进制不可用: %v", err)
 		return err
 	}
-	if err := a.GenerateConfig(ctx); err != nil {
+	if err := a.generateConfig(ctx); err != nil {
 		return err
 	}
-	if err := a.CheckConfig(ctx); err != nil {
+	if err := a.checkConfig(ctx); err != nil {
 		return err
 	}
 	if err := a.Core.Restart(ctx, a.Paths.Config); err != nil {
 		a.logf("重启失败: %v", err)
 		return err
 	}
+	a.recordApplied()
 	a.logf("sing-box 已重启")
 	return nil
 }
@@ -447,6 +564,11 @@ func (a *App) StartAutoUpdate(ctx context.Context) {
 // AutoUpdateOnce 执行一轮自动更新：更新全部启用订阅并按需重新生成配置。
 // 返回成功更新的订阅数。
 func (a *App) AutoUpdateOnce(ctx context.Context) int {
+	release, err := a.BeginOperation()
+	if err != nil {
+		return 0
+	}
+	defer release()
 	subs, err := a.DB.ListSubscriptions()
 	if err != nil {
 		a.logf("自动更新读取订阅失败: %v", err)
@@ -463,6 +585,7 @@ func (a *App) AutoUpdateOnce(ctx context.Context) int {
 			continue
 		}
 		ok++
+		a.MarkConfigDirty()
 	}
 	if ok == 0 {
 		if failed > 0 {
