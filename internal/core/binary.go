@@ -36,6 +36,20 @@ type BinaryManager struct {
 	paths      *platform.Paths
 	proxy      string // 下载代理，如 http://127.0.0.1:7890；空为直连
 	embeddedMu sync.Mutex
+
+	versionMu    sync.Mutex
+	versionCache versionCacheEntry
+}
+
+// versionCacheEntry 按二进制身份（路径 + mtime + 大小）缓存版本号。
+// TUI 每帧渲染都会经 Manager.Status() 查询版本，没有缓存时每次都要
+// 执行 `sing-box version` 子进程，滚动列表时明显卡顿。二进制被替换
+// （下载更新 / 释放内置）后 mtime 或大小变化，缓存自动失效。
+type versionCacheEntry struct {
+	path    string
+	modTime time.Time
+	size    int64
+	version string
 }
 
 // NewBinaryManager 创建二进制管理器。
@@ -114,15 +128,33 @@ func (b *BinaryManager) installEmbedded(data []byte) error {
 	return nil
 }
 
-// Version 返回 sing-box 版本号（如 "1.14.0"）。
+// Version 返回 sing-box 版本号（如 "1.14.0"）。同一二进制的结果会被缓存，
+// 避免每帧渲染都执行 `sing-box version` 子进程。
 func (b *BinaryManager) Version(ctx context.Context) (string, error) {
 	bin, err := b.Resolve()
 	if err != nil {
 		return "", err
 	}
+	if info, statErr := os.Stat(bin); statErr == nil {
+		b.versionMu.Lock()
+		c := b.versionCache
+		b.versionMu.Unlock()
+		if c.path == bin && c.modTime.Equal(info.ModTime()) && c.size == info.Size() {
+			return c.version, nil
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	return b.versionOf(ctx, bin)
+	version, err := b.versionOf(ctx, bin)
+	if err != nil {
+		return "", err
+	}
+	if info, statErr := os.Stat(bin); statErr == nil {
+		b.versionMu.Lock()
+		b.versionCache = versionCacheEntry{path: bin, modTime: info.ModTime(), size: info.Size(), version: version}
+		b.versionMu.Unlock()
+	}
+	return version, nil
 }
 
 func (b *BinaryManager) versionOf(ctx context.Context, bin string) (string, error) {
