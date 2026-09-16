@@ -41,7 +41,18 @@ func (r *Rules) selectionDetails() string {
 	switch r.mode {
 	case rulesGroups:
 		if g, ok := r.selectedGroup(); ok {
-			return fmt.Sprintf("名称: %s\n目标: %s\n规则: %d 条\n状态: %s\nEnter 查看组内规则", g.Name, g.Target, len(g.Rules), enabledLabel(g.Enabled))
+			source := ""
+			if presetGroupNames[g.Name] {
+				source = fmt.Sprintf("\n来源: 地区预置 cn（删除后按 P 重新导入恢复）")
+			}
+			return fmt.Sprintf("名称: %s\n层: %s（层内第 %d 位）\n目标: %s\n规则: %d 条\n状态: %s%s\nEnter 查看组内规则 · m 跨层移动",
+				g.Name, config.KindLabel(g.Layer()), g.Position+1, g.Target, len(g.Rules), enabledLabel(g.Enabled), source)
+		}
+	case rulesMove:
+		if i := r.moveList.Cursor; i >= 0 && i < len(r.moveKinds) {
+			kind := r.moveKinds[i]
+			return fmt.Sprintf("目标层: %s\n层序: %s\n\nEnter 选择该层；层序靠前的层优先级更高。",
+				config.KindLabel(kind), strings.Join(config.Kinds, " < "))
 		}
 	case rulesGroupRl:
 		if i, ok := r.selectedRuleIdx(); ok {

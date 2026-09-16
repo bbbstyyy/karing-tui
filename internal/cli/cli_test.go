@@ -117,14 +117,14 @@ func TestRouteTest(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := db.CreateRoutingGroup(&config.RoutingGroup{
-		Name: "测试直连", Target: "DIRECT", Position: -1, Enabled: true,
+		Name: "测试直连", Target: "DIRECT", Kind: config.KindCustom, Position: -1, Enabled: true,
 		Rules: []config.Rule{{Type: "domain_suffix", Value: "example.com", Enabled: true}},
 	}); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
 	if err := db.CreateRoutingGroup(&config.RoutingGroup{
-		Name: "测试兜底", Target: "BLOCK", Position: 99, Enabled: true,
+		Name: "测试兜底", Target: "BLOCK", Kind: config.KindFinal, Position: 99, Enabled: true,
 		Rules: []config.Rule{{Type: "final", Enabled: true}},
 	}); err != nil {
 		db.Close()

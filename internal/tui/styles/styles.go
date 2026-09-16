@@ -23,6 +23,9 @@ var (
 	// Selected 是列表选中项。
 	Selected = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "235", Dark: "255"}).Background(lipgloss.AdaptiveColor{Light: "253", Dark: "238"})
 
+	// Heading 是列表里的分组标题（Rules 页的层标题）。
+	Heading = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "30", Dark: "116"})
+
 	// Box 是内容面板边框。
 	Box = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("238")).Padding(0, 1)
 

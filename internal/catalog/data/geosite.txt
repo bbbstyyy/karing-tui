@@ -1,5 +1,6 @@
-# geosite 分类码（MetaCubeX/meta-rules-dat sing 分支 geo/geosite）
+# geosite 分类码（内嵌快照 internal/catalog/data/rulesets/geosite，来源 Karing 规则集包）
 # 由 scripts/gen-catalog.sh 生成，请勿手工编辑
+# 快照之外的 8 个码（上游仍提供、无内嵌 .srs，引用时按需下载）: 0x0 activision activision-blizzard amplitude amplitude@ads newgrounds nordvpn vixengroup 
 0x0
 115
 1337x
@@ -23,6 +24,7 @@
 800best
 8btc
 928plus
+9game
 9news
 9to5
 aamgame
@@ -33,11 +35,13 @@ acer
 acer@cn
 acfun
 acfun@ads
+acplay
 actalis
 activision
 activision-blizzard
 adblock
 adblockplus
+adcolony-ads
 addthis
 addtoany
 adguard
@@ -49,8 +53,10 @@ adobe
 adobe-activation
 adobe@ads
 adobe@cn
+ads
 aerogard
 aerogard@cn
+af
 afdian
 afp
 agilebits
@@ -91,6 +97,7 @@ amazon@cn
 amazontrust
 amc
 amd
+amd@cn
 amp
 amp@cn
 amplitude
@@ -129,6 +136,7 @@ apple-update
 apple@ads
 apple@cn
 appledaily
+applovin-ads
 applysquare
 aptoide
 archive
@@ -144,6 +152,7 @@ asproex
 asus
 asus@cn
 atlassian
+atom-data-ads
 att
 att@cn
 attwatchtv
@@ -151,6 +160,7 @@ autodesk
 autoru
 auxgroup
 auxgroup@!cn
+available-only-inside@ru
 avaxhome
 aviasales
 avito
@@ -207,6 +217,7 @@ bitwarden
 bjyouth
 blender
 blizzard
+blocked@ru
 blogspot
 bloomberg
 bluearchive
@@ -232,6 +243,7 @@ borneoschematics
 boslife
 boxun
 boylove
+br
 braveux
 brazzers
 bridgestone
@@ -272,9 +284,13 @@ catchplay
 category-acg
 category-ads
 category-ads-all
+category-ads-all@!cn
 category-ads-all@ads
+category-ads-all@cn
 category-ads-ir
+category-ads@!cn
 category-ads@ads
+category-ads@cn
 category-ai-!cn
 category-ai-!cn@!cn
 category-ai-!cn@ads
@@ -299,6 +315,7 @@ category-blog-cn
 category-bourse-ir
 category-browser-!cn
 category-cas
+category-cas@ads
 category-cas@cn
 category-cdn-!cn
 category-cdn-!cn@cn
@@ -510,6 +527,7 @@ clubhouse
 cmb
 cmb@!cn
 cn
+cn@ads
 cnb
 cnbc
 cnbeta
@@ -543,6 +561,7 @@ cowlevel
 cowtransfer
 craigslist
 creativecommons
+cryptominers
 csdn
 csis
 ctexcel
@@ -609,6 +628,8 @@ dmm
 dmm-porn
 dmm@ads
 dnspod
+doc88
+docin
 docker
 doi
 dola
@@ -659,6 +680,7 @@ elsevier
 embark
 embedly
 embl
+emogi-ads
 emojipedia
 eneba
 enfa
@@ -720,6 +742,7 @@ flibusta
 flickr
 flowus
 flowwow
+flurry-ads
 flutter
 flyio
 focuschina
@@ -742,6 +765,7 @@ ft
 ftv
 funpay
 futu
+futu@cn
 fzdm
 gaijin
 gamersky
@@ -756,7 +780,9 @@ geetest
 gemfury
 genotek-ru
 geolocation-!cn
+geolocation-!cn@ads
 geolocation-cn
+geolocation-cn@ads
 geolocation-cn@cn
 gettyimages
 getui
@@ -768,6 +794,7 @@ gigabyte
 gigabyte@cn
 gimy
 gismeteo
+gismeteo-ru
 gitbook
 gitee
 github
@@ -816,6 +843,7 @@ gree
 groq
 group-ib
 growingio
+growingio-ads
 gucci
 gucci@cn
 guo
@@ -841,6 +869,7 @@ heroku
 hetzner
 hetzner@ads
 heyzo
+hiido-ads
 hikvision
 hinet
 hinet-eca
@@ -852,6 +881,7 @@ hkedcity
 hketgroup
 hketgroup@cn
 hkgolden
+hkopentv
 hkt
 hku
 hkust
@@ -862,6 +892,7 @@ homedepot
 hongkongpost
 honor
 hooligapps
+hotjar-ads
 hotstar
 hoyoverse
 hoyoverse@ads
@@ -900,6 +931,7 @@ icbc@!cn
 icloud
 icloud@cn
 icloudprivaterelay
+id
 ideco-ru
 identrust
 idg
@@ -926,6 +958,7 @@ imgur
 imperialcollege
 infowars
 infrapedia
+inner-active-ads
 inoreader
 inshot
 insider
@@ -943,6 +976,7 @@ ipip@!cn
 iqiyi
 iqiyi@!cn
 iqiyi@ads
+ir
 isgd
 ishumei
 itchio
@@ -1005,6 +1039,7 @@ kinopoisk
 kinopub
 kkbox
 kktv
+knovel
 kodi
 kodik
 konachan
@@ -1045,6 +1080,7 @@ le@ads
 lenovo
 lethalhardcore
 letsencrypt
+letv-ads
 lg
 lianjia
 liberapay
@@ -1091,6 +1127,7 @@ mailru-group
 mailru-group@ads
 mailru@ads
 mainichi
+malware
 manhuagui
 manhuaren
 manorama
@@ -1130,6 +1167,7 @@ microsoft
 microsoft-dev
 microsoft-dev@cn
 microsoft-pki
+microsoft-pki@cn
 microsoft@ads
 microsoft@cn
 midea
@@ -1164,6 +1202,7 @@ momo
 mongodb
 monotype
 moonvy
+mopub-ads
 morisawa
 mortein
 mortein@cn
@@ -1187,6 +1226,7 @@ muji
 muji@cn
 musixmatch
 mvideo
+mxplayer-ads
 mxroute
 mydirtyhobby
 myfonts
@@ -1212,6 +1252,7 @@ netlify
 neuralink
 newegg
 newgrounds
+newrelic-ads
 newscorp
 newsmax
 nexitally
@@ -1243,6 +1284,7 @@ notion
 now
 nowcoder
 npmjs
+nsfw
 nudevista
 nurofen
 nurofen@cn
@@ -1292,6 +1334,7 @@ oreilly@cn
 organicmaps
 origin
 oschina
+osdn
 oskelly
 osu
 otpbank
@@ -1320,6 +1363,7 @@ perl
 perplexity
 petrochina
 pgyer
+phishing
 phoenix
 picacg
 picacg@ads
@@ -1346,6 +1390,7 @@ playstation
 plex
 plutotv
 pocketcasts
+pocoiq-ads
 poe
 polocloud
 polymer
@@ -1368,9 +1413,11 @@ pstorage
 ptt
 pubg
 pubmatic
+pubmatic@ads
 pugpig
 purikonejp
 python
+python-community
 qcc
 qcloud
 qcloud@!cn
@@ -1414,6 +1461,7 @@ redis
 redotpay
 redtube
 regru
+remirepo
 remnawave
 renren
 reurl
@@ -1431,6 +1479,7 @@ rsshub
 rsshub-3rd
 rt
 rthk
+ru
 ruanmei
 ruby
 rubychina
@@ -1446,6 +1495,7 @@ salesforce
 samsung
 samsung@ads
 samsung@cn
+sanctioned
 sankei
 sb
 sber
@@ -1509,6 +1559,7 @@ snapcraft
 snapp
 snk
 snodehome
+social
 softbank
 softether
 sogou
@@ -1585,12 +1636,14 @@ synology
 synology@cn
 t2-ru
 taboola
+tagtic-ads
 taihe
 taikang
 tailscale
 take-two
 talkatone
 taomee
+tappx-ads
 taptap
 taptap@!cn
 target
@@ -1608,6 +1661,7 @@ techtimes
 ted
 telegram
 telekom
+television-ads
 temp-mail
 tencent
 tencent-dev
@@ -1662,8 +1716,10 @@ tokyo-toshokan
 tonec
 tongcheng
 tongfang
+topcoder
 tor
 torproject
+tr
 tracker
 trackernetwork
 trae
@@ -1690,16 +1746,20 @@ twitter@ads
 typekit
 typenetwork
 typography
+u17
 uber
+uberads-ads
 ubiquiti
 ubiquiti@cn
 ubisoft
+ubisoft@cn
 ubuntu
 ubuntukylin
 uc
 uc@ads
 ucloud
 ucoz
+ucoz-ru
 udacity
 udemy
 udn
@@ -1727,9 +1787,12 @@ vercel
 verisign
 verisign-pki
 verizon
+verizon@ads
+verizon@cn
 vgtime
 viber
 vilavpn
+vim
 vimeo
 visa
 visa@cn

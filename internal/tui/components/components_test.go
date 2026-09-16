@@ -183,3 +183,64 @@ func TestMultiReferenceSelectionCancelAndHiddenFieldRetention(t *testing.T) {
 		t.Fatal("collapsing advanced fields discarded their values")
 	}
 }
+
+// TestListSkipsUnselectableRows 分组标题这类装饰行不可选中：上下移动、翻页、Home/End
+// 与按 key 恢复选中都不会把光标停在标题上，标题也不套用表格列宽。
+func TestListSkipsUnselectableRows(t *testing.T) {
+	l := SimpleList{}
+	l.SetTableSelectable(
+		[]Column{{Title: "名称", Width: 10}, {Title: "状态", Width: 6}},
+		[][]string{
+			{"[层 A]"},
+			{"a1", "启用"},
+			{"[层 B]"},
+			{"b1", "停用"},
+			{"b2", "启用"},
+		},
+		[]string{"", "a1", "", "b1", "b2"},
+		[]bool{false, true, false, true, true},
+	)
+	l.Height, l.Width = 10, 40
+
+	if l.IsSelectable(0) || !l.IsSelectable(1) {
+		t.Fatal("Selectable 映射错误：标题行应不可选、组行应可选")
+	}
+	// 初始光标不应停在标题行
+	if !l.IsSelectable(l.Cursor) {
+		t.Fatalf("初始光标落在不可选行: %d", l.Cursor)
+	}
+	// 向下跳过层 B 标题
+	l.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if key := l.SelectedKey(); key != "b1" {
+		t.Fatalf("向下移动后选中 = %q, 期望 b1（跳过标题）", key)
+	}
+	// 向上回到 a1
+	l.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if key := l.SelectedKey(); key != "a1" {
+		t.Fatalf("向上移动后选中 = %q, 期望 a1", key)
+	}
+	// Home / End 落到首尾可选行
+	l.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	if key := l.SelectedKey(); key != "b2" {
+		t.Fatalf("End 后选中 = %q, 期望 b2", key)
+	}
+	l.Update(tea.KeyMsg{Type: tea.KeyHome})
+	if key := l.SelectedKey(); key != "a1" {
+		t.Fatalf("Home 后选中 = %q, 期望 a1", key)
+	}
+	// 按 key 恢复到标题行时退到其后最近的可选行
+	l.SelectKey("")
+	if key := l.SelectedKey(); key != "a1" {
+		t.Fatalf("SelectKey(标题) 后选中 = %q, 期望 a1", key)
+	}
+	// 标题整行渲染（不按 10 列截断），且高度不超界
+	view := l.View("空")
+	if !strings.Contains(ansi.Strip(view), "[层 A]") || !strings.Contains(ansi.Strip(view), "[层 B]") {
+		t.Fatalf("层标题未完整渲染:\n%s", view)
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if ansi.StringWidth(line) > l.Width {
+			t.Fatalf("列表行溢出宽度: %q", line)
+		}
+	}
+}

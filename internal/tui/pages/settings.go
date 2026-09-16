@@ -194,6 +194,11 @@ func (s *SettingsPage) Update(msg tea.Msg) (Page, tea.Cmd) {
 			s.openDetails("数据目录", s.settingsPreview())
 			return s, nil
 		}
+		if !settingEditable(selected) {
+			// 分流说明项只读：Enter 查看完整说明，避免「空表单保存」覆盖真实设置
+			s.openDetails("设置详情", s.settingsPreview())
+			return s, nil
+		}
 		s.editSetting(selected)
 	case "E":
 		s.editSetting("")

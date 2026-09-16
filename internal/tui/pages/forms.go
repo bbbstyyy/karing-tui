@@ -8,9 +8,22 @@ import (
 
 	"github.com/bbbstyyy/karing-tui/internal/application"
 	"github.com/bbbstyyy/karing-tui/internal/catalog"
+	"github.com/bbbstyyy/karing-tui/internal/config"
 	"github.com/bbbstyyy/karing-tui/internal/subscription"
 	"github.com/bbbstyyy/karing-tui/internal/tui/components"
 )
+
+// kindChoices 分流层选项（按层序列出，排在前面即优先级更高）。
+func kindChoices() []components.Option {
+	choices := make([]components.Option, 0, len(config.Kinds))
+	for _, kind := range config.Kinds {
+		choices = append(choices, components.Option{
+			Value: kind,
+			Label: kind + " · " + config.KindLabel(kind),
+		})
+	}
+	return choices
+}
 
 func required(label string) func(string) error {
 	return func(v string) error {

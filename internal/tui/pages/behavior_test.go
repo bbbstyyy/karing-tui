@@ -113,16 +113,16 @@ func TestRoutingTargetsPreserveNamesAndDefaultGroupCanSave(t *testing.T) {
 		}
 	}
 	for _, g := range r.groups {
-		if g.Name == "Telegram" {
+		if g.Name == "🌏 Google" {
 			r.openFormEditGroup(g)
 			r.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 			if r.err != nil {
-				t.Fatalf("default Telegram edit: %v", r.err)
+				t.Fatalf("default Google group edit: %v", r.err)
 			}
 			return
 		}
 	}
-	t.Fatal("fixture lacked default Telegram group")
+	t.Fatal("fixture lacked default Google group")
 }
 
 func TestLongSubscriptionURLAndMixedBatchImport(t *testing.T) {

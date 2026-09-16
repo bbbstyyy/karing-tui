@@ -54,7 +54,15 @@ const usage = `Karing TUI - 基于 sing-box 的终端代理客户端
 	ruleset update            更新全部规则集缓存（自定义 + 引用中的内置分类）
 	diagnose                  输出 Clash API 连接/规则诊断
 	diagnose check <URL>      通过 mixed 入站检查 HTTP 连通性
-  route test <域名|IP>       检测输入会命中哪条分流规则及出站
+  route list                按层列出分流组（层序、层内序号、目标、状态）
+  route add <名称> --target <出站> [--kind <层>] <规则集...>
+                            新建分流组；--kind 缺省按规则构成推断并回显
+  route move <名称> --kind <层> [--pos N]
+                            把分流组移到目标层（--pos 缺省追加到层尾）
+  route preset <地区> [--merge|--replace] [--yes]
+                            对齐地区预置方案（缺省 merge：按名称跳过已存在的组；
+                            replace 会删除现有分流组，必须再加 --yes 确认）
+  route test <域名|IP>       检测输入会命中哪条分流规则、所属层及出站
   import clash <文件>       从 Clash 配置导入（节点/代理组/分流规则）
   import singbox <文件>     从 sing-box 配置导入（Karing 导出格式同此）
   backup export [路径]      导出备份（缺省 <数据目录>/backups/）
@@ -408,27 +416,176 @@ func cmdDiagnose(args []string, stdout, stderr io.Writer) int {
 	})
 }
 
-// cmdRoute 实现 `karing route test <域名|IP>`。
+// cmdRoute 实现 `karing route list|test|add|move`。
 func cmdRoute(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "用法: karing route test <域名|IP>")
+		fmt.Fprintln(stderr, "用法: karing route <list|test|add|move> [参数]")
 		return 2
 	}
-	if args[0] != "test" {
-		fmt.Fprintf(stderr, "未知子命令 %q\n用法: karing route test <域名|IP>\n", args[0])
+	switch args[0] {
+	case "list":
+		if len(args) != 1 {
+			fmt.Fprintln(stderr, "用法: karing route list")
+			return 2
+		}
+		return withApp(stderr, func(app *application.App) int {
+			return routeList(app, stdout, stderr)
+		})
+	case "test":
+		if len(args) != 2 {
+			fmt.Fprintln(stderr, "用法: karing route test <域名|IP>")
+			return 2
+		}
+		return routeTest(args[1], stdout, stderr)
+	case "add":
+		return withExclusiveApp(stderr, func(app *application.App) int {
+			return routeAdd(app, args[1:], stdout, stderr)
+		})
+	case "move":
+		return withExclusiveApp(stderr, func(app *application.App) int {
+			return routeMove(app, args[1:], stdout, stderr)
+		})
+	case "preset":
+		return withExclusiveApp(stderr, func(app *application.App) int {
+			return routePreset(app, args[1:], stdout, stderr)
+		})
+	default:
+		fmt.Fprintf(stderr, "未知子命令 %q\n用法: karing route <list|test|add|move> [参数]\n", args[0])
 		return 2
 	}
-	if len(args) != 2 {
-		fmt.Fprintln(stderr, "用法: karing route test <域名|IP>")
+}
+
+// routeList 按层列出分流组：层标题给出组数/启用数，组行给出层内序号、目标与规则数。
+func routeList(app *application.App, stdout, stderr io.Writer) int {
+	groups, err := app.DB.ListRoutingGroups()
+	if err != nil {
+		fmt.Fprintln(stderr, "读取分流组失败:", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "层序（优先级由高到低）: %s\n", strings.Join(config.Kinds, " < "))
+	if len(groups) == 0 {
+		fmt.Fprintln(stdout, "暂无分流组（karing route add 新建，或 karing route preset cn 导入地区方案）")
+		return 0
+	}
+	for _, layer := range config.GroupByKind(groups) {
+		enabled := 0
+		for _, g := range layer.Groups {
+			if g.Enabled {
+				enabled++
+			}
+		}
+		title := fmt.Sprintf("%s（%s，层序 %d）· %d 组 / 启用 %d",
+			config.KindLabel(layer.Kind), layer.Kind, config.KindRank(layer.Kind), len(layer.Groups), enabled)
+		if layer.Kind == config.KindFinal {
+			title += " · 兜底 · 不可选「不处理」"
+		}
+		fmt.Fprintln(stdout, title)
+		if len(layer.Groups) == 0 {
+			fmt.Fprintln(stdout, "    （空层）")
+			continue
+		}
+		w := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+		for i, g := range layer.Groups {
+			state := "启用"
+			if !g.Enabled {
+				state = "停用"
+			}
+			fmt.Fprintf(w, "    %d\t%s\t%s\t%d 条规则\t%s\n", i+1, g.Name, g.Target, len(g.Rules), state)
+		}
+		_ = w.Flush()
+	}
+	return 0
+}
+
+// routePreset 对齐地区预置方案（7.4 的显式入口，可重复执行）。
+// merge：按名称跳过已存在的组（也是「恢复默认预设」）；replace：先删除现有全部分流组，
+// 必须再加 --yes 作为第二次确认——静默替换用户正在运行的分流方案属于高风险行为。
+func routePreset(app *application.App, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		fmt.Fprintf(stderr, "用法: karing route preset <地区> [--merge|--replace] [--yes]（地区可选: %s）\n",
+			strings.Join(routing.PresetRegions, " / "))
 		return 2
 	}
+	region := args[0]
+	modeStr, yes := "", false
+	for _, arg := range args[1:] {
+		switch arg {
+		case "--merge":
+			modeStr = "merge"
+		case "--replace":
+			modeStr = "replace"
+		case "--yes":
+			yes = true
+		default:
+			fmt.Fprintf(stderr, "未知参数 %q\n用法: karing route preset <地区> [--merge|--replace] [--yes]\n", arg)
+			return 2
+		}
+	}
+	mode, err := routing.ParsePresetMode(modeStr)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if mode == routing.PresetReplace && !yes {
+		fmt.Fprintln(stderr, "replace 会删除现有的全部分流组（包括你在里面做的修改）。")
+		fmt.Fprintf(stderr, "确认请追加 --yes：karing route preset %s --replace --yes\n", region)
+		fmt.Fprintln(stderr, "提示: 想保留现有组、只补齐缺失的预置组，用 --merge（缺省）。")
+		return 2
+	}
+	ctx := context.Background()
+	report, err := app.Rout.ApplyPreset(region, mode)
+	if err != nil {
+		fmt.Fprintln(stderr, "对齐失败:", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "已归入 自定义分流组（custom 层）；层内顺序即优先级。逐条结果:")
+	for _, item := range report.Items {
+		mark := map[string]string{"新增": "✓", "跳过": "·", "失败": "✗", "偏差": "!", "删除": "−", "补齐": "+"}[item.Action]
+		fmt.Fprintf(stdout, "  %s [%s] %s: %s\n", mark, item.Action, item.Name, item.Detail)
+	}
+	fmt.Fprintln(stdout, report.Summary())
+	if code := regenerateAndCheck(app, ctx, stdout, stderr); code != 0 {
+		return code
+	}
+	if report.Failed > 0 {
+		return 1
+	}
+	return 0
+}
+
+// regenerateAndCheck 生成并校验配置，顺带把新增引用的规则集缓存补齐（7.4）。
+func regenerateAndCheck(app *application.App, ctx context.Context, stdout, stderr io.Writer) int {
+	if _, err := app.Bin.Ensure(ctx); err != nil {
+		fmt.Fprintf(stderr, "提示: sing-box 二进制不可用（%v），跳过校验\n", err)
+		fmt.Fprintln(stdout, "提示: 已写入分流组，稍后执行 karing config check 生成并校验配置")
+		return 0
+	}
+	if err := app.GenerateConfig(ctx); err != nil {
+		fmt.Fprintln(stderr, "生成配置失败:", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "配置已生成: %s\n", app.Paths.Config)
+	if err := app.CheckConfig(ctx); err != nil {
+		fmt.Fprintln(stderr, "校验失败:", err)
+		fmt.Fprintln(stdout, "提示: 可能是新增的规则集还没下载，执行 karing ruleset update 后重试")
+		return 1
+	}
+	fmt.Fprintln(stdout, "配置校验通过")
+	if probeRunning(app) != "未检测到运行实例" {
+		fmt.Fprintln(stdout, "提示: 检测到运行中的实例，需重启后生效（TUI Dashboard 按 r）")
+	}
+	return 0
+}
+
+// routeTest 检测输入命中的规则，并给出所属层——层序是排查优先级问题的关键信息。
+func routeTest(input string, stdout, stderr io.Writer) int {
 	return withApp(stderr, func(app *application.App) int {
 		groups, err := app.DB.ListRoutingGroups()
 		if err != nil {
 			fmt.Fprintln(stderr, "读取分流规则失败:", err)
 			return 1
 		}
-		result, err := routing.DetectWithPrivateDirect(groups, args[1], app.GetSettings().PrivateDirect)
+		result, err := routing.DetectWithPrivateDirect(groups, input, app.GetSettings().PrivateDirect)
 		if err != nil {
 			fmt.Fprintln(stderr, "检测失败:", err)
 			return 1
@@ -444,9 +601,10 @@ func cmdRoute(args []string, stdout, stderr io.Writer) int {
 		} else if !result.Matched {
 			fmt.Fprintln(stdout, "结果: 未命中规则")
 		} else if result.Fallback {
-			fmt.Fprintf(stdout, "结果: 未命中显式规则，使用兜底分流组 %s\n", result.Group.Name)
+			fmt.Fprintf(stdout, "结果: 未命中显式规则，使用兜底分流组 %s（层 %s）\n", result.Group.Name, config.KindLabel(result.Kind))
 		} else {
-			fmt.Fprintf(stdout, "结果: 命中分流组 %s\n", result.Group.Name)
+			fmt.Fprintf(stdout, "结果: 命中分流组 %s（层 %s，层内第 %d 位）\n",
+				result.Group.Name, config.KindLabel(result.Kind), result.Group.Position+1)
 			fmt.Fprintf(stdout, "规则: #%d %s", result.RuleIndex+1, result.Rule.Type)
 			if result.Rule.Type == "logical" {
 				fmt.Fprintf(stdout, "=%s", config.FormatLogicalExpr(result.Rule.Mode, result.Rule.Conditions))
@@ -463,6 +621,164 @@ func cmdRoute(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	})
+}
+
+// routeAdd 新建分流组。规则集参数合并为**一条** rule_set 规则（多值逗号分隔，语义与
+// 多条 rule_set 规则等价），与地区预置的写法保持一致。
+func routeAdd(app *application.App, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "用法: karing route add <名称> --target <出站> [--kind <层>] <规则集...>")
+		return 2
+	}
+	name := args[0]
+	target, kind := "", ""
+	var ruleSets []string
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--target" || arg == "--kind":
+			if i+1 >= len(args) {
+				fmt.Fprintf(stderr, "%s 缺少取值\n", arg)
+				return 2
+			}
+			i++
+			if arg == "--target" {
+				target = args[i]
+			} else {
+				kind = args[i]
+			}
+		case strings.HasPrefix(arg, "--target="):
+			target = strings.TrimPrefix(arg, "--target=")
+		case strings.HasPrefix(arg, "--kind="):
+			kind = strings.TrimPrefix(arg, "--kind=")
+		case strings.HasPrefix(arg, "-"):
+			fmt.Fprintf(stderr, "未知参数 %q\n", arg)
+			return 2
+		default:
+			ruleSets = append(ruleSets, arg)
+		}
+	}
+	if strings.TrimSpace(target) == "" {
+		fmt.Fprintln(stderr, "缺少 --target（DIRECT / BLOCK / 代理组名）")
+		return 2
+	}
+	explicitKind := kind != ""
+	if kind != "" && !config.KindValid(kind) {
+		fmt.Fprintf(stderr, "未知分流层 %q（可选: %s）\n", kind, strings.Join(config.Kinds, " / "))
+		return 2
+	}
+	var rules []config.Rule
+	if len(ruleSets) > 0 {
+		rules = append(rules, config.Rule{Type: "rule_set", Value: strings.Join(ruleSets, ","), Enabled: true})
+	}
+	suggested := config.SuggestKind(rules)
+	if !explicitKind && suggested == config.KindFinal {
+		suggested = config.KindCustom
+	}
+	if !explicitKind {
+		kind = suggested
+	}
+	if config.KindNormalize(kind) == config.KindFinal && len(rules) == 0 {
+		// final 层的结构要求：必须且仅有一条 final 规则
+		rules = append(rules, config.Rule{Type: "final", Enabled: true})
+	}
+	g, err := app.Rout.CreateGroupIn(name, target, kind, rules)
+	if err != nil {
+		fmt.Fprintln(stderr, "创建失败:", err)
+		return 1
+	}
+	if explicitKind {
+		fmt.Fprintf(stdout, "已创建分流组 %q → %s（%s 层 · 层序 %d）\n",
+			g.Name, g.Target, config.KindLabel(g.Kind), config.KindRank(g.Kind))
+	} else {
+		fmt.Fprintf(stdout, "已创建分流组 %q → %s（推断层 %s · 层序 %d；如需指定请加 --kind）\n",
+			g.Name, g.Target, config.KindLabel(g.Kind), config.KindRank(g.Kind))
+	}
+	if len(rules) == 0 {
+		fmt.Fprintln(stdout, "提示: 未提供规则集，该组暂无规则（TUI Rules 页或再执行一次添加）")
+	}
+	fmt.Fprintf(stdout, "层内序号: 第 %d 位（层内顺序即优先级）\n", g.Position+1)
+	return 0
+}
+
+// routeMove 跨层移动：显式改变某个分流组的优先级归属。
+func routeMove(app *application.App, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "用法: karing route move <名称> --kind <层> [--pos N]")
+		return 2
+	}
+	name, kind, pos := args[0], "", -1
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--kind" || arg == "--pos":
+			if i+1 >= len(args) {
+				fmt.Fprintf(stderr, "%s 缺少取值\n", arg)
+				return 2
+			}
+			i++
+			if arg == "--kind" {
+				kind = args[i]
+			} else if n, err := strconv.Atoi(args[i]); err == nil {
+				pos = n
+			} else {
+				fmt.Fprintf(stderr, "--pos 须为整数，实得 %q\n", args[i])
+				return 2
+			}
+		case strings.HasPrefix(arg, "--kind="):
+			kind = strings.TrimPrefix(arg, "--kind=")
+		case strings.HasPrefix(arg, "--pos="):
+			n, err := strconv.Atoi(strings.TrimPrefix(arg, "--pos="))
+			if err != nil {
+				fmt.Fprintf(stderr, "--pos 须为整数，实得 %q\n", arg)
+				return 2
+			}
+			pos = n
+		default:
+			fmt.Fprintf(stderr, "未知参数 %q\n", arg)
+			return 2
+		}
+	}
+	if kind == "" {
+		fmt.Fprintln(stderr, "缺少 --kind（目标层）")
+		return 2
+	}
+	groups, err := app.DB.ListRoutingGroups()
+	if err != nil {
+		fmt.Fprintln(stderr, "读取分流组失败:", err)
+		return 1
+	}
+	var target *config.RoutingGroup
+	for _, g := range groups {
+		if g.Name == name || strings.EqualFold(g.Name, name) {
+			target = g
+			break
+		}
+	}
+	if target == nil {
+		fmt.Fprintf(stderr, "分流组 %q 不存在（karing route list 查看）\n", name)
+		return 1
+	}
+	from := target.Layer()
+	if err := app.Rout.MoveGroupToKind(target.ID, kind, pos); err != nil {
+		fmt.Fprintln(stderr, "移动失败:", err)
+		return 1
+	}
+	moved, err := app.DB.GetRoutingGroup(target.ID)
+	if err != nil {
+		fmt.Fprintln(stderr, "回读失败:", err)
+		return 1
+	}
+	where := "层尾"
+	if pos >= 0 {
+		where = fmt.Sprintf("第 %d 位", moved.Position+1)
+	}
+	fmt.Fprintf(stdout, "%s: %s 层 → %s 层（%s）\n",
+		moved.Name, config.KindLabel(from), config.KindLabel(moved.Layer()), where)
+	if from != moved.Layer() {
+		fmt.Fprintln(stdout, "提示: 跨层移动改变了该组的优先级归属，需重新生成并应用配置后生效")
+	}
+	return 0
 }
 
 // withApp 初始化应用并执行 fn；初始化失败时输出错误并返回 1。

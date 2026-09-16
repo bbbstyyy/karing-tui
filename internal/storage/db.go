@@ -132,6 +132,13 @@ func (d *DB) migrate() error {
 				return fmt.Errorf("执行迁移 v%d 失败: %w", v, err)
 			}
 		}
+		// 少数迁移除 DDL 之外还需要 Go 侧判定（如分流组分层的存量回填）。
+		// 仍在该事务内执行，失败即整体回滚，不会留下半套 schema。
+		if post := postMigrations[v]; post != nil {
+			if err := post(context.Background(), conn); err != nil {
+				return fmt.Errorf("执行迁移 v%d 回填失败: %w", v, err)
+			}
+		}
 		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA user_version = %d", v)); err != nil {
 			return fmt.Errorf("写入 schema 版本 v%d 失败: %w", v, err)
 		}

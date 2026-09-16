@@ -12,11 +12,19 @@ type Column struct {
 }
 
 func (l *SimpleList) SetTable(columns []Column, rows [][]string, keys []string) {
+	l.Selectable = nil
+	l.SetTableSelectable(columns, rows, keys, nil)
+}
+
+// SetTableSelectable is SetTable plus per-row selectability: rows marked false
+// (group headings) are skipped by navigation and rendered as plain text.
+func (l *SimpleList) SetTableSelectable(columns []Column, rows [][]string, keys []string, selectable []bool) {
 	items := make([]string, len(rows))
 	for i, row := range rows {
 		items[i] = strings.Join(row, " · ")
 	}
 	l.Columns, l.Rows = columns, rows
+	l.Selectable = selectable
 	l.SetItems(items, keys)
 }
 

@@ -1,6 +1,7 @@
 # 含 IP 类条件（ip_cidr/ip_is_private）的 ACL4SSR 分类码
-# 由 scripts/gen-catalog.sh 经 sing-box rule-set decompile 逐个判定生成，请勿手工编辑
-# geosite 全量 1899 个实测均不含 IP 条件；geoip 一律含 IP 条件——两者无需清单
+# 由 scripts/gen-catalog.sh 用 sing-box rule-set decompile 逐个判定生成，请勿手工编辑
+# 判定对象是**内嵌快照**（发布物本身），而非上游仓库当前状态
+# geosite 全量实测均不含 IP 条件；geoip 一律含 IP 条件——两者无需清单
 Amazon
 AmazonIp
 Apple

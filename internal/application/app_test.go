@@ -152,7 +152,15 @@ func TestGenerateConfigInstallsEmbeddedCatalogOffline(t *testing.T) {
 	if fetches != 0 {
 		t.Fatalf("首次生成默认配置不应联网，实际调用 Fetch %d 次", fetches)
 	}
-	for _, ref := range []string{"geosite-cn", "geoip-cn", "geosite-telegram", "geoip-telegram", "geosite-category-ai-!cn"} {
+	// 默认方案（cn 预置）中 6 个启用组去重后引用 20 个内置分类，全部随二进制嵌入
+	embedded := []string{
+		"geosite-apple", "geosite-apple@ads", "geosite-apple-dev", "geosite-apple-pki", "geosite-apple-update",
+		"geosite-google-play", "geosite-google", "geoip-google",
+		"acl-BilibiliHMT", "acl-Bilibili",
+		"acl-ChinaIp", "acl-ChinaDomain", "acl-ChinaCompanyIp", "acl-UnBan", "acl-SteamCN", "acl-Download", "acl-ChinaMedia",
+		"geosite-geolocation-!cn", "acl-ProxyGFWlist", "acl-ProxyMedia",
+	}
+	for _, ref := range embedded {
 		path := filepath.Join(app.Rules.CacheDir(), ref+".srs")
 		if info, err := os.Stat(path); err != nil || info.Size() == 0 {
 			t.Errorf("嵌入规则集 %s 未安装到缓存（err=%v）", ref, err)

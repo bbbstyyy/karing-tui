@@ -1,0 +1,252 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "password": "p1",
+      "server": "1.1.1.1",
+      "server_port": 443,
+      "tag": "hk-01",
+      "tls": {
+        "enabled": true,
+        "server_name": "1.1.1.1"
+      },
+      "type": "trojan"
+    },
+    {
+      "server": "2.2.2.2",
+      "server_port": 443,
+      "tag": "us-01",
+      "tls": {
+        "enabled": true,
+        "server_name": "2.2.2.2"
+      },
+      "type": "vless",
+      "uuid": "u2"
+    },
+    {
+      "interval": "300s",
+      "outbounds": [
+        "hk-01",
+        "us-01"
+      ],
+      "tag": "Auto",
+      "type": "urltest",
+      "url": "http://www.gstatic.com/generate_204"
+    },
+    {
+      "outbounds": [
+        "hk-01",
+        "us-01"
+      ],
+      "tag": "Manual",
+      "type": "selector"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "geosite-apple",
+          "geosite-apple@ads",
+          "geosite-apple-dev",
+          "geosite-apple-pki",
+          "geosite-apple-update"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "geosite-google-play"
+        ],
+        "outbound": "Auto"
+      },
+      {
+        "rule_set": [
+          "geosite-google",
+          "geoip-google"
+        ],
+        "outbound": "Auto"
+      },
+      {
+        "rule_set": [
+          "acl-BilibiliHMT",
+          "acl-Bilibili"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "acl-ChinaIp",
+          "acl-ChinaDomain",
+          "acl-ChinaCompanyIp",
+          "acl-UnBan",
+          "acl-SteamCN",
+          "acl-Download",
+          "acl-ChinaMedia"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "geosite-geolocation-!cn",
+          "geosite-google",
+          "geoip-google",
+          "acl-ProxyGFWlist",
+          "acl-ProxyMedia"
+        ],
+        "outbound": "Auto"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "acl-Bilibili",
+        "format": "binary",
+        "url": "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR/Bilibili.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "acl-BilibiliHMT",
+        "format": "binary",
+        "url": "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR/BilibiliHMT.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "acl-ChinaCompanyIp",
+        "format": "binary",
+        "url": "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR/ChinaCompanyIp.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "acl-ChinaDomain",
+        "format": "binary",
+        "url": "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR/ChinaDomain.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "acl-ChinaIp",
+        "format": "binary",
+        "url": "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR/ChinaIp.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "acl-ChinaMedia",
+        "format": "binary",
+        "url": "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR/ChinaMedia.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "acl-Download",
+        "format": "binary",
+        "url": "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR/Download.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "acl-ProxyGFWlist",
+        "format": "binary",
+        "url": "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR/ProxyGFWlist.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "acl-ProxyMedia",
+        "format": "binary",
+        "url": "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR/ProxyMedia.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "acl-SteamCN",
+        "format": "binary",
+        "url": "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR/SteamCN.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "acl-UnBan",
+        "format": "binary",
+        "url": "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR/UnBan.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-google",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/google.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-apple",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/apple.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-apple-dev",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/apple-dev.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-apple-pki",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/apple-pki.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-apple-update",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/apple-update.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-apple@ads",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/apple@ads.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-geolocation-!cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-google",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-google-play",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google-play.srs"
+      }
+    ],
+    "final": "Manual",
+    "auto_detect_interface": true
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090"
+    }
+  }
+}

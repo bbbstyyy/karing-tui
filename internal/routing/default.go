@@ -3,18 +3,20 @@ package routing
 import (
 	"fmt"
 
-	"github.com/bbbstyyy/karing-tui/internal/config"
 	"github.com/bbbstyyy/karing-tui/internal/storage"
 )
 
-// DefaultGroupAI 默认分流方案使用的 AI 代理组名。
-const DefaultGroupAI = "AI"
-
 // EnsureDefaultRouting 首次使用（无任何分流组）时初始化默认分流方案：
-// 中国大陆 → DIRECT、Telegram → Auto、AI → AI 组、Final → Auto。
-// 依赖内置规则集与默认代理组（Auto）已就绪。
+// 直接采用主用地区（中国大陆）的预置方案 —— 27 个分流组（其中 6 个启用）
+// 全部归 custom 层，外加一个 kind='final'、目标为 Manual 的兜底组。
+//
+// 已装用户的既有方案**不会被改写**：本函数只在库中没有任何分流组时生效
+// （application/app.go 是唯一调用点）。想换用地区方案必须显式对齐：
+// `karing route preset cn [--merge|--replace]` 或 TUI Rules 页的预置入口。
+//
+// 依赖顺序：启动时先 storage.EnsureDefaultGroups 建出 Auto / Manual 代理组，
+// 再调用本函数，故 final 的目标必然存在；ApplyPreset 仍会自行复核并在缺失时补建。
 func EnsureDefaultRouting(db *storage.DB) error {
-	var n int
 	n, err := db.TableCount("routing_groups")
 	if err != nil {
 		return fmt.Errorf("统计分流组数量失败: %w", err)
@@ -22,61 +24,13 @@ func EnsureDefaultRouting(db *storage.DB) error {
 	if n > 0 {
 		return nil
 	}
-
-	// 确保 AI 代理组存在
-	if err := ensureAIProxyGroup(db); err != nil {
-		return err
+	m := NewManager(db, nil)
+	report, err := m.ApplyPreset(PresetCN, PresetMerge)
+	if err != nil {
+		return fmt.Errorf("初始化默认分流方案失败: %w", err)
 	}
-
-	// 目标与规则。规则集以内置分类引用书写（见 internal/catalog）：无需预先把分类
-	// 写进 rulesets 表，生成配置时按需产出 rule_set 条目并按需下载缓存。
-	finalTarget := storage.DefaultGroupAuto
-	aiTarget := DefaultGroupAI
-	scheme := []struct {
-		name    string
-		target  string
-		tagList []string
-	}{
-		{"中国大陆", "DIRECT", []string{"geosite:cn", "geoip:cn"}},
-		{"Telegram", storage.DefaultGroupAuto, []string{"geosite:telegram", "geoip:telegram"}},
-		{"AI", aiTarget, []string{"geosite:category-ai-!cn"}},
-		{"Final", finalTarget, nil}, // final 规则
-	}
-	for _, s := range scheme {
-		g := &config.RoutingGroup{
-			Name:    s.name,
-			Target:  s.target,
-			Enabled: true,
-		}
-		if s.tagList == nil {
-			g.Rules = []config.Rule{{Type: "final", Value: "", Enabled: true}}
-		} else {
-			for _, tag := range s.tagList {
-				g.Rules = append(g.Rules, config.Rule{Type: "rule_set", Value: tag, Enabled: true})
-			}
-		}
-		if err := db.CreateRoutingGroup(g); err != nil {
-			return err
-		}
+	if report.Failed > 0 {
+		return fmt.Errorf("初始化默认分流方案失败: %v", report.FailedItems())
 	}
 	return nil
-}
-
-// ensureAIProxyGroup 确保默认 AI 代理组存在（select，全部节点）。
-func ensureAIProxyGroup(db *storage.DB) error {
-	groups, err := db.ListProxyGroups()
-	if err != nil {
-		return err
-	}
-	for _, g := range groups {
-		if g.Name == DefaultGroupAI {
-			return nil
-		}
-	}
-	ai := &config.ProxyGroup{
-		Name:    DefaultGroupAI,
-		Type:    "select",
-		Members: []config.ProxyGroupMember{{Type: "all"}},
-	}
-	return db.CreateProxyGroup(ai)
 }

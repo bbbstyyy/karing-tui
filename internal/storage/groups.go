@@ -192,11 +192,13 @@ func (d *DB) loadGroupMembers(g *config.ProxyGroup) error {
 
 // --- 分流组与规则 ---
 
-// CreateRoutingGroup 新建分流组（含规则）。
+// CreateRoutingGroup 新建分流组（含规则）。kind_rank 是 config.KindRank 的冗余列，
+// 由这里统一计算落库，保证层序只有一处事实源。
 func (d *DB) CreateRoutingGroup(g *config.RoutingGroup) error {
+	g.Kind = config.KindNormalize(g.Kind)
 	res, err := d.db.Exec(
-		`INSERT INTO routing_groups (name, target, position, enabled) VALUES (?, ?, ?, ?)`,
-		g.Name, g.Target, g.Position, boolInt(g.Enabled),
+		`INSERT INTO routing_groups (name, target, kind, kind_rank, position, enabled) VALUES (?, ?, ?, ?, ?, ?)`,
+		g.Name, g.Target, g.Kind, config.KindRank(g.Kind), g.Position, boolInt(g.Enabled),
 	)
 	if err != nil {
 		return fmt.Errorf("创建分流组 %q 失败: %w", g.Name, err)
@@ -209,9 +211,10 @@ func (d *DB) CreateRoutingGroup(g *config.RoutingGroup) error {
 
 // UpdateRoutingGroup 更新分流组（含规则，整体替换）。
 func (d *DB) UpdateRoutingGroup(g *config.RoutingGroup) error {
+	g.Kind = config.KindNormalize(g.Kind)
 	_, err := d.db.Exec(
-		`UPDATE routing_groups SET name=?, target=?, position=?, enabled=? WHERE id=?`,
-		g.Name, g.Target, g.Position, boolInt(g.Enabled), g.ID,
+		`UPDATE routing_groups SET name=?, target=?, kind=?, kind_rank=?, position=?, enabled=? WHERE id=?`,
+		g.Name, g.Target, g.Kind, config.KindRank(g.Kind), g.Position, boolInt(g.Enabled), g.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("更新分流组 %d 失败: %w", g.ID, err)
@@ -298,6 +301,19 @@ func (d *DB) GetRoutingGroup(id int64) (*config.RoutingGroup, error) {
 	return nil, ErrNotFound
 }
 
+// SetRoutingGroupPlacement 只更新分流组的「定位」列（层、层序号），不动规则。
+// 层内重排/跨层移动用它，避免为了改一个序号而重写整组规则。
+func (d *DB) SetRoutingGroupPlacement(id int64, kind string, position int) error {
+	kind = config.KindNormalize(kind)
+	if _, err := d.db.Exec(
+		`UPDATE routing_groups SET kind=?, kind_rank=?, position=? WHERE id=?`,
+		kind, config.KindRank(kind), position, id,
+	); err != nil {
+		return fmt.Errorf("更新分流组 %d 的层定位失败: %w", id, err)
+	}
+	return nil
+}
+
 // DeleteRoutingGroup 删除分流组；规则级联删除。
 func (d *DB) DeleteRoutingGroup(id int64) error {
 	_, err := d.db.Exec(`DELETE FROM routing_groups WHERE id=?`, id)
@@ -307,9 +323,10 @@ func (d *DB) DeleteRoutingGroup(id int64) error {
 	return nil
 }
 
-// ListRoutingGroups 返回全部分流组（含规则），按 position、id 排序。
+// ListRoutingGroups 返回全部分流组（含规则），按层序、层内 position、id 排序。
+// 即生成配置时的优先级顺序：层序（kind_rank）优先，层内 position 次之。
 func (d *DB) ListRoutingGroups() ([]*config.RoutingGroup, error) {
-	rows, err := d.db.Query(`SELECT id, name, target, position, enabled FROM routing_groups ORDER BY position, id`)
+	rows, err := d.db.Query(`SELECT id, name, target, kind, position, enabled FROM routing_groups ORDER BY kind_rank, position, id`)
 	if err != nil {
 		return nil, fmt.Errorf("查询分流组列表失败: %w", err)
 	}
@@ -319,9 +336,10 @@ func (d *DB) ListRoutingGroups() ([]*config.RoutingGroup, error) {
 	for rows.Next() {
 		var g config.RoutingGroup
 		var enabled int
-		if err := rows.Scan(&g.ID, &g.Name, &g.Target, &g.Position, &enabled); err != nil {
+		if err := rows.Scan(&g.ID, &g.Name, &g.Target, &g.Kind, &g.Position, &enabled); err != nil {
 			return nil, fmt.Errorf("扫描分流组失败: %w", err)
 		}
+		g.Kind = config.KindNormalize(g.Kind)
 		g.Enabled = enabled != 0
 		out = append(out, &g)
 	}

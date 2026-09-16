@@ -13,7 +13,9 @@ import (
 	"github.com/bbbstyyy/karing-tui/internal/application"
 	"github.com/bbbstyyy/karing-tui/internal/catalog"
 	"github.com/bbbstyyy/karing-tui/internal/config"
+	"github.com/bbbstyyy/karing-tui/internal/routing"
 	"github.com/bbbstyyy/karing-tui/internal/tui/components"
+	"github.com/bbbstyyy/karing-tui/internal/tui/styles"
 	"github.com/bbbstyyy/karing-tui/internal/validation"
 )
 
@@ -21,16 +23,36 @@ import (
 type rulesMode int
 
 const (
-	rulesGroups  rulesMode = iota // 分流组列表
+	rulesGroups  rulesMode = iota // 分流组列表（按层分组渲染）
 	rulesGroupRl                  // 分流组规则列表
 	rulesForm                     // 表单（分流组/规则/规则集）
 	rulesSets                     // 规则集管理
 	rulesConfirm                  // 删除确认
 	rulesCatalog                  // 内置分类库浏览/挑选
+	rulesMove                     // 跨层移动：选择目标层
 )
 
-// Rules 分流管理页：分流组列表、规则编辑（排序/启停）、规则集管理与下载、
+// Rules 分流管理页：分流组列表（按层分组）、规则编辑（排序/启停）、规则集管理与下载、
 // 内置分类库浏览与挑选。
+
+// presetGroupNames 是地区预置会创建的分组名，用于在列表里标注来源（7.6）：
+// 用户删除预置组后能一眼看出「这组可以按 P 恢复」。嵌入的 JSON 只解析一次。
+var presetGroupNames = func() map[string]bool {
+	names := map[string]bool{}
+	for _, region := range routing.PresetRegions {
+		entries, err := routing.LoadPreset(region)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.Group != nil {
+				names[entry.Group.Name] = true
+			}
+		}
+	}
+	return names
+}()
+
 type Rules struct {
 	base
 	mode            rulesMode
@@ -43,6 +65,17 @@ type Rules struct {
 	catalogBackList components.SimpleList
 	catBefore       string
 	catBeforeList   components.SimpleList
+
+	// 按层渲染（6.5）：groupRows 把列表行映射到 r.groups 的下标，-1 表示层标题行。
+	groupRows   []int
+	enabledOnly bool // 仅显示启用（7.6）：27 组方案里停用组会淹没 custom 层
+
+	// 跨层移动：moveList 是目标层选择器，moveKinds 与行一一对应。
+	moveList   components.SimpleList
+	moveBack   components.SimpleList
+	moveKinds  []string
+	moveTarget *config.RoutingGroup
+	moveKind   string // 确认后要移入的层
 
 	// 内置分类库浏览态
 	catKind   string          // 当前种类（geosite/geoip/acl）
@@ -117,6 +150,8 @@ func (r *Rules) Update(msg tea.Msg) (Page, tea.Cmd) {
 				r.status = "规则集下载：" + resultSummary(msg.Results) + " · v 详情"
 			case "download-catalog":
 				r.status = msg.Data + " 已缓存"
+			case "apply-preset":
+				r.status = msg.Data + " · Ctrl+A 应用最新配置"
 			}
 		}
 		if r.mode == rulesCatalog {
@@ -184,6 +219,18 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 	case rulesConfirm:
 		if consumed, cmd := r.confirm.Update(msg); consumed {
 			return r, cmd
+		}
+		return r, nil
+
+	case rulesMove:
+		if consumed, cmd := r.moveList.Update(msg); consumed {
+			return r, cmd
+		}
+		switch key {
+		case "esc":
+			r.closeMoveLayer()
+		case "enter":
+			r.confirmMoveLayer()
 		}
 		return r, nil
 
@@ -309,7 +356,9 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 		switch key {
 		case "alt+enter":
 			if group, ok := r.selectedGroup(); ok {
-				r.openDetails("分流组详情", fmt.Sprintf("名称: %s\n目标: %s\n规则: %d 条\n启用: %v", group.Name, group.Target, len(group.Rules), group.Enabled))
+				r.openDetails("分流组详情", fmt.Sprintf("名称: %s\n层: %s\n目标: %s\n规则: %d 条\n启用: %v\n层内序号: %d\n\n优先级 = (层序, 层内序号, ID)；层序: %s",
+					group.Name, config.KindLabel(group.Layer()), group.Target, len(group.Rules), group.Enabled, group.Position+1,
+					strings.Join(config.Kinds, " < ")))
 			}
 		case "a":
 			r.openForm("add-rg")
@@ -338,9 +387,49 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 					r.err = err
 				} else {
 					r.app.MarkConfigDirty()
+					if g.Layer() == config.KindFinal && g.Enabled {
+						r.status = "已停用 final 兜底组：未匹配流量将直连而非走代理"
+					}
 				}
 				r.reload()
 			}
+		case "J", "K":
+			// 层内上移/下移（与规则列表同款交换语义，边界处不动作）
+			if g, ok := r.selectedGroup(); ok {
+				delta := -1
+				if key == "J" {
+					delta = 1
+				}
+				if err := r.app.Rout.MoveGroup(g.ID, delta); err != nil {
+					r.err = err
+				} else {
+					r.err = nil
+					r.app.MarkConfigDirty()
+					r.status = fmt.Sprintf("%s 层内顺序已保存（层内顺序即优先级）", config.KindLabel(g.Layer()))
+				}
+				r.reload()
+			}
+		case "m":
+			if g, ok := r.selectedGroup(); ok {
+				r.openMoveLayer(g)
+			}
+		case "P":
+			// 导入 / 恢复地区预置（7.4 / 7.6）：merge 语义，不改写已存在的组
+			if r.busy {
+				return r, nil
+			}
+			r.confirm = components.NewConfirm("apply-preset",
+				fmt.Sprintf("导入地区预置 %s？\n27 个分组全部归入 自定义分流组（custom 层），层内顺序即优先级；\n同名分组会被跳过，不会改写你已有的修改。", strings.Join(routing.PresetRegions, " / ")))
+			r.confirmKind = "apply-preset"
+			r.mode = rulesConfirm
+		case "f":
+			r.enabledOnly = !r.enabledOnly
+			if r.enabledOnly {
+				r.status = "仅显示启用的分流组（再按 f 显示全部）"
+			} else {
+				r.status = "显示全部分流组"
+			}
+			r.reload()
 		case "]":
 			r.groupList = r.list
 			r.list = components.SimpleList{}
@@ -351,6 +440,93 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 		}
 		return r, nil
 	}
+}
+
+// --- 跨层移动（6.5）---
+
+// openMoveLayer 打开「移动到其他层」选择器。跨层移动会改变该组的优先级归属，
+// 故必须显式操作并在确认弹窗里说明后果，不能靠层内上移/下移"移出去"。
+func (r *Rules) openMoveLayer(g *config.RoutingGroup) {
+	r.moveBack = r.list
+	r.moveTarget = g
+	current := g.Layer()
+	r.moveKinds = nil
+	r.moveList = components.SimpleList{}
+	rows := make([][]string, 0, len(config.Kinds))
+	for _, kind := range config.Kinds {
+		count, enabled := 0, 0
+		for _, other := range r.groups {
+			if other.Layer() != kind {
+				continue
+			}
+			count++
+			if other.Enabled {
+				enabled++
+			}
+		}
+		mark := ""
+		if kind == current {
+			mark = "（当前）"
+		}
+		note := ""
+		switch kind {
+		case config.KindFinal:
+			note = "兜底 · 不可选「不处理」"
+		case config.KindCustom:
+			note = "手工规则优先于此层之下所有层"
+		}
+		rows = append(rows, []string{
+			fmt.Sprintf("%s%s", config.KindLabel(kind), mark),
+			fmt.Sprintf("%d 组 / 启用 %d", count, enabled),
+			note,
+		})
+		r.moveKinds = append(r.moveKinds, kind)
+	}
+	keys := make([]string, len(r.moveKinds))
+	for i, kind := range r.moveKinds {
+		keys[i] = "layer:" + kind
+	}
+	r.moveList.SetTable([]components.Column{
+		col("层", 18, 0, false),
+		col("组数", 12, 0, false),
+		col("说明", 30, 1, false),
+	}, rows, keys)
+	r.moveList.SelectKey("layer:" + current)
+	r.status = ""
+	r.mode = rulesMove
+}
+
+// closeMoveLayer 退出层选择器，回到分流组列表。
+func (r *Rules) closeMoveLayer() {
+	r.list = r.moveBack
+	r.moveTarget = nil
+	r.moveKinds = nil
+	r.mode = rulesGroups
+	r.reload()
+}
+
+// confirmMoveLayer 对选中的目标层给出明确提示后再执行移动。
+func (r *Rules) confirmMoveLayer() {
+	if r.moveTarget == nil {
+		return
+	}
+	i := r.moveList.Cursor
+	if i < 0 || i >= len(r.moveKinds) {
+		return
+	}
+	target := r.moveKinds[i]
+	g := r.moveTarget
+	if target == g.Layer() {
+		r.status = fmt.Sprintf("%s 已在 %s 层", g.Name, config.KindLabel(target))
+		return
+	}
+	r.moveKind = target
+	r.confirm = components.NewConfirm("move-layer",
+		fmt.Sprintf("把分流组 %q 移到 %s 层？\n该组的优先级归属会随之改变（层序：%s）。",
+			g.Name, config.KindLabel(target), strings.Join(config.Kinds, " < ")))
+	r.confirmKind = "move-layer"
+	r.confirmID = g.ID
+	r.mode = rulesConfirm
 }
 
 // --- 数据加载 ---
@@ -430,16 +606,72 @@ func (r *Rules) reload() {
 	r.list.Height = 0
 	r.list.Items = nil
 	r.list.Keys = nil
-	for _, g := range groups {
-		state := "启用"
-		if !g.Enabled {
-			state = "停用"
-		}
-		r.list.Items = append(r.list.Items,
-			fmt.Sprintf("%-14s → %-10s %2d 条规则  %s", g.Name, g.Target, len(g.Rules), state))
-		r.list.Keys = append(r.list.Keys, fmt.Sprintf("group:%d", g.ID))
-	}
+	r.buildGroupList()
 	r.list.SelectKey(selected)
+}
+
+// buildGroupList 按层重建分流组列表（6.5）：层标题是不可选中行，层内为可选中行。
+// 层序固定 custom → geosite → geoip → acl → final（final 恒置底）；空层也显示标题，
+// 这样用户能把规则移进去（若视觉过重，采用折叠风格而非隐藏整层）。
+func (r *Rules) buildGroupList() {
+	rows := make([][]string, 0, len(r.groups))
+	items := make([]string, 0, len(r.groups))
+	keys := make([]string, 0, len(r.groups))
+	groupRows := make([]int, 0, len(r.groups))
+	selectable := make([]bool, 0, len(r.groups))
+
+	indexOf := make(map[int64]int, len(r.groups))
+	for i, g := range r.groups {
+		indexOf[g.ID] = i
+	}
+	for _, layer := range config.GroupByKind(r.groups) {
+		enabled := 0
+		for _, g := range layer.Groups {
+			if g.Enabled {
+				enabled++
+			}
+		}
+		head := fmt.Sprintf("%s · %d 组 / 启用 %d", config.KindLabel(layer.Kind), len(layer.Groups), enabled)
+		if layer.Kind == config.KindFinal {
+			head += " · 兜底 · 不可选「不处理」"
+		}
+		rows = append(rows, []string{head})
+		items = append(items, styles.Heading.Render(head))
+		keys = append(keys, "")
+		groupRows = append(groupRows, -1)
+		selectable = append(selectable, false)
+
+		pos := 0
+		for _, g := range layer.Groups {
+			if r.enabledOnly && !g.Enabled {
+				continue
+			}
+			pos++
+			source := ""
+			if presetGroupNames[g.Name] {
+				source = "预置"
+			}
+			rows = append(rows, []string{
+				fmt.Sprintf("%d. %s", pos, g.Name),
+				g.Target,
+				fmt.Sprintf("%d 条", len(g.Rules)),
+				enabledLabel(g.Enabled),
+				source,
+			})
+			items = append(items, "")
+			keys = append(keys, fmt.Sprintf("group:%d", g.ID))
+			groupRows = append(groupRows, indexOf[g.ID])
+			selectable = append(selectable, true)
+		}
+	}
+	r.groupRows = groupRows
+	r.list.SetTableSelectable([]components.Column{
+		col("分流组（层内序号）", 20, 0, false),
+		col("目标", 12, 0, false),
+		col("规则", 5, 0, true),
+		col("状态", 4, 0, false),
+		col("来源", 6, 3, false), // 窄屏隐藏；预置组删除后可按 P 恢复
+	}, rows, keys, selectable)
 }
 
 // reloadGroupRules 重建当前分流组的规则列表。
@@ -483,11 +715,17 @@ func (r *Rules) reloadGroupRules() {
 	r.list.SelectKey(selected)
 }
 
+// selectedGroup 返回光标所在的分流组。光标落在层标题上时返回 false：
+// 标题行不是可操作对象，不能对它删除/编辑/启停。
 func (r *Rules) selectedGroup() (*config.RoutingGroup, bool) {
-	if r.list.Cursor < 0 || r.list.Cursor >= len(r.groups) {
+	if r.list.Cursor < 0 || r.list.Cursor >= len(r.groupRows) {
 		return nil, false
 	}
-	return r.groups[r.list.Cursor], true
+	idx := r.groupRows[r.list.Cursor]
+	if idx < 0 || idx >= len(r.groups) {
+		return nil, false
+	}
+	return r.groups[idx], true
 }
 
 // selectedSet 返回光标所在的自定义规则集。光标落在只读的内置分类行上时返回 false，
@@ -721,9 +959,9 @@ func (r *Rules) openForm(kind string) {
 	switch kind {
 	case "add-rg":
 		r.form = components.NewForm("新建分流组",
-			[]string{"名称", "目标"},
-			[]string{"name", "target"},
-			[]string{"如 流媒体", "DIRECT / BLOCK / 代理组名"})
+			[]string{"名称", "目标", "层"},
+			[]string{"name", "target", "kind"},
+			[]string{"如 流媒体", "DIRECT / BLOCK / 代理组名", "层序即优先级：custom < geosite < geoip < acl < final"})
 	case "add-rule":
 		r.form = components.NewForm("添加规则（"+r.cur.Name+"）",
 			[]string{"类型", "值", "反转"},
@@ -745,11 +983,12 @@ func (r *Rules) openFormEditGroup(g *config.RoutingGroup) {
 	r.formKind = "edit-rg"
 	r.editID = g.ID
 	r.form = components.NewForm("编辑分流组",
-		[]string{"名称", "目标"},
-		[]string{"name", "target"},
-		[]string{"", "DIRECT / BLOCK / 代理组名"})
+		[]string{"名称", "目标", "层"},
+		[]string{"name", "target", "kind"},
+		[]string{"", "DIRECT / BLOCK / 代理组名", "改层会改变该组的优先级归属"})
 	r.form.SetValueByKey("name", g.Name)
 	r.form.SetValueByKey("target", g.Target)
+	r.form.SetValueByKey("kind", g.Layer())
 	r.err = nil
 	r.configureForm()
 	r.mode = rulesForm
@@ -800,6 +1039,7 @@ func (r *Rules) submitForm() {
 func (r *Rules) submitGroupForm() {
 	name := r.form.ValueByKey("name")
 	target := strings.TrimSpace(r.form.ValueByKey("target"))
+	kind := config.KindNormalize(r.form.ValueByKey("kind"))
 	if strings.EqualFold(target, "DIRECT") || strings.EqualFold(target, "BLOCK") {
 		target = strings.ToUpper(target)
 	}
@@ -812,11 +1052,11 @@ func (r *Rules) submitGroupForm() {
 		return
 	}
 	if r.formKind == "add-rg" {
-		if _, err := r.app.Rout.CreateGroup(name, target, nil); err != nil {
+		if _, err := r.app.Rout.CreateGroupIn(name, target, kind, nil); err != nil {
 			r.err = err
 			return
 		}
-		r.status = "分流组已创建，enter 添加规则"
+		r.status = fmt.Sprintf("分流组已创建（%s 层），enter 添加规则", config.KindLabel(kind))
 	} else {
 		g, err := r.app.DB.GetRoutingGroup(r.editID)
 		if err != nil {
@@ -824,7 +1064,7 @@ func (r *Rules) submitGroupForm() {
 			r.mode = rulesGroups
 			return
 		}
-		g.Name, g.Target = name, target
+		g.Name, g.Target, g.Kind = name, target, kind
 		if err := r.app.Rout.UpdateGroup(g, g.Rules); err != nil {
 			r.err = err
 			return
@@ -894,6 +1134,42 @@ func (r *Rules) submitRulesetForm() {
 }
 
 // --- 异步下载 ---
+
+// applyPresetTask 在后台执行地区预置对齐，随后生成并校验配置。
+// 逐条结果走与其他任务相同的回执通道（v 查看、f 重试语义不适用，故只给汇总）。
+func (r *Rules) applyPresetTask() tea.Cmd {
+	r.busy = true
+	r.err = nil
+	r.status = "正在导入地区预置…"
+	region := routing.PresetCN
+	if len(routing.PresetRegions) > 0 {
+		region = routing.PresetRegions[0]
+	}
+	return r.taskN("地区预置导入", 0, func(report func(itemResult)) tea.Msg {
+		ctx, cancel := context.WithTimeout(r.app.BackgroundContext(), 30*time.Minute)
+		defer cancel()
+		result, err := r.app.Rout.ApplyPreset(region, routing.PresetMerge)
+		if err != nil {
+			return actionDoneMsg{Action: "apply-preset", Data: region, Err: err}
+		}
+		results := make([]itemResult, 0, len(result.Items))
+		for _, item := range result.Items {
+			row := itemResult{ID: 0, Key: item.Name, Name: item.Name, State: item.Action, Detail: item.Detail}
+			results = append(results, row)
+		}
+		// 预置只新增了内置分类引用：生成一次配置，把缺缓存的部分按需补齐（失败不致命，
+		// 生成器会回退 remote，由 sing-box 启动时下载）
+		if genErr := r.app.GenerateConfig(ctx); genErr != nil {
+			results = append(results, itemResult{Name: "生成配置", State: "失败", Detail: genErr.Error()})
+		} else if checkErr := r.app.CheckConfig(ctx); checkErr != nil {
+			results = append(results, itemResult{
+				Name: "校验配置", State: "失败",
+				Detail: checkErr.Error() + "（可能是规则集未下载，执行 ruleset update 后重试）",
+			})
+		}
+		return actionDoneMsg{Action: "apply-preset", Data: result.Summary(), Results: results}
+	})
+}
 
 func (r *Rules) downloadRuleSets(ids []int64, doing string) tea.Cmd {
 	return r.downloadWork(ids, nil, false)
@@ -1006,6 +1282,37 @@ func (r *Rules) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 		r.reloadGroupRules()
 		return r, nil
 	}
+	if r.confirmKind == "move-layer" {
+		target, group := r.moveKind, r.moveTarget
+		r.list = r.moveBack
+		r.moveTarget, r.moveKinds = nil, nil
+		r.mode = rulesGroups
+		if msg.Confirmed && msg.ID == r.confirmKind {
+			name := "分组"
+			if group != nil {
+				name = group.Name
+				if err := r.app.Rout.MoveGroupToKind(group.ID, target, -1); err != nil {
+					r.err = err
+					r.status = ""
+					r.reload()
+					return r, nil
+				}
+				r.err = nil
+				r.app.MarkConfigDirty()
+				r.status = fmt.Sprintf("%s 已移入 %s 层（层尾）", name, config.KindLabel(target))
+			}
+		}
+		r.reload()
+		return r, nil
+	}
+	if r.confirmKind == "apply-preset" {
+		r.mode = rulesGroups
+		if msg.Confirmed && msg.ID == r.confirmKind {
+			return r, r.applyPresetTask()
+		}
+		r.reload()
+		return r, nil
+	}
 	backTo := rulesGroups
 	if r.confirmKind == "delete-rs" {
 		backTo = rulesSets
@@ -1053,13 +1360,25 @@ func (r *Rules) View() string {
 		return r.confirmView(&r.confirm)
 	case rulesCatalog:
 		return r.catalogView()
+	case rulesMove:
+		head := "移动到其他层 · 层序即优先级（上→下）"
+		if r.moveTarget != nil {
+			head = fmt.Sprintf("把 %q 移动到其他层（当前 %s）· 层序即优先级（上→下）",
+				r.moveTarget.Name, config.KindLabel(r.moveTarget.Layer()))
+		}
+		return r.listView(&r.moveList, head,
+			"没有可选的层。", r.statusLine(), "Enter 选择目标层 · Esc 取消")
 	case rulesSets:
 		return r.listView(&r.list, "分流组  [规则集] · [/] 切换", "暂无规则集，c 浏览分类库。", r.statusLine(), Hints(r))
 	case rulesGroupRl:
 		return r.listView(&r.list, fmt.Sprintf("分流 / %s → %s · 顺序即优先级", r.cur.Name, r.cur.Target),
 			"暂无规则，a 添加。", r.statusLine(), Hints(r))
 	default:
-		return r.listView(&r.list, "[分流组]  规则集 · [/] 切换", "暂无分流组，a 新建。", r.statusLine(), Hints(r))
+		head := "[分流组]  规则集 · [/] 切换 · 层序即优先级"
+		if r.enabledOnly {
+			head += " · 仅显示启用（f 显示全部）"
+		}
+		return r.listView(&r.list, head, "暂无分流组，a 新建。", r.statusLine(), Hints(r))
 	}
 }
 
@@ -1086,6 +1405,19 @@ func (r *Rules) statusLine() string {
 func (r *Rules) configureForm() {
 	r.form.SetChoices("type", ruleTypeChoices(true))
 	r.form.SetChoices("target", proxyChoices(r.app, true))
+	// 层：新建时默认 custom（层序最高、语义最安全）。规则构成对应的建议值由
+	// config.SuggestKind 在「不带 --kind 直接建组」的路径给出（CLI / 模型层），
+	// 表单这里以层序提示为主，用户可显式改。
+	if field := r.form.Field("kind"); field != nil {
+		r.form.SetChoices("kind", kindChoices())
+		field.Help = "层序即优先级：" + strings.Join(config.Kinds, " < ") + "。混合种类的规则组请留在 custom 层。"
+		field.Validate = func(value string) error {
+			if !config.KindValid(value) {
+				return fmt.Errorf("未知层 %q（可选 %s）", value, strings.Join(config.Kinds, " / "))
+			}
+			return nil
+		}
+	}
 	configureRuleValue(r.app, &r.form)
 	for _, key := range []string{"name", "tag", "target"} {
 		if field := r.form.Field(key); field != nil {

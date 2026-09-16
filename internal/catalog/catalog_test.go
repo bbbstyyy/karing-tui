@@ -1,14 +1,19 @@
 package catalog
 
-import "testing"
+import (
+	"sort"
+	"strings"
+	"testing"
+)
 
-// TestLoadCounts 清单能正常加载，且数量与上游一致（更新清单后需同步此处）。
+// TestLoadCounts 清单能正常加载，数量与内嵌快照一致（更新清单后需同步此处）。
 func TestLoadCounts(t *testing.T) {
 	load()
 	if loadErr != nil {
 		t.Fatalf("加载分类清单失败: %v", loadErr)
 	}
-	want := map[string]int{KindGeosite: 1899, KindGeoIP: 260, KindACL: 171}
+	// geosite 比快照多 8 个：上游仍提供、但没有内嵌 .srs 的候选码（见 geosite.txt 头部注释）
+	want := map[string]int{KindGeosite: 1961, KindGeoIP: 278, KindACL: 171}
 	for kind, n := range want {
 		if got := Count(kind); got != n {
 			t.Errorf("%s 分类码数量 = %d, 期望 %d（更新清单后请同步此断言）", kind, got, n)
@@ -22,6 +27,64 @@ func TestLoadCounts(t *testing.T) {
 	for i := 1; i < len(codes); i++ {
 		if codes[i-1] > codes[i] {
 			t.Fatalf("geoip 清单未排序: %q 在 %q 之前", codes[i-1], codes[i])
+		}
+	}
+}
+
+// embeddedSnapshotCodes 列出编译期嵌入的 .srs 快照里的分类码（即发布物本身）。
+func embeddedSnapshotCodes(t *testing.T, kind string) []string {
+	t.Helper()
+	entries, err := builtinRuleSetFS.ReadDir("data/rulesets/" + kind)
+	if err != nil {
+		t.Fatalf("读取内嵌快照 %s 失败: %v", kind, err)
+	}
+	codes := make([]string, 0, len(entries))
+	for _, e := range entries {
+		name, ok := strings.CutSuffix(e.Name(), ".srs")
+		if !ok {
+			continue
+		}
+		codes = append(codes, name)
+	}
+	sort.Strings(codes)
+	return codes
+}
+
+// TestCodeTableCoversEmbeddedSnapshot 6.0 的回归门：内嵌快照里每一个 .srs 都必须在码表
+// 里有对应分类码。否则该 .srs 虽随二进制发布，catalog.Parse 却判为未知码，规则写入时被
+// checkRuleSetTags 直接拒绝——即「已发布却无法引用」的悬空分类。
+//
+// 修复前（2026-09-15）：geosite 62 个、geoip 18 个 .srs 悬空，其中包含地区方案要用的
+// geosite:malware / phishing / cryptominers 与 geoip:malware / phishing / openai / github。
+func TestCodeTableCoversEmbeddedSnapshot(t *testing.T) {
+	load()
+	if loadErr != nil {
+		t.Fatalf("加载分类清单失败: %v", loadErr)
+	}
+	for _, kind := range Kinds {
+		codes := embeddedSnapshotCodes(t, kind)
+		if len(codes) == 0 {
+			t.Fatalf("内嵌快照 %s 为空（go:embed 是否失效？）", kind)
+		}
+		var missing []string
+		for _, code := range codes {
+			if !Has(kind, code) {
+				missing = append(missing, code)
+			}
+		}
+		if len(missing) > 0 {
+			t.Errorf("%s: %d 个内嵌 .srs 没有码表条目（悬空分类）: %s\n  修复: scripts/gen-catalog.sh",
+				kind, len(missing), strings.Join(missing, ", "))
+		}
+	}
+}
+
+// TestEmbeddedSnapshotCounts 内嵌快照的数量基线，与 scripts/gen-catalog.sh 的输出一致。
+func TestEmbeddedSnapshotCounts(t *testing.T) {
+	want := map[string]int{KindGeosite: 1953, KindGeoIP: 278, KindACL: 171}
+	for _, kind := range Kinds {
+		if got := len(embeddedSnapshotCodes(t, kind)); got != want[kind] {
+			t.Errorf("内嵌快照 %s 分类数 = %d, 期望 %d", kind, got, want[kind])
 		}
 	}
 }
@@ -193,6 +256,62 @@ func TestNeedsResolve(t *testing.T) {
 		if got := c.ref.NeedsResolve(); got != c.want {
 			t.Errorf("%s.NeedsResolve() = %v, 期望 %v", c.ref, got, c.want)
 		}
+	}
+}
+
+// TestNeedsResolveKindInvariants 把「geosite 一律无 IP 条件、geoip 一律有 IP 条件」
+// 这两条隐含假设固化成断言。二者都是 2026-09-15 对内嵌快照逐个反编译得到的实测结论
+// （geosite 0/1953、geoip 278/278、acl 33/171），单条反例就会被这条测试抓住，
+// 避免分类更新后 resolve 规则静默插错位置。
+func TestNeedsResolveKindInvariants(t *testing.T) {
+	for _, code := range Codes(KindGeosite) {
+		if (Ref{Kind: KindGeosite, Code: code}).NeedsResolve() {
+			t.Errorf("geosite:%s 被判为含 IP 条件，但实测 geosite 全量不含 IP 条件", code)
+		}
+	}
+	for _, code := range Codes(KindGeoIP) {
+		if !(Ref{Kind: KindGeoIP, Code: code}).NeedsResolve() {
+			t.Errorf("geoip:%s 未判为含 IP 条件，但 geoip 全量为 IP 条件", code)
+		}
+	}
+	aclIPCount := 0
+	for _, code := range Codes(KindACL) {
+		if (Ref{Kind: KindACL, Code: code}).NeedsResolve() {
+			aclIPCount++
+		}
+	}
+	if aclIPCount != 33 {
+		t.Errorf("acl 含 IP 条件的分类数 = %d, 期望 33（与 data/acl-ip.txt 一致）", aclIPCount)
+	}
+	// acl-ip.txt 里的每一条都必须真的有内嵌 .srs，否则清单是凭空写出来的
+	for code := range aclIP {
+		if !(Ref{Kind: KindACL, Code: code}).HasEmbeddedRuleSet() {
+			t.Errorf("acl-ip.txt 含 %s，但快照里没有对应 .srs", code)
+		}
+	}
+}
+
+// TestPhase7CatalogRefsResolvable 地区方案（cn 预置）要用的分类引用必须都能解析。
+// 这是 6.0 的直接验收：修复前其中 7 个因码表缺条目而被 catalog.Parse 判为未知码。
+// geoip:bing 是**真悬空引用**（快照无 bing.srs，karing 的 geoip_codes.txt 也没有该码），
+// 故地区方案必须剔除它只保留 geosite:bing——这里把「它仍然不可解析」也固定下来，
+// 防止有人「顺手」把它加回码表却依然没有可下载的规则集。
+func TestPhase7CatalogRefsResolvable(t *testing.T) {
+	needed := []string{
+		"geosite:malware", "geosite:phishing", "geosite:cryptominers",
+		"geoip:malware", "geoip:phishing", "geoip:openai", "geoip:github",
+		"acl:Gemini", "acl:Claude", "acl:GoogleFCM", "acl:Steam", "acl:Nintendo",
+		"acl:BilibiliHMT", "acl:NetEaseMusic", "acl:ChinaIp", "acl:ChinaDomain",
+		"acl:ChinaCompanyIp", "acl:UnBan", "acl:SteamCN", "acl:Download", "acl:ChinaMedia",
+		"acl:ProxyGFWlist", "acl:ProxyMedia", "geosite:geolocation-!cn", "geosite:bing",
+	}
+	for _, value := range needed {
+		if !IsRef(value) {
+			t.Errorf("地区方案引用的分类 %q 无法解析（码表缺失或被改名）", value)
+		}
+	}
+	if IsRef("geoip:bing") {
+		t.Error("geoip:bing 应为悬空引用（快照无 bing.srs），不应出现在码表中")
 	}
 }
 

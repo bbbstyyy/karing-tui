@@ -235,4 +235,15 @@ var migrations = [][]string{
 	{
 		`ALTER TABLE subscriptions ADD COLUMN download_strategy TEXT NOT NULL DEFAULT 'prefer_proxy'`,
 	},
+
+	// v8: 分流组分层（Kind）——移植 karing 的「层序」模型。
+	// kind_rank 是 config.KindRank 的冗余列：SQLite 不能调用 Go 函数，把层序
+	// 落成整数列才能继续把排序下推到 SQL。Position 语义同步改为「层内序号」。
+	// 存量数据的回填需要「哪个组是 final」这层判断，放在 postMigrations[8]
+	// （见 routing_layers.go），与这里的 DDL 同处一个事务。
+	{
+		`ALTER TABLE routing_groups ADD COLUMN kind TEXT NOT NULL DEFAULT 'custom'`,
+		`ALTER TABLE routing_groups ADD COLUMN kind_rank INTEGER NOT NULL DEFAULT 0`,
+		`CREATE INDEX idx_routing_groups_order ON routing_groups(kind_rank, position, id)`,
+	},
 }

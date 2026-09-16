@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/bbbstyyy/karing-tui/internal/config"
@@ -52,11 +53,18 @@ func TestCreateGroupWithLogicalRule(t *testing.T) {
 
 func TestRejectsMultipleActiveFinalGroups(t *testing.T) {
 	m := newTestManager(t)
-	if _, err := m.CreateGroup("Final 1", "Auto", []config.Rule{{Type: "final", Enabled: true}}); err != nil {
+	if _, err := m.CreateGroupIn("Final 1", "Auto", config.KindFinal, []config.Rule{{Type: "final", Enabled: true}}); err != nil {
 		t.Fatalf("创建第一个 final: %v", err)
 	}
-	if _, err := m.CreateGroup("Final 2", "Auto", []config.Rule{{Type: "final", Enabled: true}}); err == nil {
-		t.Fatal("活动 final 分流组应全局唯一")
+	_, err := m.CreateGroupIn("Final 2", "Auto", config.KindFinal, []config.Rule{{Type: "final", Enabled: true}})
+	if err == nil {
+		t.Fatal("final 层最多只能有一个分流组")
+	}
+	// 错误信息要能定位到冲突的组，并给出修复方式
+	for _, want := range []string{"Final 1", "final 层最多只能有一个"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误信息缺少 %q: %v", want, err)
+		}
 	}
 }
 
@@ -71,16 +79,15 @@ func TestValidateLogicalErrors(t *testing.T) {
 		{"缺少子条件", config.Rule{Type: "logical", Mode: "and"}},
 		{"未知条件类型", config.Rule{Type: "logical", Mode: "or", Conditions: []config.RuleCondition{{Type: "nosuch", Value: "x"}}}},
 		{"条件值为空", config.Rule{Type: "logical", Mode: "and", Conditions: []config.RuleCondition{{Type: "domain", Value: " "}}}},
-		{"final 混入组内", config.Rule{Type: "domain", Value: "a.com"}},
 	}
-	// final 规则校验：final 必须是组内唯一规则——先造一个含 final + 普通规则的组
+
+	// 非 final 层不得含 final 规则（6.3：替代原「final 必须是组内唯一规则」的表述）
 	if _, err := m.CreateGroup("Final混用", "Auto", []config.Rule{
 		{Type: "final", Enabled: true},
 		{Type: "domain", Value: "a.com"},
 	}); err == nil {
-		t.Error("final 与其他规则同组应被拒绝")
+		t.Error("非 final 层含 final 规则应被拒绝")
 	}
-	cases = cases[:4]
 
 	for _, c := range cases {
 		if _, err := m.CreateGroup(c.name, "Auto", []config.Rule{c.rule}); err == nil {

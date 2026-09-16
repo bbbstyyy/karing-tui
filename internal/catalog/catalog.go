@@ -46,6 +46,10 @@ var Kinds = []string{KindGeosite, KindGeoIP, KindACL}
 
 // 分类规则集下载地址前缀。geosite/geoip 取 meta-rules-dat（上游权威）；
 // ACL4SSR 仅 karing-ruleset 提供 sing 格式（.srs），与 karing 同源。
+//
+// 注意：码表（data/*.txt）的事实源是**内嵌快照**，不是这两个仓库的当前文件树。
+// 上游只用于发现「没有内嵌 .srs 的候选码」（data/*.txt 头部注释里列出的那些），
+// 它们仍可引用，只是首次生成配置时要联网下载。见 scripts/gen-catalog.sh。
 const (
 	geoBaseURL = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo"
 	aclBaseURL = "https://github.com/KaringX/karing-ruleset/raw/sing/ACL4SSR"
@@ -250,11 +254,19 @@ func RefByTag(tag string) (Ref, bool) {
 }
 
 // NeedsResolve 报告该分类的规则集是否含 IP 类条件（ip_cidr/ip_is_private）——
-// 这类条件对域名目标必须先 resolve 才能匹配（见 4.1）。判定依据是实测而非命名：
-//   - geoip：全部为 IP 条件
-//   - geosite：上游全量 1899 个分类实测均不含 IP 条件
-//   - acl：混合，按 data/acl-ip.txt 清单判定（ChinaDomain、Apple 等名字不带 "ip"
-//     的分类实际含 ip_cidr，仅凭 tag 字面判断会漏判）
+// 这类条件对域名目标必须先 resolve 才能匹配（见 4.1）。判定依据是**对内嵌快照逐个
+// 反编译得到的实测结论**，而非命名或上游仓库的状态：
+//
+//   - geoip：278 个分类全部含 IP 条件
+//   - geosite：1953 个分类全部**不含** IP 条件
+//   - acl：混合，33/171 含 IP 条件，按 data/acl-ip.txt 清单判定
+//     （ChinaDomain、Apple 等名字不带 "ip" 的分类实际含 ip_cidr，仅凭 tag 字面判断会漏判）
+//
+// 复核记录（2026-09-15，判定对象 internal/catalog/data/rulesets/ 即发布物本身）：
+// geosite 1953/1953 无 IP、geoip 278/278 有 IP、acl 33/171 有 IP，
+// 与 data/acl-ip.txt 逐条一致。重跑方式见 scripts/gen-catalog.sh（--ip-all 覆盖三类）。
+// 相应地，码表里没有内嵌 .srs 的上游候选码（如 geosite 的 8 个）按「无 IP 条件」处理，
+// 与它们在生成配置时需要联网下载这一点无关。
 func (r Ref) NeedsResolve() bool {
 	load()
 	switch r.Kind {

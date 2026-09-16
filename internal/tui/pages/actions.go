@@ -133,10 +133,18 @@ func Actions(page Page) []Action {
 			add("Enter", "查看组内规则", ok, empty)
 			add("Alt+Enter", "查看分流组详情", ok, empty)
 			add("a", "新建分流组", true, "")
-			add("e", "编辑目标与名称", ok, empty)
+			add("e", "编辑目标、名称与层", ok, empty)
 			add("d", "删除分流组", ok, empty)
+			add("J", "层内下移（降低层内优先级）", ok, empty)
+			add("K", "层内上移（提高层内优先级）", ok, empty)
+			add("m", "移动到其他层（改变优先级归属）", ok, empty)
+			add("f", "仅显示启用 / 显示全部", true, "")
+			add("P", "导入 / 恢复地区预置", !p.busy, "任务进行中")
 			add(keys.Next, "管理规则集", true, "")
 			actions[len(actions)-1].Aliases = []string{"R"}
+		case rulesMove:
+			add("Enter", "移动到选中的层", true, "")
+			add("Esc", "取消移动", true, "")
 		case rulesGroupRl:
 			add("Enter", "查看规则全文", ok, empty)
 			add("a", "添加规则", true, "")
@@ -195,7 +203,8 @@ func Actions(page Page) []Action {
 		add("G", "跟随最新日志", true, "")
 		add("]", "切换日志来源", true, "")
 	case *SettingsPage:
-		add("e", "编辑当前设置", p.section != 3, "请选择需要编辑的设置")
+		selected := p.list.SelectedKey()
+		add("e", "编辑当前设置", p.section != 3 && settingEditable(selected), "请选择需要编辑的设置")
 		add("E", "编辑全部设置", true, "")
 		add("Enter", "打开当前项", true, "")
 		add("Alt+Enter", "查看完整说明", true, "")

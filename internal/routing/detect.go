@@ -24,6 +24,7 @@ type DetectResult struct {
 	RuleIndex     int
 	Target        string
 	PrivateDirect bool
+	Kind          string // 命中分流组所属层（kind），便于排查层序问题
 	UnknownRules  []string
 }
 
@@ -53,7 +54,7 @@ func DetectWithPrivateDirect(groups []*config.RoutingGroup, input string, privat
 			return result, nil
 		}
 	}
-	groups = SortGroupsByPosition(groups)
+	groups = SortGroupsByPriority(groups)
 
 	// 生成器对 final 的语义是全局兜底：取配置顺序中第一个 final。
 	var fallbackGroup *config.RoutingGroup
@@ -88,6 +89,7 @@ func DetectWithPrivateDirect(groups []*config.RoutingGroup, input string, privat
 			if matched {
 				result.Matched = true
 				result.Group, result.Rule, result.RuleIndex, result.Target = group, rule, i, group.Target
+				result.Kind = config.KindNormalize(group.Kind)
 				return result, nil
 			}
 		}
@@ -97,6 +99,7 @@ func DetectWithPrivateDirect(groups []*config.RoutingGroup, input string, privat
 		result.Matched = true
 		result.Fallback = true
 		result.Group, result.Rule, result.RuleIndex, result.Target = fallbackGroup, fallbackRule, fallbackIndex, fallbackGroup.Target
+		result.Kind = config.KindNormalize(fallbackGroup.Kind)
 	}
 	return result, nil
 }
@@ -253,10 +256,15 @@ func ruleDescription(group *config.RoutingGroup, index int, rule *config.Rule) s
 	return fmt.Sprintf("%s #%d %s=%s", group.Name, index+1, rule.Type, value)
 }
 
-// SortGroupsByPosition 返回按分流组 Position、ID 排序的副本，供不来自 DB 的调用方使用。
-func SortGroupsByPosition(groups []*config.RoutingGroup) []*config.RoutingGroup {
+// SortGroupsByPriority 返回按 (层序, 层内 Position, ID) 排序的副本，与
+// ListRoutingGroups 的排序键一致，供不来自 DB 的调用方使用。
+func SortGroupsByPriority(groups []*config.RoutingGroup) []*config.RoutingGroup {
 	out := append([]*config.RoutingGroup(nil), groups...)
 	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := config.KindRank(out[i].Kind), config.KindRank(out[j].Kind)
+		if ri != rj {
+			return ri < rj
+		}
 		if out[i].Position != out[j].Position {
 			return out[i].Position < out[j].Position
 		}

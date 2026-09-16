@@ -9,6 +9,7 @@
 - 多订阅与分享链接导入，支持 Clash YAML、sing-box JSON、Base64 节点列表。
 - 节点搜索、过滤、测速，以及 Select / URLTest 代理组。
 - 域名、正则、IP、地理分类、规则集与逻辑组合分流，内置 geosite / geoip / ACL4SSR 分类库。
+- 分流按「层」组织：自定义分流组 < GeoSite < GeoIP < ACL < final，层序固定、层内保序；默认内置中国大陆地区方案（27 组，对照 Karing 的 cn 预置）。
 - DNS 与 FakeIP 配置、日志、流量状态、路由检测和连通性诊断。
 - CLI 后台运行、备份恢复、配置迁移及订阅自动更新。
 
@@ -27,8 +28,8 @@ tar -xzf karing-tui-v0.2.0-linux-amd64.tar.gz
 归档中的 `karing` 是主程序；可将它安装到 PATH 中的目录。后文命令假设已将其命名为 `karing` 并加入 PATH。
 
 1. 按 `2` 打开「订阅与节点」，按 `a` 添加订阅。`Ctrl+U` 保存并更新；也可 `Ctrl+S` 仅保存，返回列表后按 `u` 更新。
-2. 按 `3` 查看代理组。首次初始化会创建 Auto / Manual / AI 默认组。
-3. 按 `4` 查看或调整分流；按 `7` 设置端口及下载代理。
+2. 按 `3` 查看代理组。首次初始化会创建 Auto（自动选择）/ Manual（手动选择）默认组。
+3. 按 `4` 查看或调整分流；首次初始化已装入中国大陆地区方案（27 组归入「自定义分流组」层，外加 final 兜底组），按 `P` 可重新导入/恢复预置，按 `7` 设置端口及下载代理。
 4. 按 `Ctrl+A` 生成、校验并应用配置。核心未运行时启动；运行中会先确认重启影响，校验失败时保留当前运行实例。
 5. 将需要代理的应用指向 `127.0.0.1:2080`（HTTP 或 SOCKS5）。
 
@@ -45,7 +46,7 @@ tar -xzf karing-tui-v0.2.0-linux-amd64.tar.gz
 | 常用操作 | `a` 新增，`e` 编辑，`d` 删除，`r` 刷新；节点 `t/T` 测速选中项/当前结果列表，代理组 `t` 测速组内节点 |
 | 订阅与任务 | `u` 更新选中订阅，`U` 更新所有启用订阅；任务显示进度，期间可浏览其他页面；`v` 查看逐项结果，`f` 仅重试失败项；多行分享链接逐条报告导入结果 |
 | 代理组 | `Enter` 查看成员，`m` 勾选成员；Select 组用 `Space` 保存具体节点选择，再用 `Ctrl+A` 应用；界面分别显示保存选择与运行实际节点 |
-| 规则与 DNS | `[/]` 切换子页签；逻辑规则按条件行编辑，`[/]` 切换 AND/OR，`Space` 切换当前条件的 NOT；DNS 全局选项随 FakeIP 开关显示相关字段 |
+| 规则与 DNS | `[/]` 切换子页签；分流列表按层分组显示，`J/K` 层内上移/下移，`m` 移到其他层（会改变优先级归属），`f` 仅显示启用，`P` 导入/恢复地区预置；逻辑规则按条件行编辑，`[/]` 切换 AND/OR，`Space` 切换当前条件的 NOT；DNS 全局选项随 FakeIP 开关显示相关字段 |
 | 日志 | `[/]` 切换来源，`/` 搜索，`f` 切换级别过滤；回看时位置固定，`End/G` 跟随最新日志，`Alt+←/→` 查看长行 |
 | 设置 | `[/]` 切换监听、下载、分流和备份分组；`e/Enter` 编辑当前项，`E` 编辑全部；说明显示默认值与生效条件 |
 
@@ -78,7 +79,11 @@ karing stop --json
 | `karing core update [版本]` | 更新受管内核，默认采用本次构建的内置版本 |
 | `karing ruleset search geosite google` | 搜索内置分类 |
 | `karing ruleset update` | 更新规则集缓存 |
-| `karing route test example.com` | 离线检查规则匹配，无法判断的规则集会提示 |
+| `karing route list` | 按层列出分流组（层序、层内序号、目标与状态） |
+| `karing route add <名称> --target <出站> [--kind <层>] <规则集...>` | 新建分流组，`--kind` 缺省按规则构成推断 |
+| `karing route move <名称> --kind <层> [--pos N]` | 跨层移动分流组（改变优先级归属） |
+| `karing route preset cn [--merge\|--replace] [--yes]` | 对齐地区预置方案；`replace` 删除现有分流组，必须加 `--yes` 确认 |
+| `karing route test example.com` | 离线检查规则匹配，并显示命中分组所属的层 |
 | `karing import clash <文件>` / `karing import singbox <文件>` | 合并导入配置 |
 | `karing backup export [路径]` / `karing backup import <文件>` | 导出备份或覆盖恢复 |
 | `karing help` | 查看全部命令 |
@@ -101,6 +106,20 @@ KARING_HOME="$PWD/var/demo" karing
 目录中包含 `karing.db`、`runtime/config.json`、`runtime/bin/sing-box`、缓存、日志及备份。数据库、配置和备份包含订阅地址与节点凭据，分享诊断信息前请移除这些内容。
 
 已有的受管内核优先于发布包内置版本；普通源码构建没有嵌入内核时，还会尝试 PATH 或按需下载。规则集随版本提供离线快照；少量不在快照内的分类和自定义远程规则集仍需要下载。
+
+## 分流分层与默认方案
+
+分流组的优先级 = `(层序, 层内序号, ID)`，层序固定为：
+
+| 层 | 含义 |
+| --- | --- |
+| `custom` 自定义分流组 | 手工配置的组，以及中国大陆地区预置的全部 27 组（混合种类不重新归类，保持预置的扁平优先级） |
+| `geosite` / `geoip` / `acl` | 按分类库勾选生成的组 |
+| `final` | 兜底组，固定置底、最多一个，必须且仅含一条 final 规则 |
+
+首次初始化采用中国大陆地区方案：27 组全部在 `custom` 层（6 个默认启用、21 个建组但停用），另有 final 兜底组指向 `Manual`（select 手动选择）。**在 Manual 中没有选择节点时，未匹配流量会走 Manual 成员列表里的第一个节点**（即订阅中排序第一个节点），而不是不走代理。想改用其他方案，显式执行 `karing route preset cn --replace --yes`，或在 Rules 页逐组调整。
+
+`karing route preset cn`（缺省 `--merge`）按名称跳过已存在的组，可重复执行，用于恢复默认预设；已安装用户的既有方案不会被自动改写。
 
 ## IP 规则行为
 

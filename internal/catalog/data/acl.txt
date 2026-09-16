@@ -1,4 +1,4 @@
-# ACL4SSR 分类码（KaringX/karing-ruleset sing 分支 ACL4SSR 顶层）
+# acl 分类码（内嵌快照 internal/catalog/data/rulesets/acl，来源 Karing 规则集包）
 # 由 scripts/gen-catalog.sh 生成，请勿手工编辑
 360
 4399

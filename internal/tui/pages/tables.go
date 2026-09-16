@@ -91,10 +91,9 @@ func (r *Rules) table() {
 	var rows [][]string
 	switch r.mode {
 	case rulesGroups:
-		for _, g := range r.groups {
-			rows = append(rows, []string{g.Name, g.Target, strconv.Itoa(len(g.Rules)), enabledLabel(g.Enabled)})
-		}
-		r.list.SetTable([]components.Column{col("分流组", 18, 0, false), col("目标", 14, 0, false), col("规则", 5, 0, true), col("状态", 4, 0, false)}, rows, r.list.Keys)
+		// 按层分组渲染：层标题作为不可选中行，层的组数/启用数与层内序号都在这里
+		// 统一生成（buildGroupList），避免渲染与键位映射两处各写一遍。
+		r.buildGroupList()
 	case rulesGroupRl:
 		if r.cur == nil {
 			return

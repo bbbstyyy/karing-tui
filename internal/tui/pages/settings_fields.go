@@ -24,10 +24,16 @@ var settingFields = []settingField{
 	{"auto_update_minutes", "自动更新间隔（分钟）", "下载与订阅", "0（关闭）", "周期更新启用订阅；间隔修改需重启应用，更新结果仍需 Ctrl+A 应用。"},
 	{"private_direct", "内网直连", "分流行为", "开启", "内网 IP 直接连接，不需要额外 DNS 解析；Ctrl+A 后生效。"},
 	{"resolve_ip_rules", "IP 规则解析域名", "分流行为", "关闭", "开启后先解析域名匹配 IP 规则；代理侧收到 IP，解析失败会中断连接。Ctrl+A 后生效。"},
+	{"routing_layers", "分流层序", "分流行为", "只读", "优先级 = (层序, 层内序号, ID)：自定义分流组 < GeoSite < GeoIP < ACL < final。预置方案的全部组都在「自定义分流组」层。"},
+	{"routing_preset", "默认分流方案", "分流行为", "预置 cn", "中国大陆地区预置：27 组（6 个默认启用）+ final 兜底组。Rules 页按 P 可重新导入/恢复；已装方案不会被自动改写。"},
+	{"routing_final", "final 兜底出口", "分流行为", "Manual", "未匹配流量走 Manual（select）。在 Manual 中没有选择节点时走成员列表第一个节点（订阅中排序第一个），不是不走代理。"},
 }
 
 func configureSettingsForm(f *components.Form) {
 	for _, spec := range settingFields {
+		if !settingEditable(spec.key) {
+			continue // 只读说明项，不进编辑表单
+		}
 		field := f.Field(spec.key)
 		field.Label, field.Section = spec.label, spec.group
 		field.Help = "默认: " + spec.defaultValue + "。" + spec.help
@@ -57,13 +63,44 @@ func configureSettingsForm(f *components.Form) {
 
 func (s *SettingsPage) settingValues() map[string]string {
 	set := s.app.GetSettings()
+	final := s.finalRoutingInfo()
 	return map[string]string{
 		"mixed_port": strconv.Itoa(set.MixedPort), "allow_lan": strconv.FormatBool(set.AllowLAN),
 		"clash_api_port": strconv.Itoa(set.ClashAPIPort), "clash_api_secret": set.ClashAPISecret,
 		"log_level": set.LogLevel, "download_proxy": set.DownloadProxy, "auto_update_minutes": strconv.Itoa(set.AutoUpdateMinutes),
 		"private_direct": strconv.FormatBool(set.PrivateDirect), "resolve_ip_rules": strconv.FormatBool(set.ResolveIPRules),
+		// 只读说明项：反映当前分流状态，不进编辑表单
+		"routing_layers": "custom < geosite < geoip < acl < final",
+		"routing_preset": final.preset,
+		"routing_final":  final.target,
 	}
 }
+
+// routingInfo 汇总只读说明项要显示的分流状态。
+type routingInfo struct{ preset, target string }
+
+// finalRoutingInfo 读取 final 兜底组的目标与预置来源标记。
+// 数据库不可达或没有 final 组时给出缺省说明，不影响设置页其余部分。
+func (s *SettingsPage) finalRoutingInfo() routingInfo {
+	info := routingInfo{preset: "预置 cn", target: "Manual"}
+	groups, err := s.app.DB.ListRoutingGroups()
+	if err != nil {
+		return info
+	}
+	for _, g := range groups {
+		if config.KindNormalize(g.Kind) == config.KindFinal {
+			info.target = g.Target
+		}
+	}
+	return info
+}
+
+// settingReadOnlyKeys 分流行为分组里的只读说明项：它们描述当前分流状态，
+// 不进编辑表单——否则「编辑全部」会把这些说明当成输入，覆盖真实设置。
+var settingReadOnlyKeys = map[string]bool{"routing_layers": true, "routing_preset": true, "routing_final": true}
+
+// settingEditable 报告设置项是否可编辑。
+func settingEditable(key string) bool { return !settingReadOnlyKeys[key] }
 
 func settingValue(key, value string) string {
 	switch key {
@@ -123,6 +160,9 @@ func (s *SettingsPage) settingsPreview() string {
 }
 
 func (s *SettingsPage) editSetting(key string) {
+	if key != "" && !settingEditable(key) {
+		return
+	}
 	s.form = newSettingsForm()
 	configureSettingsForm(&s.form)
 	s.loadForm()

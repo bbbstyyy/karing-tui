@@ -109,13 +109,34 @@ func (m ProxyGroupMember) MemberKey() string {
 }
 
 // RoutingGroup 分流组：一组规则共同指向一个目标（代理组名 / DIRECT / BLOCK）。
+//
+// Kind 是层（见 routing_kind.go），Position 是**层内序号**而非全局序号：
+// 生成配置时的优先级 = (层序 KindRank, 层内 Position, ID)。层内顺序即优先级。
 type RoutingGroup struct {
 	ID       int64
 	Name     string
 	Target   string
-	Position int
+	Kind     string // custom / geosite / geoip / acl / final；空值按 custom 处理
+	Position int    // 层内序号
 	Enabled  bool
 	Rules    []Rule
+}
+
+// Layer 返回归一化后的层名（空值与非法值按 custom）。
+func (g *RoutingGroup) Layer() string { return KindNormalize(g.Kind) }
+
+// HasFinalRule 报告组内是否含 final 规则（不论启用状态）。
+// 引入 Kind 后 final 语义收紧为结构性约束（见 routing.Manager.validate）。
+func (g *RoutingGroup) HasFinalRule() bool {
+	if g == nil {
+		return false
+	}
+	for _, r := range g.Rules {
+		if r.Type == "final" {
+			return true
+		}
+	}
+	return false
 }
 
 // Rule 分流规则，属于某个分流组；顺序即优先级。

@@ -1,4 +1,4 @@
-# geoip 分类码（MetaCubeX/meta-rules-dat sing 分支 geo/geoip）
+# geoip 分类码（内嵌快照 internal/catalog/data/rulesets/geoip，来源 Karing 规则集包）
 # 由 scripts/gen-catalog.sh 生成，请勿手工编辑
 ad
 ae
@@ -7,9 +7,11 @@ ag
 ai
 al
 am
+amazon
 ao
 aq
 ar
+arvancloud
 as
 at
 au
@@ -26,6 +28,8 @@ bh
 bi
 bj
 bl
+blocked-community@ru
+blocked@ru
 bm
 bn
 bo
@@ -59,6 +63,8 @@ cx
 cy
 cz
 de
+derakcloud
+digitalocean
 dj
 dk
 dm
@@ -81,12 +87,14 @@ fo
 fr
 ga
 gb
+gcore
 gd
 ge
 gf
 gg
 gh
 gi
+github
 gl
 gm
 gn
@@ -113,6 +121,8 @@ in
 io
 iq
 ir
+iranserver
+irgfw-other-injected-ips
 is
 it
 je
@@ -134,6 +144,7 @@ la
 lb
 lc
 li
+linode
 lk
 lr
 ls
@@ -142,12 +153,14 @@ lu
 lv
 ly
 ma
+malware
 mc
 md
 me
 mf
 mg
 mh
+microsoft
 mk
 ml
 mm
@@ -178,11 +191,15 @@ nr
 nu
 nz
 om
+openai
+oracle
 pa
+parspack
 pe
 pf
 pg
 ph
+phishing
 pk
 pl
 pm
@@ -195,6 +212,7 @@ pw
 py
 qa
 re
+re-filter@ru
 ro
 rs
 ru
