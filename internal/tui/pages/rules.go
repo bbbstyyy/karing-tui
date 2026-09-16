@@ -15,7 +15,6 @@ import (
 	"github.com/bbbstyyy/karing-tui/internal/config"
 	"github.com/bbbstyyy/karing-tui/internal/routing"
 	"github.com/bbbstyyy/karing-tui/internal/tui/components"
-	"github.com/bbbstyyy/karing-tui/internal/tui/styles"
 	"github.com/bbbstyyy/karing-tui/internal/validation"
 )
 
@@ -615,7 +614,6 @@ func (r *Rules) reload() {
 // 这样用户能把规则移进去（若视觉过重，采用折叠风格而非隐藏整层）。
 func (r *Rules) buildGroupList() {
 	rows := make([][]string, 0, len(r.groups))
-	items := make([]string, 0, len(r.groups))
 	keys := make([]string, 0, len(r.groups))
 	groupRows := make([]int, 0, len(r.groups))
 	selectable := make([]bool, 0, len(r.groups))
@@ -636,7 +634,6 @@ func (r *Rules) buildGroupList() {
 			head += " · 兜底 · 不可选「不处理」"
 		}
 		rows = append(rows, []string{head})
-		items = append(items, styles.Heading.Render(head))
 		keys = append(keys, "")
 		groupRows = append(groupRows, -1)
 		selectable = append(selectable, false)
@@ -658,7 +655,6 @@ func (r *Rules) buildGroupList() {
 				enabledLabel(g.Enabled),
 				source,
 			})
-			items = append(items, "")
 			keys = append(keys, fmt.Sprintf("group:%d", g.ID))
 			groupRows = append(groupRows, indexOf[g.ID])
 			selectable = append(selectable, true)
@@ -1288,9 +1284,7 @@ func (r *Rules) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 		r.moveTarget, r.moveKinds = nil, nil
 		r.mode = rulesGroups
 		if msg.Confirmed && msg.ID == r.confirmKind {
-			name := "分组"
 			if group != nil {
-				name = group.Name
 				if err := r.app.Rout.MoveGroupToKind(group.ID, target, -1); err != nil {
 					r.err = err
 					r.status = ""
@@ -1299,7 +1293,7 @@ func (r *Rules) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 				}
 				r.err = nil
 				r.app.MarkConfigDirty()
-				r.status = fmt.Sprintf("%s 已移入 %s 层（层尾）", name, config.KindLabel(target))
+				r.status = fmt.Sprintf("%s 已移入 %s 层（层尾）", group.Name, config.KindLabel(target))
 			}
 		}
 		r.reload()
