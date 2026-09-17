@@ -23,6 +23,11 @@ type Manager struct {
 	// afterPlacement 仅供测试使用（C14 失败回滚验证）：每次 placement 写
 	// 成功后以 1 起计数调用，返回错误即中止后续写。生产路径恒为 nil。
 	afterPlacement func(n int) error
+
+	// writeProbe 仅供测试使用（C14-AUDIT 失败回滚验证）：DeleteGroup 与
+	// ApplyPreset(replace) 的事务内每次 DB 写之前以操作名调用，返回错误即中止
+	// 整个事务。生产路径恒为 nil。
+	writeProbe func(op string) error
 }
 
 // NewManager 创建分流管理器。logf 可为 nil。
@@ -303,22 +308,41 @@ func indexOfGroup(groups []*config.RoutingGroup, id int64) int {
 }
 
 // DeleteGroup 删除分流组（规则级联删除），并把该层剩余成员的层内序号去空档。
+// 删除与重排在单个事务中完成（C14-AUDIT）：中途失败整体回滚，不会留下
+// 组已删、序号未去空档的半状态。
 func (m *Manager) DeleteGroup(id int64) error {
-	g, err := m.getGroup(id)
+	var name string
+	err := m.DB.WithTx(context.Background(), func(tx *sql.Tx) error {
+		all, err := m.DB.ListRoutingGroupsTx(tx)
+		if err != nil {
+			return err
+		}
+		g := findGroupByID(all, id)
+		if g == nil {
+			return storage.ErrNotFound
+		}
+		name = g.Name
+		kind := config.KindNormalize(g.Kind)
+		if m.writeProbe != nil {
+			if err := m.writeProbe("DeleteRoutingGroup"); err != nil {
+				return err
+			}
+		}
+		if err := m.DB.DeleteRoutingGroupTx(tx, id); err != nil {
+			return err
+		}
+		if m.writeProbe != nil {
+			if err := m.writeProbe("applyLayerOrder"); err != nil {
+				return err
+			}
+		}
+		// all 是删除前快照，重排时跳过被删组本身
+		return m.applyLayerOrderTx(tx, kind, layerMembers(all, kind, id))
+	})
 	if err != nil {
 		return err
 	}
-	if err := m.DB.DeleteRoutingGroup(id); err != nil {
-		return err
-	}
-	all, err := m.DB.ListRoutingGroups()
-	if err != nil {
-		return err
-	}
-	if err := m.applyLayerOrder(config.KindNormalize(g.Kind), layerMembers(all, config.KindNormalize(g.Kind), 0)); err != nil {
-		return err
-	}
-	m.Logf("删除分流组 %q", g.Name)
+	m.Logf("删除分流组 %q", name)
 	return nil
 }
 

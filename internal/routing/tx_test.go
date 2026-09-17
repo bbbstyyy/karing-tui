@@ -114,3 +114,75 @@ func TestMoveGroupRollsBackOnMidwayFailure(t *testing.T) {
 	after := placementSnapshot(t, m)
 	assertPlacementUnchanged(t, before, after)
 }
+
+// --- C14-AUDIT：删除级联清理与预置 replace 的事务化验证 ---
+
+// TestDeleteGroupRollsBackOnMidwayFailure 删除分流组：组行删除成功但重排失败
+// 时，删除必须回滚（组还在、各层 position 原样）。
+func TestDeleteGroupRollsBackOnMidwayFailure(t *testing.T) {
+	m := newTestManager(t)
+	ids := seedCustomAndGeositeLayers(t, m)
+	before := placementSnapshot(t, m)
+
+	// 注入在重排之前（组行已删、尚未去空档）——旧实现的半状态窗口。
+	m.writeProbe = func(op string) error {
+		if op == "applyLayerOrder" {
+			return errInjected
+		}
+		return nil
+	}
+	if err := m.DeleteGroup(ids["c2"]); !errors.Is(err, errInjected) {
+		t.Fatalf("期望注入错误透出，得到 %v", err)
+	}
+
+	after := placementSnapshot(t, m)
+	assertPlacementUnchanged(t, before, after)
+
+	// 清除探针后可正常删除。
+	m.writeProbe = nil
+	if err := m.DeleteGroup(ids["c2"]); err != nil {
+		t.Fatalf("清除探针后删除失败: %v", err)
+	}
+	if after := placementSnapshot(t, m); len(after) != len(before)-1 {
+		t.Fatalf("删除后组数 = %d, 期望 %d", len(after), len(before)-1)
+	}
+}
+
+// TestApplyPresetReplaceRollsBackOnMidwayFailure 预置 replace 模式：预置组写入
+// 中途失败时，现有分组必须全部原样保留（旧实现会先删光再写，失败后分组丢失）。
+func TestApplyPresetReplaceRollsBackOnMidwayFailure(t *testing.T) {
+	m := newTestManager(t)
+	// 先用 merge 铺一层「用户现有配置」。
+	if _, err := m.ApplyPreset(PresetCN, PresetMerge); err != nil {
+		t.Fatalf("ApplyPreset(merge): %v", err)
+	}
+	before := placementSnapshot(t, m)
+	if len(before) == 0 {
+		t.Fatal("夹具失效：merge 后应有分组")
+	}
+
+	// replace 在写第一个预置组时失败。
+	m.writeProbe = func(op string) error {
+		if op == "CreateRoutingGroup" {
+			return errInjected
+		}
+		return nil
+	}
+	defer func() { m.writeProbe = nil }()
+	if _, err := m.ApplyPreset(PresetCN, PresetReplace); !errors.Is(err, errInjected) {
+		t.Fatalf("期望注入错误透出，得到 %v", err)
+	}
+
+	after := placementSnapshot(t, m)
+	assertPlacementUnchanged(t, before, after)
+
+	// 清除探针后 replace 正常完成：全量替换。
+	m.writeProbe = nil
+	rep, err := m.ApplyPreset(PresetCN, PresetReplace)
+	if err != nil {
+		t.Fatalf("清除探针后 replace 失败: %v", err)
+	}
+	if rep.Added == 0 {
+		t.Fatalf("replace 未写入任何组: %s", rep.Summary())
+	}
+}

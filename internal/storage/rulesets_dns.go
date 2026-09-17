@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -12,11 +13,20 @@ import (
 
 // CreateRuleSet 新建规则集。
 func (d *DB) CreateRuleSet(rs *config.RuleSet) error {
+	return d.createRuleSet(d.db, rs)
+}
+
+// CreateRuleSetTx 是 CreateRuleSet 的事务内版本（C14-AUDIT）。
+func (d *DB) CreateRuleSetTx(tx *sql.Tx, rs *config.RuleSet) error {
+	return d.createRuleSet(tx, rs)
+}
+
+func (d *DB) createRuleSet(q querier, rs *config.RuleSet) error {
 	if err := validateRuleSetTag(rs.Tag); err != nil {
 		return err
 	}
 	now := time.Now()
-	res, err := d.db.Exec(
+	res, err := q.Exec(
 		`INSERT INTO rulesets (name, tag, source_type, format, url, enabled, cached_path, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		rs.Name, rs.Tag, rs.SourceType, rs.Format, rs.URL, boolInt(rs.Enabled), rs.CachedPath, now,
@@ -65,7 +75,16 @@ func (d *DB) DeleteRuleSet(id int64) error {
 
 // ListRuleSets 返回全部规则集，按名称排序。
 func (d *DB) ListRuleSets() ([]*config.RuleSet, error) {
-	rows, err := d.db.Query(
+	return d.listRuleSets(d.db)
+}
+
+// ListRuleSetsTx 是 ListRuleSets 的事务内版本（C14-AUDIT）。
+func (d *DB) ListRuleSetsTx(tx *sql.Tx) ([]*config.RuleSet, error) {
+	return d.listRuleSets(tx)
+}
+
+func (d *DB) listRuleSets(q querier) ([]*config.RuleSet, error) {
+	rows, err := q.Query(
 		`SELECT id, name, tag, source_type, format, url, enabled, cached_path, updated_at FROM rulesets ORDER BY name`,
 	)
 	if err != nil {

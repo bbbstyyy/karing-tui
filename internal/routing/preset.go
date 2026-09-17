@@ -10,6 +10,8 @@
 package routing
 
 import (
+	"context"
+	"database/sql"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -253,7 +255,10 @@ func (r *PresetReport) FailedItems() []string {
 
 // ApplyPreset 把地区预置写入当前库。
 //
-// merge：按名称跳过已存在的组；replace：先删除现有全部分流组。
+// merge：按名称跳过已存在的组，可重复执行——契约即逐条增量，单条失败
+// 记入报告并继续，不做事务包裹（这是有意的，见 applyPresetReplaceTx 注释）。
+// replace：先删除现有全部分流组再写入——用户视角是一次「全量替换」操作，
+// 必须全成或全败，因此在单个事务中完成（C14-AUDIT）。
 // 两种模式都会在写入前确认 Auto / Manual 代理组存在（缺失就地补建），
 // 并保证全库最多一个 kind='final' 的兜底组。
 //
@@ -280,16 +285,11 @@ func (m *Manager) ApplyPreset(region string, mode PresetMode) (*PresetReport, er
 		return nil, err
 	}
 	if mode == PresetReplace {
-		for _, g := range existing {
-			if err := m.DB.DeleteRoutingGroup(g.ID); err != nil {
-				return nil, fmt.Errorf("删除现有分流组 %q 失败: %w", g.Name, err)
-			}
+		if err := m.applyPresetReplaceTx(entries, report); err != nil {
+			return nil, err
 		}
-		report.Items = append(report.Items, PresetItem{
-			Name: "现有分流组", Action: "删除",
-			Detail: fmt.Sprintf("已删除 %d 个（replace 模式）", len(existing)),
-		})
-		existing = nil
+		m.Logf("%s", report.Summary())
+		return report, nil
 	}
 
 	byName := make(map[string]bool, len(existing))
@@ -311,18 +311,9 @@ func (m *Manager) ApplyPreset(region string, mode PresetMode) (*PresetReport, er
 			continue
 		}
 		if byName[entry.Group.Name] {
-			if mode == PresetMerge {
-				report.Skipped++
-				report.Items = append(report.Items, PresetItem{
-					Name: entry.Group.Name, Action: "跳过", Detail: "同名分流组已存在（merge 模式不改写）",
-				})
-				continue
-			}
-			// replace 模式下同名组已在上面被删除，理论上不会走到这里；
-			// 真出现说明删除未生效，按失败处理而不是静默覆盖。
-			report.Failed++
+			report.Skipped++
 			report.Items = append(report.Items, PresetItem{
-				Name: entry.Group.Name, Action: "失败", Detail: "同名分流组仍然存在",
+				Name: entry.Group.Name, Action: "跳过", Detail: "同名分流组已存在（merge 模式不改写）",
 			})
 			continue
 		}
@@ -370,6 +361,96 @@ func (m *Manager) ApplyPreset(region string, mode PresetMode) (*PresetReport, er
 
 	m.Logf("%s", report.Summary())
 	return report, nil
+}
+
+// applyPresetReplaceTx 在单个事务中完成 replace 模式：删除现有全部分流组 →
+// 逐条写入预置组 → 建 final 兜底组。任一步失败整体回滚——replace 是一次
+// 带二次确认的破坏性操作，绝不留下「删了一半、写了一半」的状态
+// （原实现中途失败会丢光用户分组且只写入部分预置，C14-AUDIT 修复）。
+// merge 模式不事务化：其契约就是逐条、可重复、单条失败记入报告。
+func (m *Manager) applyPresetReplaceTx(entries []PresetEntry, report *PresetReport) error {
+	return m.DB.WithTx(context.Background(), func(tx *sql.Tx) error {
+		existing, err := m.DB.ListRoutingGroupsTx(tx)
+		if err != nil {
+			return err
+		}
+		for _, g := range existing {
+			if m.writeProbe != nil {
+				if err := m.writeProbe("DeleteRoutingGroup"); err != nil {
+					return err
+				}
+			}
+			if err := m.DB.DeleteRoutingGroupTx(tx, g.ID); err != nil {
+				return fmt.Errorf("删除现有分流组 %q 失败: %w", g.Name, err)
+			}
+		}
+		report.Items = append(report.Items, PresetItem{
+			Name: "现有分流组", Action: "删除",
+			Detail: fmt.Sprintf("已删除 %d 个（replace 模式）", len(existing)),
+		})
+
+		byName := map[string]bool{}
+		for _, entry := range entries {
+			for _, note := range entry.Notes {
+				report.Items = append(report.Items, PresetItem{Name: entry.Name, Action: "偏差", Detail: note})
+			}
+			if entry.Skipped != "" {
+				report.Skipped++
+				report.Items = append(report.Items, PresetItem{Name: entry.Name, Action: "跳过", Detail: entry.Skipped})
+				continue
+			}
+			if byName[entry.Group.Name] {
+				// 预置文件内部同名：跳过而不是让 UNIQUE 冲突炸掉整个事务
+				report.Skipped++
+				report.Items = append(report.Items, PresetItem{
+					Name: entry.Group.Name, Action: "跳过", Detail: "预置内同名条目重复，仅写入首个",
+				})
+				continue
+			}
+			if m.writeProbe != nil {
+				if err := m.writeProbe("CreateRoutingGroup"); err != nil {
+					return err
+				}
+			}
+			if err := m.DB.CreateRoutingGroupTx(tx, entry.Group); err != nil {
+				return fmt.Errorf("写入分流组 %q 失败: %w", entry.Group.Name, err)
+			}
+			byName[entry.Group.Name] = true
+			report.Added++
+			detail := fmt.Sprintf("→ %s · %s 层 · 层内第 %d 位 · %s",
+				entry.Group.Target, config.KindLabel(entry.Group.Kind), entry.Group.Position+1, enabledLabel(entry.Group.Enabled))
+			report.Items = append(report.Items, PresetItem{Name: entry.Group.Name, Action: "新增", Detail: detail})
+		}
+
+		// 兜底组：replace 删光了现有组，final 层必然为空（除非预置里恰有同名组）
+		if byName[PresetFinalGroup] {
+			report.Skipped++
+			report.Items = append(report.Items, PresetItem{
+				Name: PresetFinalGroup, Action: "跳过", Detail: "同名分流组已存在但不是 final 层",
+			})
+			return nil
+		}
+		final := &config.RoutingGroup{
+			Name: PresetFinalGroup, Target: storage.DefaultGroupManual, Kind: config.KindFinal,
+			Position: 0, Enabled: true,
+			Rules: []config.Rule{{Type: "final", Enabled: true}},
+		}
+		if m.writeProbe != nil {
+			if err := m.writeProbe("CreateRoutingGroup"); err != nil {
+				return err
+			}
+		}
+		if err := m.DB.CreateRoutingGroupTx(tx, final); err != nil {
+			return fmt.Errorf("写入兜底组 %q 失败: %w", final.Name, err)
+		}
+		report.Added++
+		report.Items = append(report.Items, PresetItem{
+			Name: final.Name, Action: "新增",
+			Detail: fmt.Sprintf("→ %s · final 层（兜底）· 未在 %s 中选择节点时走成员列表首个节点",
+				final.Target, final.Target),
+		})
+		return nil
+	})
 }
 
 // ensurePresetProxyGroups 确保预置用到的默认代理组（Auto / Manual）存在。

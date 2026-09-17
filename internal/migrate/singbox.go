@@ -1,6 +1,8 @@
 package migrate
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -23,6 +25,7 @@ var singboxProtocols = map[string]bool{
 // 出站 → 节点、selector/urltest → 代理组、route.rules → 分流组（多匹配字段
 // 的规则映射为 and 逻辑规则）、remote 规则集 → 规则集。dns/inbounds/experimental
 // 与 direct/block/dns 出站忽略；含不支持匹配字段的规则跳过并记录。
+// 全部写入在单个事务中完成（C14-AUDIT）：中途失败整体回滚。
 func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 	var doc struct {
 		Outbounds []map[string]any `json:"outbounds"`
@@ -35,19 +38,27 @@ func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 	if err := json.Unmarshal([]byte(content), &doc); err != nil {
 		return Report{}, fmt.Errorf("sing-box JSON 解析失败: %w", err)
 	}
+	if err := db.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return importSingBoxTx(db, tx, &doc, &rep)
+	}); err != nil {
+		return rep, err
+	}
+	return rep, nil
+}
 
-	var createdRuleSets, createdNodes, createdGroups, createdRoutings []int64
-	defer func() {
-		if retErr != nil {
-			rollbackImport(db, createdRuleSets, createdRoutings, createdGroups, createdNodes)
-		}
-	}()
-
+func importSingBoxTx(db *storage.DB, tx *sql.Tx, doc *struct {
+	Outbounds []map[string]any `json:"outbounds"`
+	Route     struct {
+		Rules   []map[string]any `json:"rules"`
+		Final   string           `json:"final"`
+		RuleSet []map[string]any `json:"rule_set"`
+	} `json:"route"`
+}, rep *Report) error {
 	// 规则集（仅 remote srs/json 可直接复用）
 	rsTags := map[string]bool{}
-	existingSets, err := db.ListRuleSets()
+	existingSets, err := db.ListRuleSetsTx(tx)
 	if err != nil {
-		return rep, err
+		return err
 	}
 	for _, existing := range existingSets {
 		if existing.Enabled {
@@ -78,14 +89,12 @@ func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 		item := &config.RuleSet{
 			Name: tag, Tag: tag, SourceType: "remote", Format: format, URL: url, Enabled: true,
 		}
-		if err := db.CreateRuleSet(item); err != nil {
-			if item.ID > 0 {
-				createdRuleSets = append(createdRuleSets, item.ID)
-			}
-			rep.skipf("规则集 %q 写入失败: %v", tag, err)
-			continue
+		if err := probe("CreateRuleSet"); err != nil {
+			return err
 		}
-		createdRuleSets = append(createdRuleSets, item.ID)
+		if err := db.CreateRuleSetTx(tx, item); err != nil {
+			return fmt.Errorf("写入规则集 %q 失败: %w", tag, err)
+		}
 		rsTags[tag] = true
 		rep.RuleSets++
 	}
@@ -116,13 +125,12 @@ func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 			}
 			n.SubscriptionID = config.ManualSubscriptionID
 			n.Enabled = true
-			if err := db.CreateNode(n); err != nil {
-				if n.ID > 0 {
-					createdNodes = append(createdNodes, n.ID)
-				}
-				return rep, fmt.Errorf("写入节点 %q 失败: %w", n.Name, err)
+			if err := probe("CreateNode"); err != nil {
+				return err
 			}
-			createdNodes = append(createdNodes, n.ID)
+			if err := db.CreateNodeTx(tx, n); err != nil {
+				return fmt.Errorf("写入节点 %q 失败: %w", n.Name, err)
+			}
 			nodeIDs[tag] = n.ID
 			rep.Nodes++
 		}
@@ -147,9 +155,9 @@ func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 		specs = append(specs, spec)
 		byTag[tag] = spec
 	}
-	existingGroups, err := db.ListProxyGroups()
+	existingGroups, err := db.ListProxyGroupsTx(tx)
 	if err != nil {
-		return rep, err
+		return err
 	}
 	taken := map[string]bool{}
 	for _, g := range existingGroups {
@@ -163,13 +171,12 @@ func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 			g.TestURL = jStr(spec.ob, "url")
 			g.IntervalS = int(jDur(spec.ob, "interval").Seconds())
 		}
-		if err := db.CreateProxyGroup(g); err != nil {
-			if g.ID > 0 {
-				createdGroups = append(createdGroups, g.ID)
-			}
-			return rep, fmt.Errorf("写入代理组 %q 失败: %w", spec.name, err)
+		if err := probe("CreateProxyGroup"); err != nil {
+			return err
 		}
-		createdGroups = append(createdGroups, g.ID)
+		if err := db.CreateProxyGroupTx(tx, g); err != nil {
+			return fmt.Errorf("写入代理组 %q 失败: %w", spec.name, err)
+		}
 		groupIDs[jStr(spec.ob, "tag")] = g.ID
 		taken[spec.name] = true
 	}
@@ -206,13 +213,16 @@ func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 				}
 			}
 		}
-		if err := db.UpdateProxyGroup(g); err != nil {
-			return rep, fmt.Errorf("写入代理组 %q 成员失败: %w", spec.name, err)
+		if err := probe("UpdateProxyGroup"); err != nil {
+			return err
+		}
+		if err := db.UpdateProxyGroupTx(tx, g); err != nil {
+			return fmt.Errorf("写入代理组 %q 成员失败: %w", spec.name, err)
 		}
 		// UpdateProxyGroup 不写 selected 列，selector 默认值单独持久化
 		if g.Selected != "" {
-			if err := db.SetProxyGroupSelected(g.ID, g.Selected); err != nil {
-				return rep, fmt.Errorf("写入代理组 %q 选中项失败: %w", spec.name, err)
+			if err := db.SetProxyGroupSelectedTx(tx, g.ID, g.Selected); err != nil {
+				return fmt.Errorf("写入代理组 %q 选中项失败: %w", spec.name, err)
 			}
 		}
 		rep.Groups++
@@ -221,22 +231,19 @@ func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 	// 路由规则 → 分流组（按目标分组，保持文件顺序）
 	// 目标解析：组名 / 节点（节点目标自动包一个 select 组）/ direct 出站→DIRECT /
 	// block 出站或 reject 动作→BLOCK
-	targetName := func(tag string) string {
+	targetName := func(tag string) (string, error) {
 		switch {
 		case infraTags[tag] == "direct":
-			return "DIRECT"
+			return "DIRECT", nil
 		case infraTags[tag] == "block":
-			return "BLOCK"
+			return "BLOCK", nil
 		case byTag[tag] != nil:
-			return byTag[tag].name
+			return byTag[tag].name, nil
 		case nodeIDs[tag] != 0:
-			name, id := nodeTargetName(db, taken, tag, nodeIDs[tag])
-			if id != 0 {
-				createdGroups = append(createdGroups, id)
-			}
-			return name
+			name, _, err := nodeTargetNameTx(db, tx, taken, tag, nodeIDs[tag])
+			return name, err
 		}
-		return ""
+		return "", nil
 	}
 	type routeSpec struct {
 		target string
@@ -258,7 +265,11 @@ func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 		if action == "reject" {
 			target = "BLOCK"
 		} else if outbound != "" {
-			target = targetName(outbound)
+			t, err := targetName(outbound)
+			if err != nil {
+				return err
+			}
+			target = t
 			if target == "" {
 				rep.skipf("路由规则目标 %q 不可用", outbound)
 				continue
@@ -334,7 +345,11 @@ func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 		routeSpecs[len(routeSpecs)-1].rules = append(routeSpecs[len(routeSpecs)-1].rules, r)
 	}
 	if fin := doc.Route.Final; fin != "" {
-		if t := targetName(fin); t != "" {
+		t, err := targetName(fin)
+		if err != nil {
+			return err
+		}
+		if t != "" {
 			finalTarget = t
 		} else {
 			rep.skipf("route.final %q 不可用", fin)
@@ -345,9 +360,9 @@ func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 		rep.Routings++
 	}
 
-	existingRoutings, err := db.ListRoutingGroups()
+	existingRoutings, err := db.ListRoutingGroupsTx(tx)
 	if err != nil {
-		return rep, err
+		return err
 	}
 	pos := 0
 	takenRoutings := map[string]bool{}
@@ -363,13 +378,12 @@ func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 			Name: uniqueName(takenRoutings, "迁移-"+spec.target), Target: spec.target,
 			Position: pos, Enabled: true, Rules: spec.rules,
 		}
-		if err := db.CreateRoutingGroup(rg); err != nil {
-			if rg.ID > 0 {
-				createdRoutings = append(createdRoutings, rg.ID)
-			}
-			return rep, fmt.Errorf("写入分流组 %q 失败: %w", rg.Name, err)
+		if err := probe("CreateRoutingGroup"); err != nil {
+			return err
 		}
-		createdRoutings = append(createdRoutings, rg.ID)
+		if err := db.CreateRoutingGroupTx(tx, rg); err != nil {
+			return fmt.Errorf("写入分流组 %q 失败: %w", rg.Name, err)
+		}
 		takenRoutings[rg.Name] = true
 	}
 	if finalTarget != "" {
@@ -379,16 +393,15 @@ func ImportSingBox(db *storage.DB, content string) (rep Report, retErr error) {
 			Position: pos, Enabled: true,
 			Rules: []config.Rule{{Type: "final", Enabled: true}},
 		}
-		if err := db.CreateRoutingGroup(rg); err != nil {
-			if rg.ID > 0 {
-				createdRoutings = append(createdRoutings, rg.ID)
-			}
-			return rep, fmt.Errorf("写入 final 分流组失败: %w", err)
+		if err := probe("CreateRoutingGroup"); err != nil {
+			return err
 		}
-		createdRoutings = append(createdRoutings, rg.ID)
+		if err := db.CreateRoutingGroupTx(tx, rg); err != nil {
+			return fmt.Errorf("写入 final 分流组失败: %w", err)
+		}
 		takenRoutings[rg.Name] = true
 	}
-	return rep, nil
+	return nil
 }
 
 func findRuleSet(sets []*config.RuleSet, tag string) (*config.RuleSet, bool) {
@@ -400,19 +413,24 @@ func findRuleSet(sets []*config.RuleSet, tag string) (*config.RuleSet, bool) {
 	return nil, false
 }
 
-// nodeTargetName 为以节点为目标的规则自动创建一个 select 组（内部模型要求
-// 分流目标为代理组），组名基于节点 tag。
-func nodeTargetName(db *storage.DB, taken map[string]bool, tag string, nodeID int64) (string, int64) {
+// nodeTargetNameTx 为以节点为目标的规则自动创建一个 select 组（内部模型要求
+// 分流目标为代理组），组名基于节点 tag。建组失败向上传播中止导入（C14-AUDIT：
+// 原实现吞掉错误把目标置空，静默跳过引用它的规则——在事务化模型下写失败
+// 本来就该中止整个操作）。
+func nodeTargetNameTx(db *storage.DB, tx *sql.Tx, taken map[string]bool, tag string, nodeID int64) (string, int64, error) {
 	name := uniqueName(taken, tag)
 	g := &config.ProxyGroup{
 		Name: name, Type: "select",
 		Members: []config.ProxyGroupMember{{Type: "node", ID: nodeID}},
 	}
-	if err := db.CreateProxyGroup(g); err != nil {
-		return "", 0
+	if err := probe("CreateProxyGroup"); err != nil {
+		return "", 0, err
+	}
+	if err := db.CreateProxyGroupTx(tx, g); err != nil {
+		return "", 0, fmt.Errorf("为节点目标 %q 创建代理组失败: %w", tag, err)
 	}
 	taken[name] = true
-	return name, g.ID
+	return name, g.ID, nil
 }
 
 // singboxOutboundToNode 把 sing-box 出站转换为统一节点（字段映射与生成器一致）。

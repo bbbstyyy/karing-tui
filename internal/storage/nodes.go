@@ -14,12 +14,21 @@ import (
 
 // CreateNode 新建节点。
 func (d *DB) CreateNode(n *config.Node) error {
+	return d.createNode(d.db, n)
+}
+
+// CreateNodeTx 是 CreateNode 的事务内版本（C14-AUDIT）。
+func (d *DB) CreateNodeTx(tx *sql.Tx, n *config.Node) error {
+	return d.createNode(tx, n)
+}
+
+func (d *DB) createNode(q querier, n *config.Node) error {
 	meta, err := json.Marshal(n.Metadata)
 	if err != nil {
 		return fmt.Errorf("序列化节点 %q 元数据失败: %w", n.Name, err)
 	}
 	now := time.Now()
-	res, err := d.db.Exec(
+	res, err := q.Exec(
 		`INSERT INTO nodes (subscription_id, name, protocol, server, port, tls, transport, enabled, metadata, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		nullInt64(n.SubscriptionID), n.Name, n.Protocol, n.Server, n.Port,

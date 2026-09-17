@@ -1,6 +1,8 @@
 package migrate
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"strconv"
 	"strings"
@@ -19,49 +21,54 @@ var clashRuleTypes = map[string]string{
 	"IP-CIDR":      "ip_cidr", "IP-CIDR6": "ip_cidr", "GEOIP": "geoip", "GEOSITE": "geosite",
 }
 
+// clashDoc 是 Clash YAML 中被导入的部分。
+type clashDoc struct {
+	Proxies     []map[string]any `yaml:"proxies"`
+	ProxyGroups []struct {
+		Name     string   `yaml:"name"`
+		Type     string   `yaml:"type"`
+		Proxies  []string `yaml:"proxies"`
+		URL      string   `yaml:"url"`
+		Interval int      `yaml:"interval"`
+		Use      []string `yaml:"use"`
+	} `yaml:"proxy-groups"`
+	Rules []string `yaml:"rules"`
+}
+
 // ImportClash 从 Clash 配置 YAML 导入：proxies → 节点、proxy-groups → 代理组
 // （fallback/load-balance 映射为 urltest）、rules → 分流组（按目标分组，
 // MATCH → final 组）。RULE-SET 规则与 use 引用不支持，跳过并记录。
+// 全部写入在单个事务中完成（C14-AUDIT）：中途失败整体回滚。
 func ImportClash(db *storage.DB, content string) (rep Report, retErr error) {
-	var doc struct {
-		Proxies     []map[string]any `yaml:"proxies"`
-		ProxyGroups []struct {
-			Name     string   `yaml:"name"`
-			Type     string   `yaml:"type"`
-			Proxies  []string `yaml:"proxies"`
-			URL      string   `yaml:"url"`
-			Interval int      `yaml:"interval"`
-			Use      []string `yaml:"use"`
-		} `yaml:"proxy-groups"`
-		Rules []string `yaml:"rules"`
-	}
+	var doc clashDoc
 	if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
 		return Report{}, fmt.Errorf("解析 Clash YAML 失败: %w", err)
 	}
-
-	var createdNodes, createdGroups, createdRoutings []int64
-	defer func() {
-		if retErr != nil {
-			rollbackImport(db, nil, createdRoutings, createdGroups, createdNodes)
-		}
-	}()
-
-	// 节点
+	// 解析节点：纯内存计算，放在事务外，失败不触库。
 	nodes, err := subscription.ParseClashProxies(content)
 	if err != nil {
-		return rep, fmt.Errorf("解析节点失败: %w", err)
+		return Report{}, fmt.Errorf("解析节点失败: %w", err)
 	}
+	if err := db.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return importClashTx(db, tx, &doc, nodes, &rep)
+	}); err != nil {
+		return rep, err
+	}
+	return rep, nil
+}
+
+func importClashTx(db *storage.DB, tx *sql.Tx, doc *clashDoc, nodes []*config.Node, rep *Report) error {
+	// 节点
 	nodeIDs := map[string]int64{}
 	for _, n := range nodes {
 		n.SubscriptionID = config.ManualSubscriptionID
 		n.Enabled = true
-		if err := db.CreateNode(n); err != nil {
-			if n.ID > 0 {
-				createdNodes = append(createdNodes, n.ID)
-			}
-			return rep, fmt.Errorf("写入节点 %q 失败: %w", n.Name, err)
+		if err := probe("CreateNode"); err != nil {
+			return err
 		}
-		createdNodes = append(createdNodes, n.ID)
+		if err := db.CreateNodeTx(tx, n); err != nil {
+			return fmt.Errorf("写入节点 %q 失败: %w", n.Name, err)
+		}
 		nodeIDs[n.Name] = n.ID
 	}
 	rep.Nodes = len(nodes)
@@ -105,9 +112,9 @@ func ImportClash(db *storage.DB, content string) (rep Report, retErr error) {
 		byOrig[name] = spec
 	}
 
-	existingGroups, err := db.ListProxyGroups()
+	existingGroups, err := db.ListProxyGroupsTx(tx)
 	if err != nil {
-		return rep, err
+		return err
 	}
 	taken := map[string]bool{}
 	for _, g := range existingGroups {
@@ -118,13 +125,12 @@ func ImportClash(db *storage.DB, content string) (rep Report, retErr error) {
 	for _, spec := range specs {
 		spec.name = uniqueName(taken, spec.name)
 		g := &config.ProxyGroup{Name: spec.name, Type: spec.typ, TestURL: spec.url, IntervalS: spec.intl}
-		if err := db.CreateProxyGroup(g); err != nil {
-			if g.ID > 0 {
-				createdGroups = append(createdGroups, g.ID)
-			}
-			return rep, fmt.Errorf("写入代理组 %q 失败: %w", spec.name, err)
+		if err := probe("CreateProxyGroup"); err != nil {
+			return err
 		}
-		createdGroups = append(createdGroups, g.ID)
+		if err := db.CreateProxyGroupTx(tx, g); err != nil {
+			return fmt.Errorf("写入代理组 %q 失败: %w", spec.name, err)
+		}
 		groupIDs[spec.origName] = g.ID
 		groupNames[spec.origName] = spec.name
 		taken[spec.name] = true
@@ -147,8 +153,11 @@ func ImportClash(db *storage.DB, content string) (rep Report, retErr error) {
 			Name: spec.name, Type: spec.typ, TestURL: spec.url, IntervalS: spec.intl,
 			Members: spec.members,
 		}
-		if err := db.UpdateProxyGroup(g); err != nil {
-			return rep, fmt.Errorf("写入代理组 %q 成员失败: %w", spec.name, err)
+		if err := probe("UpdateProxyGroup"); err != nil {
+			return err
+		}
+		if err := db.UpdateProxyGroupTx(tx, g); err != nil {
+			return fmt.Errorf("写入代理组 %q 成员失败: %w", spec.name, err)
 		}
 		rep.Groups++
 	}
@@ -208,9 +217,9 @@ func ImportClash(db *storage.DB, content string) (rep Report, retErr error) {
 	}
 
 	// 写入分流组（position 递增，排在现有组之后）
-	existingRoutings, err := db.ListRoutingGroups()
+	existingRoutings, err := db.ListRoutingGroupsTx(tx)
 	if err != nil {
-		return rep, err
+		return err
 	}
 	pos := 0
 	takenRoutings := map[string]bool{}
@@ -227,13 +236,12 @@ func ImportClash(db *storage.DB, content string) (rep Report, retErr error) {
 			Name: name, Target: spec.target, Position: pos, Enabled: true,
 			Rules: spec.rules,
 		}
-		if err := db.CreateRoutingGroup(rg); err != nil {
-			if rg.ID > 0 {
-				createdRoutings = append(createdRoutings, rg.ID)
-			}
-			return rep, fmt.Errorf("写入分流组 %q 失败: %w", name, err)
+		if err := probe("CreateRoutingGroup"); err != nil {
+			return err
 		}
-		createdRoutings = append(createdRoutings, rg.ID)
+		if err := db.CreateRoutingGroupTx(tx, rg); err != nil {
+			return fmt.Errorf("写入分流组 %q 失败: %w", name, err)
+		}
 		takenRoutings[name] = true
 	}
 	if finalTarget != "" {
@@ -243,16 +251,15 @@ func ImportClash(db *storage.DB, content string) (rep Report, retErr error) {
 			Position: pos, Enabled: true,
 			Rules: []config.Rule{{Type: "final", Enabled: true}},
 		}
-		if err := db.CreateRoutingGroup(rg); err != nil {
-			if rg.ID > 0 {
-				createdRoutings = append(createdRoutings, rg.ID)
-			}
-			return rep, fmt.Errorf("写入 final 分流组失败: %w", err)
+		if err := probe("CreateRoutingGroup"); err != nil {
+			return err
 		}
-		createdRoutings = append(createdRoutings, rg.ID)
+		if err := db.CreateRoutingGroupTx(tx, rg); err != nil {
+			return fmt.Errorf("写入 final 分流组失败: %w", err)
+		}
 		takenRoutings[rg.Name] = true
 	}
-	return rep, nil
+	return nil
 }
 
 // resolveClashTarget 把规则目标映射为内部目标（DIRECT/BLOCK/组名）。

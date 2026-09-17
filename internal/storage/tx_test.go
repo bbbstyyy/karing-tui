@@ -78,6 +78,45 @@ func TestQueryOnlyDSNNoTxlock(t *testing.T) {
 	}
 }
 
+// TestEnsureDefaultGroupsAtomicOnFailure C14-AUDIT：第二个默认组创建失败时，
+// 第一个（Auto）必须回滚——否则下次调用因 proxy_groups 非空短路，Manual 永久缺失。
+func TestEnsureDefaultGroupsAtomicOnFailure(t *testing.T) {
+	db := newTestDB(t)
+
+	calls := 0
+	proxyGroupCreateProbe = func() error {
+		calls++
+		if calls == 2 {
+			return errors.New("injected second create failure")
+		}
+		return nil
+	}
+	defer func() { proxyGroupCreateProbe = nil }()
+
+	if err := db.EnsureDefaultGroups(); err == nil {
+		t.Fatal("期望注入错误透出")
+	}
+	var n int
+	if err := db.db.QueryRow(`SELECT COUNT(*) FROM proxy_groups`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("回滚不干净：proxy_groups 仍有 %d 行（Auto 泄漏会卡死后续补建）", n)
+	}
+
+	// 清除探针后重试：完整创建两组（证明空库状态得以恢复）。
+	proxyGroupCreateProbe = nil
+	if err := db.EnsureDefaultGroups(); err != nil {
+		t.Fatalf("重试失败: %v", err)
+	}
+	if err := db.db.QueryRow(`SELECT COUNT(*) FROM proxy_groups`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("重试后 proxy_groups = %d 行, 期望 2", n)
+	}
+}
+
 // TestWithTxOnQueryOnlyRejectedByQueryOnlyPragma 行为级验证：query-only 连接上
 // BeginTx 仍是普通（deferred）事务，写入被 _query_only 拒绝且回滚后连接可用——
 // 证明只读路径没有被 _txlock=immediate 波及。

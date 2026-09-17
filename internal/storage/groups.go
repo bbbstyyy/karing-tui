@@ -19,10 +19,26 @@ type querier interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
-// CreateProxyGroup 新建代理组（含成员）。
+// CreateProxyGroup 新建代理组（含成员）。组行与成员同一事务。
 func (d *DB) CreateProxyGroup(g *config.ProxyGroup) error {
+	return d.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return d.CreateProxyGroupTx(tx, g)
+	})
+}
+
+// proxyGroupCreateProbe 仅供测试使用（C14-AUDIT）：CreateProxyGroupTx 每次调用
+// 之前触发，返回错误即注入失败。生产路径恒为 nil。
+var proxyGroupCreateProbe func() error
+
+// CreateProxyGroupTx 是 CreateProxyGroup 的事务内版本（C14-AUDIT）。
+func (d *DB) CreateProxyGroupTx(tx *sql.Tx, g *config.ProxyGroup) error {
+	if proxyGroupCreateProbe != nil {
+		if err := proxyGroupCreateProbe(); err != nil {
+			return err
+		}
+	}
 	now := time.Now()
-	res, err := d.db.Exec(
+	res, err := tx.Exec(
 		`INSERT INTO proxy_groups (name, type, test_url, interval_s, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		g.Name, g.Type, g.TestURL, g.IntervalS, now, now,
@@ -34,19 +50,25 @@ func (d *DB) CreateProxyGroup(g *config.ProxyGroup) error {
 		return fmt.Errorf("获取代理组自增 ID 失败: %w", err)
 	}
 	g.CreatedAt, g.UpdatedAt = now, now
-	return d.replaceGroupMembers(g)
+	return replaceGroupMembersTx(tx, g)
 }
 
-// UpdateProxyGroup 更新代理组（含成员，整体替换）。
+// UpdateProxyGroup 更新代理组（含成员，整体替换）。组行与成员同一事务。
 func (d *DB) UpdateProxyGroup(g *config.ProxyGroup) error {
-	_, err := d.db.Exec(
+	return d.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return d.UpdateProxyGroupTx(tx, g)
+	})
+}
+
+// UpdateProxyGroupTx 是 UpdateProxyGroup 的事务内版本（C14-AUDIT）。
+func (d *DB) UpdateProxyGroupTx(tx *sql.Tx, g *config.ProxyGroup) error {
+	if _, err := tx.Exec(
 		`UPDATE proxy_groups SET name=?, type=?, test_url=?, interval_s=?, updated_at=? WHERE id=?`,
 		g.Name, g.Type, g.TestURL, g.IntervalS, time.Now(), g.ID,
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("更新代理组 %d 失败: %w", g.ID, err)
 	}
-	return d.replaceGroupMembers(g)
+	return replaceGroupMembersTx(tx, g)
 }
 
 // UpdateProxyGroupRenamed updates a proxy group and all routing references atomically.
@@ -71,17 +93,11 @@ func (d *DB) UpdateProxyGroupRenamed(g *config.ProxyGroup, oldName string) error
 	return tx.Commit()
 }
 
-// replaceGroupMembers 整体替换组成员。
+// replaceGroupMembers 整体替换组成员（独立短事务）。
 func (d *DB) replaceGroupMembers(g *config.ProxyGroup) error {
-	tx, err := d.db.Begin()
-	if err != nil {
-		return fmt.Errorf("开启组成员事务失败: %w", err)
-	}
-	defer tx.Rollback()
-	if err := replaceGroupMembersTx(tx, g); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return d.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return replaceGroupMembersTx(tx, g)
+	})
 }
 
 func replaceGroupMembersTx(tx *sql.Tx, g *config.ProxyGroup) error {
@@ -129,7 +145,7 @@ func (d *DB) GetProxyGroup(id int64) (*config.ProxyGroup, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := d.loadGroupMembers(g); err != nil {
+	if err := d.loadGroupMembers(d.db, g); err != nil {
 		return nil, err
 	}
 	return g, nil
@@ -137,7 +153,16 @@ func (d *DB) GetProxyGroup(id int64) (*config.ProxyGroup, error) {
 
 // ListProxyGroups 返回全部代理组（含成员），按名称排序。
 func (d *DB) ListProxyGroups() ([]*config.ProxyGroup, error) {
-	rows, err := d.db.Query(`SELECT id, name, type, test_url, interval_s, selected, created_at, updated_at FROM proxy_groups ORDER BY name`)
+	return d.listProxyGroups(d.db)
+}
+
+// ListProxyGroupsTx 是 ListProxyGroups 的事务内版本（C14-AUDIT）。
+func (d *DB) ListProxyGroupsTx(tx *sql.Tx) ([]*config.ProxyGroup, error) {
+	return d.listProxyGroups(tx)
+}
+
+func (d *DB) listProxyGroups(q querier) ([]*config.ProxyGroup, error) {
+	rows, err := q.Query(`SELECT id, name, type, test_url, interval_s, selected, created_at, updated_at FROM proxy_groups ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("查询代理组列表失败: %w", err)
 	}
@@ -155,7 +180,7 @@ func (d *DB) ListProxyGroups() ([]*config.ProxyGroup, error) {
 		return nil, err
 	}
 	for _, g := range out {
-		if err := d.loadGroupMembers(g); err != nil {
+		if err := d.loadGroupMembers(q, g); err != nil {
 			return nil, err
 		}
 	}
@@ -164,7 +189,16 @@ func (d *DB) ListProxyGroups() ([]*config.ProxyGroup, error) {
 
 // SetProxyGroupSelected 持久化 select 组的当前选中成员（"node:<id>" / "group:<id>"）。
 func (d *DB) SetProxyGroupSelected(id int64, selected string) error {
-	_, err := d.db.Exec(`UPDATE proxy_groups SET selected=?, updated_at=? WHERE id=?`, selected, time.Now(), id)
+	return d.setProxyGroupSelected(d.db, id, selected)
+}
+
+// SetProxyGroupSelectedTx 是 SetProxyGroupSelected 的事务内版本（C14-AUDIT）。
+func (d *DB) SetProxyGroupSelectedTx(tx *sql.Tx, id int64, selected string) error {
+	return d.setProxyGroupSelected(tx, id, selected)
+}
+
+func (d *DB) setProxyGroupSelected(q querier, id int64, selected string) error {
+	_, err := q.Exec(`UPDATE proxy_groups SET selected=?, updated_at=? WHERE id=?`, selected, time.Now(), id)
 	if err != nil {
 		return fmt.Errorf("更新代理组 %d 选中项失败: %w", id, err)
 	}
@@ -179,8 +213,8 @@ func scanProxyGroup(row interface{ Scan(...any) error }) (*config.ProxyGroup, er
 	return &g, nil
 }
 
-func (d *DB) loadGroupMembers(g *config.ProxyGroup) error {
-	rows, err := d.db.Query(
+func (d *DB) loadGroupMembers(q querier, g *config.ProxyGroup) error {
+	rows, err := q.Query(
 		`SELECT member_type, member_id, position FROM proxy_group_members WHERE group_id=? ORDER BY position`, g.ID,
 	)
 	if err != nil {
@@ -207,18 +241,24 @@ func (d *DB) loadGroupMembers(g *config.ProxyGroup) error {
 func (d *DB) CreateRoutingGroup(g *config.RoutingGroup) error {
 	g.Kind = config.KindNormalize(g.Kind)
 	return d.WithTx(context.Background(), func(tx *sql.Tx) error {
-		res, err := tx.Exec(
-			`INSERT INTO routing_groups (name, target, kind, kind_rank, position, enabled) VALUES (?, ?, ?, ?, ?, ?)`,
-			g.Name, g.Target, g.Kind, config.KindRank(g.Kind), g.Position, boolInt(g.Enabled),
-		)
-		if err != nil {
-			return fmt.Errorf("创建分流组 %q 失败: %w", g.Name, err)
-		}
-		if g.ID, err = res.LastInsertId(); err != nil {
-			return fmt.Errorf("获取分流组自增 ID 失败: %w", err)
-		}
-		return replaceRulesTx(tx, g)
+		return d.CreateRoutingGroupTx(tx, g)
 	})
+}
+
+// CreateRoutingGroupTx 是 CreateRoutingGroup 的事务内版本（C14-AUDIT）。
+func (d *DB) CreateRoutingGroupTx(tx *sql.Tx, g *config.RoutingGroup) error {
+	g.Kind = config.KindNormalize(g.Kind)
+	res, err := tx.Exec(
+		`INSERT INTO routing_groups (name, target, kind, kind_rank, position, enabled) VALUES (?, ?, ?, ?, ?, ?)`,
+		g.Name, g.Target, g.Kind, config.KindRank(g.Kind), g.Position, boolInt(g.Enabled),
+	)
+	if err != nil {
+		return fmt.Errorf("创建分流组 %q 失败: %w", g.Name, err)
+	}
+	if g.ID, err = res.LastInsertId(); err != nil {
+		return fmt.Errorf("获取分流组自增 ID 失败: %w", err)
+	}
+	return replaceRulesTx(tx, g)
 }
 
 // UpdateRoutingGroup 更新分流组（含规则，整体替换）。组行与规则同一事务（C14）。
@@ -340,8 +380,16 @@ func (d *DB) setRoutingGroupPlacement(q querier, id int64, kind string, position
 
 // DeleteRoutingGroup 删除分流组；规则级联删除。
 func (d *DB) DeleteRoutingGroup(id int64) error {
-	_, err := d.db.Exec(`DELETE FROM routing_groups WHERE id=?`, id)
-	if err != nil {
+	return d.deleteRoutingGroup(d.db, id)
+}
+
+// DeleteRoutingGroupTx 是 DeleteRoutingGroup 的事务内版本（C14-AUDIT）。
+func (d *DB) DeleteRoutingGroupTx(tx *sql.Tx, id int64) error {
+	return d.deleteRoutingGroup(tx, id)
+}
+
+func (d *DB) deleteRoutingGroup(q querier, id int64) error {
+	if _, err := q.Exec(`DELETE FROM routing_groups WHERE id=?`, id); err != nil {
 		return fmt.Errorf("删除分流组 %d 失败: %w", id, err)
 	}
 	return nil
