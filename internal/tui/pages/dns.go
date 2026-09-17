@@ -37,6 +37,13 @@ type DNSPage struct {
 	serverList components.SimpleList
 	ruleList   components.SimpleList
 
+	// servers / rules 是 DNS 配置的唯一内存副本，只在 reload()（Update 阶段）
+	// 写入；View、预览与所有选择器一律读它。改动前 table()、selectionDetails()
+	// 与 selectedServer()/selectedRule() 各自查一次 SQLite，同一次渲染会重复
+	// 2–3 次 ListServers() / ListRules()。
+	servers []*config.DNSServer
+	rules   []*config.DNSRule
+
 	form        components.Form
 	formKind    string // add-server / edit-server / add-rule / edit-rule
 	editID      int64
@@ -69,7 +76,8 @@ func (d *DNSPage) Update(msg tea.Msg) (Page, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		d.SetSize(msg.Width, msg.Height)
-		d.reload()
+		// 只按新宽度重建列表；resize 不查库（宽度只影响内存里的列宽计算）。
+		d.rebuildDNSList()
 		return d, nil
 	case ActivateMsg:
 		d.reload()
@@ -301,13 +309,36 @@ func (d *DNSPage) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 
 // --- 数据加载 ---
 
+// reload 是 DNS 页唯一访问数据库的入口，负责刷新内存缓存后再重建列表。
+//
+// 它只在 Update 阶段被调用（激活、切 tab、增删改、显式刷新），不参与渲染：
+// 这样 View() 的调用链里没有 DB / 文件 / 网络访问，也不会同一次渲染重复查库。
 func (d *DNSPage) reload() {
-	selected := d.list.SelectedKey()
 	cfg, err := d.app.DNS.LoadConfig()
 	d.cfg = cfg
 	if err != nil {
 		d.err = err
 	}
+	// 服务器与规则一次读齐：两个子视图互相切换（[ / ]）与右侧预览都要用，
+	// 读一次即可覆盖，不必在切 tab 时再查一遍。
+	if servers, err := d.app.DNS.ListServers(); err != nil {
+		d.err = err
+	} else {
+		d.servers = servers
+	}
+	if rules, err := d.app.DNS.ListRules(); err != nil {
+		d.err = err
+	} else {
+		d.rules = rules
+	}
+	d.rebuildDNSList()
+}
+
+// rebuildDNSList 只基于内存缓存、当前宽度与模式重建列表项，不访问数据库。
+//
+// 与 reload 的分工是刻意的：resize、切 tab、光标移动都只走这里。
+func (d *DNSPage) rebuildDNSList() {
+	selected := d.list.SelectedKey()
 	mode := d.mode
 	switch mode {
 	case dnsForm:
@@ -320,14 +351,13 @@ func (d *DNSPage) reload() {
 			mode = dnsRules
 		}
 	}
+	if mode == dnsGlobal {
+		return
+	}
+	d.list.Items = nil
+	d.list.Keys = nil
 	if mode == dnsRules {
-		rules, err := d.app.DNS.ListRules()
-		if err != nil {
-			d.err = err
-		}
-		d.list.Items = nil
-		d.list.Keys = nil
-		for _, r := range rules {
+		for _, r := range d.rules {
 			state := "启用"
 			if !r.Enabled {
 				state = "停用"
@@ -339,22 +369,13 @@ func (d *DNSPage) reload() {
 		d.list.SelectKey(selected)
 		return
 	}
-	if mode == dnsGlobal {
-		return
-	}
-	servers, err := d.app.DNS.ListServers()
-	if err != nil {
-		d.err = err
-	}
-	d.list.Items = nil
-	d.list.Keys = nil
-	for _, s := range servers {
+	for _, s := range d.servers {
 		state := "启用"
 		if !s.Enabled {
 			state = "停用"
 		}
 		final := ""
-		if s.Tag == cfg.Final {
+		if s.Tag == d.cfg.Final {
 			final = "  ● 默认"
 		}
 		resolver := ""
@@ -372,20 +393,20 @@ func (d *DNSPage) reload() {
 	d.list.SelectKey(selected)
 }
 
+// selectedServer / selectedRule 读内存缓存，不做任何查询——它们会被
+// 键处理与 View 两侧同时调用，每帧重复查库正是本项要消除的问题。
 func (d *DNSPage) selectedServer() ([]*config.DNSServer, int, bool) {
-	servers, err := d.app.DNS.ListServers()
-	if err != nil || d.list.Cursor < 0 || d.list.Cursor >= len(servers) {
+	if d.list.Cursor < 0 || d.list.Cursor >= len(d.servers) {
 		return nil, 0, false
 	}
-	return servers, d.list.Cursor, true
+	return d.servers, d.list.Cursor, true
 }
 
 func (d *DNSPage) selectedRule() ([]*config.DNSRule, int, bool) {
-	rules, err := d.app.DNS.ListRules()
-	if err != nil || d.list.Cursor < 0 || d.list.Cursor >= len(rules) {
+	if d.list.Cursor < 0 || d.list.Cursor >= len(d.rules) {
 		return nil, 0, false
 	}
-	return rules, d.list.Cursor, true
+	return d.rules, d.list.Cursor, true
 }
 
 // --- 表单 ---
@@ -643,25 +664,17 @@ func (d *DNSPage) configureForm() {
 }
 
 func (d *DNSPage) serverByID(id int64) ([]*config.DNSServer, int, bool) {
-	servers, err := d.app.DNS.ListServers()
-	if err != nil {
-		return nil, 0, false
-	}
-	for i, s := range servers {
+	for i, s := range d.servers {
 		if s.ID == id {
-			return servers, i, true
+			return d.servers, i, true
 		}
 	}
 	return nil, 0, false
 }
 func (d *DNSPage) ruleByID(id int64) ([]*config.DNSRule, int, bool) {
-	rules, err := d.app.DNS.ListRules()
-	if err != nil {
-		return nil, 0, false
-	}
-	for i, r := range rules {
+	for i, r := range d.rules {
 		if r.ID == id {
-			return rules, i, true
+			return d.rules, i, true
 		}
 	}
 	return nil, 0, false

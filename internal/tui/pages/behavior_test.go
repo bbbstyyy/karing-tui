@@ -387,6 +387,45 @@ func TestDNSMoveEditDeleteAndReferenceErrorKeepIdentity(t *testing.T) {
 	}
 }
 
+// C3：DNS 页的 View() 与选择器只能读内存缓存，渲染路径不得再查数据库。
+//
+// 手法是直接把库关掉：如果 View / resize 还会走 ListServers() / ListRules()，
+// 就会拿到 "database is closed" 并改写 d.err，渲染结果随之变化。
+func TestDNSViewDoesNotTouchDatabase(t *testing.T) {
+	app := pageFixture(t)
+	if _, err := app.DNS.AddRule("domain", "example.com", "remote"); err != nil {
+		t.Fatal(err)
+	}
+	d := NewDNS(app)
+	d.SetSize(100, 24)
+	d.reload()
+	// 切到「DNS 规则」子视图（此切换本身会 reload 一次，属 Update 阶段）。
+	d.Update(chars("]"))
+	before := d.View()
+	if !strings.Contains(before, "example.com") || !strings.Contains(before, "remote") {
+		t.Fatal("reload 没有把数据读进缓存")
+	}
+
+	if err := app.DB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.View(); got != before {
+		t.Fatal("View 访问了数据库：关闭后渲染结果发生变化")
+	}
+	// resize 与光标移动同样不得触发查库（只重建内存列表）。
+	d.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	if d.err != nil {
+		t.Fatalf("resize 触发了数据库访问：%v", d.err)
+	}
+	d.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if d.err != nil {
+		t.Fatalf("光标移动触发了数据库访问：%v", d.err)
+	}
+	if len(d.servers) == 0 || len(d.rules) == 0 {
+		t.Fatal("缓存被意外清空")
+	}
+}
+
 func TestNodeSearchIsIncrementalAndEscapeRestoresFilterAndPosition(t *testing.T) {
 	app := pageFixture(t)
 	p := NewProfiles(app)

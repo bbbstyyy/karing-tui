@@ -148,16 +148,15 @@ func (r *Rules) table() {
 	}
 }
 
+// table 只把已在 reload() 中读入内存的 d.servers / d.rules 建模成表格行。
+//
+// 它由 View 每帧调用，因此绝不能回查数据库：改动前这里会执行
+// ListServers() / ListRules()，并在失败时改写 d.err——View 里的副作用。
 func (d *DNSPage) table() {
 	var rows [][]string
 	switch d.mode {
 	case dnsServers:
-		servers, err := d.app.DNS.ListServers()
-		if err != nil {
-			d.err = err
-			return
-		}
-		for _, s := range servers {
+		for _, s := range d.servers {
 			state := enabledLabel(s.Enabled)
 			if s.Tag == d.cfg.Final {
 				state += " 默认"
@@ -170,12 +169,7 @@ func (d *DNSPage) table() {
 		}
 		d.list.SetTable([]components.Column{col("DNS 服务器", 16, 0, false), col("类型", 6, 0, false), col("状态", 9, 0, false), col("地址", 26, 1, false)}, rows, d.list.Keys)
 	case dnsRules:
-		rules, err := d.app.DNS.ListRules()
-		if err != nil {
-			d.err = err
-			return
-		}
-		for i, r := range rules {
+		for i, r := range d.rules {
 			rows = append(rows, []string{r.Value, strconv.Itoa(i + 1), r.Server, enabledLabel(r.Enabled), r.Type})
 		}
 		d.list.SetTable([]components.Column{col("DNS 条件", 18, 0, false), col("优先级", 6, 0, true), col("服务器", 12, 0, false), col("状态", 4, 0, false), col("类型", 14, 1, false)}, rows, d.list.Keys)
