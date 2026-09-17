@@ -146,12 +146,34 @@ func referenceChoices(app *application.App, typ, current string) []components.Op
 	return choices
 }
 
+// syncRuleValueOnTypeChange 在「类型」字段真的变化时才重配值字段。
+//
+// 规则类表单的每一个按键都会走到这里，因此它必须便宜：类型没变就直接返回。
+// 值字段自身的变化（多选增删、继续输入）不会改变值字段的行为或选项构成，
+// 无需任何重配——改动前每敲一个键都要跑一次 configureRuleValue，对
+// rule_set / geosite / geoip 而言就是一次 DB 查询加一次分类库全量物化。
+func syncRuleValueOnTypeChange(app *application.App, form *components.Form, previousType string) {
+	if form.ValueByKey("type") == previousType {
+		return
+	}
+	configureRuleValue(app, form)
+}
+
+// configureRuleValue 重配规则表单的值字段。只应在两种时机调用：
+//   - 表单刚打开（configureForm / logicalEditor.open）；
+//   - 用户切换了「类型」字段（经 syncRuleValueOnTypeChange）。
 func configureRuleValue(app *application.App, form *components.Form) {
 	field := form.Field("value")
 	if field == nil {
 		return
 	}
-	typ := form.ValueByKey("type")
+	configureRuleValueField(form, field)
+	rebuildRuleValueOptions(app, form, field)
+}
+
+// configureRuleValueField 只设置依赖「类型」的字段行为，不构造选项列表——
+// 这部分没有 I/O，便宜。
+func configureRuleValueField(form *components.Form, field *components.FormField) {
 	field.When = func(f *components.Form) bool { return f.ValueByKey("type") != "final" }
 	if invert := form.Field("invert"); invert != nil {
 		invert.When = field.When
@@ -160,19 +182,28 @@ func configureRuleValue(app *application.App, form *components.Form) {
 	field.Validate = required("规则值")
 	field.Choice, field.Multi = false, false
 	field.Options = nil
-	switch typ {
+	switch form.ValueByKey("type") {
 	case "logical":
 		field.Action = "conditions"
 		field.Help = "Enter 按条件行编辑；AND 全部满足、OR 任一满足，每行可独立 NOT 取反。"
 	case "rule_set", "geosite", "geoip":
 		field.Choice, field.Multi = true, true
-		field.Options = referenceChoices(app, typ, field.Value())
 		field.Help = "Enter 搜索已有规则集或分类；Space 多选，Enter 确认。保存内部引用。"
 	case "domain_regex":
 		field.Help = "RE2 正则；逗号作为正则的一部分保留，多分支用 |。"
 	default:
 		field.Help = "可填写多个值，以逗号分隔；保存后 Ctrl+A 应用配置。"
 	}
+}
+
+// rebuildRuleValueOptions 构造依赖类型的选项列表：rule_set 要查一次 DB，
+// geosite / geoip 要物化一次分类库。因此只在类型变化或表单打开时执行，
+// 不参与按键热路径。
+func rebuildRuleValueOptions(app *application.App, form *components.Form, field *components.FormField) {
+	if !field.Choice {
+		return
+	}
+	field.Options = referenceChoices(app, form.ValueByKey("type"), field.Value())
 }
 
 func (p *Profiles) configureSubForm() {

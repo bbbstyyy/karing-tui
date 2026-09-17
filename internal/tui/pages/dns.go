@@ -154,9 +154,10 @@ func (d *DNSPage) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 		}
 		return d, nil
 	case dnsForm:
+		previousType := d.form.ValueByKey("type")
 		action, cmd := d.form.Handle(msg)
 		if d.formBackMode() == dnsRules {
-			configureRuleValue(d.app, &d.form)
+			syncRuleValueOnTypeChange(d.app, &d.form, previousType)
 		}
 		switch action {
 		case "cancel":

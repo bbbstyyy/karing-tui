@@ -79,8 +79,9 @@ func (e *logicalEditor) open(index int) {
 
 func (e *logicalEditor) update(msg tea.Msg) (string, tea.Cmd) {
 	if e.form != nil {
+		previousType := e.form.ValueByKey("type")
 		action, cmd := e.form.Handle(msg)
-		configureRuleValue(e.app, e.form)
+		syncRuleValueOnTypeChange(e.app, e.form, previousType)
 		if action == "cancel" {
 			e.form = nil
 			e.err = nil

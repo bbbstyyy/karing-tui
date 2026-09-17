@@ -203,8 +203,9 @@ func (r *Rules) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 			}
 			return r, cmd
 		}
+		previousType := r.form.ValueByKey("type")
 		action, cmd := r.form.Handle(msg)
-		configureRuleValue(r.app, &r.form)
+		syncRuleValueOnTypeChange(r.app, &r.form, previousType)
 		switch action {
 		case "conditions":
 			r.logical = newLogicalEditor(r.app, r.form.ValueByKey("value"))

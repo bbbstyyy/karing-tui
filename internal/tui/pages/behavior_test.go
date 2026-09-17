@@ -17,6 +17,7 @@ import (
 	"github.com/bbbstyyy/karing-tui/internal/clashapi"
 	"github.com/bbbstyyy/karing-tui/internal/config"
 	"github.com/bbbstyyy/karing-tui/internal/platform"
+	"github.com/bbbstyyy/karing-tui/internal/tui/components"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 )
@@ -424,6 +425,61 @@ func TestDNSViewDoesNotTouchDatabase(t *testing.T) {
 	if len(d.servers) == 0 || len(d.rules) == 0 {
 		t.Fatal("缓存被意外清空")
 	}
+}
+
+// C5：规则表单里，值字段的连续输入不得重跑 configureRuleValue。
+//
+// 判定手法：先让 rule_set 的选项里带上一个只存在于数据库的自定义规则集，
+// 然后关掉数据库再连打 20 个字符。若按键路径仍重建选项，那次 DB 查询会失败，
+// 该条目就会从选项里消失。
+func TestRuleFormKeyPressDoesNotReloadReferenceChoices(t *testing.T) {
+	app := pageFixture(t)
+	if err := app.DB.CreateRuleSet(&config.RuleSet{Name: "自定义集", Tag: "my-set", SourceType: "remote", Format: "srs", URL: "https://example.invalid/x.srs", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRules(app)
+	r.SetSize(120, 30)
+	r.cur = &config.RoutingGroup{ID: 1, Name: "基准组", Target: "DIRECT"}
+	r.openForm("add-rule")
+	r.form.SetValueByKey("type", "rule_set")
+	configureRuleValue(r.app, &r.form)
+	if !hasOption(r.form.Field("value"), "my-set") {
+		t.Fatal("rule_set 选项没有带上数据库里的自定义规则集")
+	}
+
+	// 反向核对：类型真的变化时必须重配（否则上面的断言会因为「永不重配」而假通过）。
+	r.form.SetValueByKey("type", "domain")
+	syncRuleValueOnTypeChange(r.app, &r.form, "rule_set")
+	if r.form.Field("value").Choice {
+		t.Fatal("类型切到 domain 后值字段仍按 rule_set 配置")
+	}
+	r.form.SetValueByKey("type", "rule_set")
+	syncRuleValueOnTypeChange(r.app, &r.form, "domain")
+	if !hasOption(r.form.Field("value"), "my-set") {
+		t.Fatal("类型切回 rule_set 后没有重建选项")
+	}
+
+	if err := app.DB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 20 {
+		r.Update(chars("x"))
+	}
+	if !hasOption(r.form.Field("value"), "my-set") {
+		t.Fatal("按键路径重建了选项列表（触发了数据库查询）")
+	}
+}
+
+func hasOption(field *components.FormField, value string) bool {
+	if field == nil {
+		return false
+	}
+	for _, opt := range field.Options {
+		if opt.Value == value {
+			return true
+		}
+	}
+	return false
 }
 
 // C4：Profiles 的表格行必须在状态变化时准备好，渲染路径只做渲染。
