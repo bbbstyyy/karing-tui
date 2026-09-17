@@ -3,6 +3,8 @@
 package routing
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"github.com/bbbstyyy/karing-tui/internal/validation"
 	"regexp"
@@ -17,6 +19,10 @@ import (
 type Manager struct {
 	DB   *storage.DB
 	Logf func(format string, args ...any)
+
+	// afterPlacement 仅供测试使用（C14 失败回滚验证）：每次 placement 写
+	// 成功后以 1 起计数调用，返回错误即中止后续写。生产路径恒为 nil。
+	afterPlacement func(n int) error
 }
 
 // NewManager 创建分流管理器。logf 可为 nil。
@@ -110,29 +116,42 @@ func (m *Manager) UpdateGroup(g *config.RoutingGroup, rules []config.Rule) error
 
 // MoveGroup 在层内上移/下移分流组（delta: -1 上移 / +1 下移）；已到边界时不动。
 // 层内顺序即优先级，跨层移动必须用 MoveGroupToKind（显式操作）。
+// 重排写入在单个事务中完成（C14），读取也在事务内做——单连接池下事务内
+// 不得再经 d.db 取连接。
 func (m *Manager) MoveGroup(id int64, delta int) error {
-	all, err := m.DB.ListRoutingGroups()
+	var moved bool
+	var movedName, movedKind string
+	err := m.DB.WithTx(context.Background(), func(tx *sql.Tx) error {
+		all, err := m.DB.ListRoutingGroupsTx(tx)
+		if err != nil {
+			return err
+		}
+		target := findGroupByID(all, id)
+		if target == nil {
+			return storage.ErrNotFound
+		}
+		members := layerMembers(all, target.Kind, 0)
+		idx := indexOfGroup(members, id)
+		if idx < 0 {
+			return storage.ErrNotFound
+		}
+		next := idx + delta
+		if next < 0 || next >= len(members) {
+			return nil
+		}
+		members[idx], members[next] = members[next], members[idx]
+		if err := m.applyLayerOrderTx(tx, target.Kind, members); err != nil {
+			return err
+		}
+		moved, movedName, movedKind = true, target.Name, config.KindLabel(target.Kind)
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	target := findGroupByID(all, id)
-	if target == nil {
-		return storage.ErrNotFound
+	if moved {
+		m.Logf("分流组 %q 在 %s 层内顺序已调整", movedName, movedKind)
 	}
-	members := layerMembers(all, target.Kind, 0)
-	idx := indexOfGroup(members, id)
-	if idx < 0 {
-		return storage.ErrNotFound
-	}
-	next := idx + delta
-	if next < 0 || next >= len(members) {
-		return nil
-	}
-	members[idx], members[next] = members[next], members[idx]
-	if err := m.applyLayerOrder(target.Kind, members); err != nil {
-		return err
-	}
-	m.Logf("分流组 %q 在 %s 层内顺序已调整", target.Name, config.KindLabel(target.Kind))
 	return nil
 }
 
@@ -163,8 +182,23 @@ func (m *Manager) MoveGroupToKind(id int64, kind string, pos int) error {
 }
 
 // relocate 把 g 放进 kind 层的 pos 位置（pos < 0 表示层尾），并重排两层的序号。
+// 整行更新 + 目标层重排 + 源层去空档在单个事务中完成（C14）：
+// 中途失败整体回滚，不留半更新状态。
 func (m *Manager) relocate(g *config.RoutingGroup, kind string, pos int) error {
-	all, err := m.DB.ListRoutingGroups()
+	if err := m.DB.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return m.relocateTx(tx, g, kind, pos)
+	}); err != nil {
+		return err
+	}
+	m.Logf("分流组 %q 已移入 %s 层（第 %d 位）", g.Name, config.KindLabel(kind), g.Position+1)
+	return nil
+}
+
+// relocateTx 是 relocate 的事务内版本（C14）：必须经 WithTx 提供的事务执行，
+// 读取与写入都走传入的 tx（单连接池下事务内不得再经 d.db 取连接）。
+// 事务内只做 SQL 与内存计算。
+func (m *Manager) relocateTx(tx *sql.Tx, g *config.RoutingGroup, kind string, pos int) error {
+	all, err := m.DB.ListRoutingGroupsTx(tx)
 	if err != nil {
 		return err
 	}
@@ -186,25 +220,34 @@ func (m *Manager) relocate(g *config.RoutingGroup, kind string, pos int) error {
 
 	g.Kind = kind
 	g.Position = pos
-	if err := m.DB.UpdateRoutingGroup(g); err != nil {
+	if err := m.DB.UpdateRoutingGroupTx(tx, g); err != nil {
 		return err
 	}
-	if err := m.applyLayerOrder(kind, ordered); err != nil {
+	if err := m.applyLayerOrderTx(tx, kind, ordered); err != nil {
 		return err
 	}
 	if source != "" && source != kind {
 		// 源层被抽走一个成员：重排去掉空档
-		if err := m.applyLayerOrder(source, layerMembers(all, source, g.ID)); err != nil {
+		if err := m.applyLayerOrderTx(tx, source, layerMembers(all, source, g.ID)); err != nil {
 			return err
 		}
 	}
-	m.Logf("分流组 %q 已移入 %s 层（第 %d 位）", g.Name, config.KindLabel(kind), g.Position+1)
 	return nil
 }
 
-// applyLayerOrder 按给定顺序把 kind 层的 position 重排为连续值 0..n-1。
+// applyLayerOrder 按给定顺序把 kind 层的 position 重排为连续值 0..n-1（独立短事务）。
 // 只更新定位列（kind/kind_rank/position），不触碰规则。
 func (m *Manager) applyLayerOrder(kind string, ordered []*config.RoutingGroup) error {
+	return m.DB.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return m.applyLayerOrderTx(tx, kind, ordered)
+	})
+}
+
+// applyLayerOrderTx 是 applyLayerOrder 的事务内版本（C14）：必须经 WithTx
+// 提供的事务执行。afterPlacement 测试注入缝同样在事务内生效——注入错误
+// 会让整个外层事务回滚。
+func (m *Manager) applyLayerOrderTx(tx *sql.Tx, kind string, ordered []*config.RoutingGroup) error {
+	n := 0
 	for i, g := range ordered {
 		if g == nil {
 			continue
@@ -212,11 +255,17 @@ func (m *Manager) applyLayerOrder(kind string, ordered []*config.RoutingGroup) e
 		if config.KindNormalize(g.Kind) == kind && g.Position == i {
 			continue
 		}
-		if err := m.DB.SetRoutingGroupPlacement(g.ID, kind, i); err != nil {
+		if err := m.DB.SetRoutingGroupPlacementTx(tx, g.ID, kind, i); err != nil {
 			return err
 		}
 		g.Kind = kind
 		g.Position = i
+		n++
+		if m.afterPlacement != nil {
+			if err := m.afterPlacement(n); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

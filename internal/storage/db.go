@@ -43,8 +43,18 @@ func ReadOnlyUnavailable(err error) bool {
 // writableDSNPragmas 可写连接的 DSN 参数。
 //
 // _time_format=sqlite 让时间类型按 SQLite 原生存储，便于跨驱动读取；
-// foreign_keys(1) 启用外键级联（SQLite 默认关闭）。
-const writableDSNPragmas = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_time_format=sqlite"
+// foreign_keys(1) 启用外键级联（SQLite 默认关闭）；
+// _txlock=immediate 是 C14 的**有意选择（方案 A）**：共享可写 DSN 上的所有
+// BeginTx / Begin 都按 IMMEDIATE 事务处理——BeginTx 阶段即申请写锁。
+// 理由：本库 SetMaxOpenConns(1)，池内只有一条连接，任何事务最终都要写锁，
+// upfront 申请不损失并发性，却消除了 deferred 事务中途升级写锁时撞上其他
+// 进程写者的 SQLITE_BUSY 失败形态，与 migrate() 的 BEGIN IMMEDIATE 语义一致。
+// 现有 d.db.Begin() 调用全部是写事务（nodes/subscriptions/groups/rulesets），
+// 自动获得正确语义。
+// 注意：只读打开路径（OpenQueryOnly）的 DSN 白名单（queryOnlyDSNPragmas）
+// **不含** _txlock，也不得加入——只读连接不开写事务，白名单测试
+// （TestQueryOnlyDSNWhitelist）守护这条边界。
+const writableDSNPragmas = "_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_time_format=sqlite"
 
 // queryOnlyDSNPragmas 只读连接的 DSN 参数**白名单**。
 //
@@ -100,6 +110,33 @@ func Open(paths *platform.Paths) (*DB, error) {
 // Close 关闭数据库连接。
 func (d *DB) Close() error {
 	return d.db.Close()
+}
+
+// WithTx 在一个数据库事务中执行 fn：fn 返回错误则整体回滚并透出该错误，
+// 否则提交。统一 BeginTx / rollback / commit，替代各处手写的事务样板。
+//
+// 锁语义见 writableDSNPragmas 注释（C14 方案 A）：本方法开启的事务都是
+// IMMEDIATE 事务，BeginTx 阶段即持有写锁。
+//
+// **fn 内只能使用传入的 tx 做数据库访问**——本库 SetMaxOpenConns(1)，事务
+// 持有池内唯一连接，fn 若再经 d.db 取连接会永久阻塞。因此 fn 内不得调用
+// 任何 *DB 公开方法（它们都走 d.db），只调用配套的 *Tx 后缀方法。
+//
+// 事务必须短小：fn 内只做 SQL 与必要的内存计算，禁止网络和文件 I/O，
+// 否则写锁持续期间会阻塞全部查询并卡住 TUI。
+func (d *DB) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
+	}
+	return nil
 }
 
 // OpenQueryOnly 以只读方式打开**既有**数据库，供 CLI 只读命令使用。
