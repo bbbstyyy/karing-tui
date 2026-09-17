@@ -2,6 +2,7 @@ package components
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -241,6 +242,109 @@ func TestListSkipsUnselectableRows(t *testing.T) {
 	for _, line := range strings.Split(view, "\n") {
 		if ansi.StringWidth(line) > l.Width {
 			t.Fatalf("列表行溢出宽度: %q", line)
+		}
+	}
+}
+
+// optionItemsReference 是选项面板过滤的独立参照实现：直接用原始表达式逐项匹配
+// （Label + 空格 + Value，不区分大小写），不复用 Form 上的任何派生缓存。
+// 仅适用于 Multi 字段——生产实现给每个条目都拼勾选框前缀（未选 [ ]、已选 [x]），
+// 前缀不参与匹配。
+func optionItemsReference(opts []Option, query string, selected map[string]bool) []string {
+	lower := strings.ToLower(query)
+	var items []string
+	for _, opt := range opts {
+		if !strings.Contains(strings.ToLower(opt.Label+" "+opt.Value), lower) {
+			continue
+		}
+		mark := "[ ] "
+		if selected[opt.Value] {
+			mark = "[x] "
+		}
+		items = append(items, mark+opt.Label)
+	}
+	return items
+}
+
+// TestFormOptionFilterMatchesReferenceSemantics 用独立参照实现钉住选项面板的过滤语义：
+// 「Label + 空格 + Value 不区分大小写地包含查询词」。C19 只是把这条表达式的结果缓存
+// 到 Form 侧，语义必须逐项一致，勾选状态也不得改变结果集合。
+//
+// 跨字段探针 "a hk1" 是刻意的：它只在「两个字段先拼成一个字符串再匹配」时命中，
+// 用来挡住今后把缓存改成逐字段匹配（C8 在节点搜索上留了同款探针）。
+//
+// 参照实现不引用任何缓存，因此本测试在 C19 前后都通过——它证明的是「行为没变」；
+// 「改动真的落地」由 TestFormOptionFilterReadsCachedSearchKeys 负责。
+func TestFormOptionFilterMatchesReferenceSemantics(t *testing.T) {
+	opts := []Option{
+		{Value: "geosite-cn", Label: "规则集 · CN 广告拦截"},
+		{Value: "hk1", Label: "a"},
+		{Value: "proxy", Label: "PROXY 代理"},
+		{Value: "tokyo-jp", Label: "东京节点"},
+	}
+	f := NewForm("规则值", []string{"引用"}, []string{"value"}, []string{""})
+	f.SetChoices("value", opts)
+	f.Field("value").Multi = true
+	f.FocusKey("value")
+	f.openOptions()
+	f.selection = map[string]bool{"proxy": true} // 有勾选项，且勾选不得改变结果集合
+
+	queries := []string{"", "cn", "CN", "规则", "proxy", "PROXY", "东京", "tokyo", "a hk1", "hk1 a", "不存在"}
+	matchedAny := false
+	for _, q := range queries {
+		f.query.SetValue(q)
+		f.filterOptions()
+		want := optionItemsReference(opts, q, f.selection)
+		if len(want) > 0 {
+			matchedAny = true
+		}
+		if !slices.Equal(f.options.Items, want) {
+			t.Fatalf("查询 %q：选项列表 %v，参照实现 %v", q, f.options.Items, want)
+		}
+	}
+	if !matchedAny {
+		t.Fatal("没有任何查询命中，前面对照失去意义")
+	}
+}
+
+// TestFormOptionFilterReadsCachedSearchKeys 钉住 C19 的实现要点：过滤循环读的是
+// Form 侧缓存的小写搜索键，而不是每次按键现算 ToLower(Label+" "+Value)。
+//
+// 手法与 C8 一致：把某个选项的缓存键换成 Label/Value 里都不含的哨兵值，再用哨兵
+// 查询——命中即证明读的是缓存。上面那条对照测试在旧实现上同样通过，无法区分两者。
+// （实测：把过滤循环临时改回当场拼接 + ToLower，本测试报「未命中」而对照测试仍通过。）
+//
+// 末尾反向核对：哨兵不得出现在任何 Label/Value 里，否则命中可能来自现算。
+func TestFormOptionFilterReadsCachedSearchKeys(t *testing.T) {
+	f := NewForm("规则值", []string{"引用"}, []string{"value"}, []string{""})
+	f.SetChoices("value", []Option{
+		{Value: "first", Label: "第一条"},
+		{Value: "second", Label: "第二条"},
+	})
+	f.FocusKey("value")
+	f.openOptions()
+	f.filterOptions() // 触发缓存建立
+
+	const canary = "zz-canary-zz"
+	patched := false
+	for i := range f.optionSearch {
+		if f.Fields[f.focus].Options[i].Value == "second" {
+			f.optionSearch[i] = canary
+			patched = true
+		}
+	}
+	if !patched {
+		t.Fatal("没找到用于打哨兵的选项缓存项")
+	}
+
+	f.query.SetValue(canary)
+	f.filterOptions()
+	if got := f.options.Items; len(got) != 1 || got[0] != "第二条" {
+		t.Fatalf("过滤没有使用 Form 缓存的小写搜索键: %v", got)
+	}
+	for _, opt := range f.Fields[f.focus].Options {
+		if strings.Contains(opt.Label, canary) || strings.Contains(opt.Value, canary) {
+			t.Fatal("哨兵出现在 Label/Value 里，断言失去意义")
 		}
 	}
 }

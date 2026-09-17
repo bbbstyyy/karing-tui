@@ -75,6 +75,19 @@ type Form struct {
 	selection                          map[string]bool
 	selectionOrder                     []string
 	externalError                      string
+
+	// C19：选项搜索键缓存。optionSearch 与「焦点字段」的 Options 下标一一对应，
+	// 每项 = strings.ToLower(Label + " " + Value)，即过滤循环里的那条原始表达式。
+	// 选项面板每敲一个字符都全量过滤一遍选项，这条表达式在 1953 项下每个按键
+	// 重复约 3900 次分配；缓存后按键路径零分配。
+	// 有效条件是三键核对（缓存非空 + 焦点字段一致 + optionsGen 一致）：焦点切换、
+	// 任何路径替换 Options 都会使其失效。所有写 Options 的入口都必须经
+	// optionsChanged()——SetChoices（含 SetOptions）与 SetFieldOptions 已收口，
+	// 不要绕过它们直接改 field.Options，否则过滤会读到旧选项。
+	optionSearch      []string
+	optionSearchFocus int
+	optionSearchGen   uint64
+	optionsGen        uint64
 }
 
 func NewForm(title string, labels, keys, hints []string) Form {
@@ -128,6 +141,25 @@ func NewForm(title string, labels, keys, hints []string) Form {
 	return f
 }
 
+// optionsChanged 记录「某字段的 Options 已被替换」，使选项搜索键缓存失效。
+// 这是写 Options 后的唯一收口：SetChoices（含 SetOptions）与 SetFieldOptions 都走它。
+func (f *Form) optionsChanged() {
+	f.optionsGen++
+	f.optionSearch = nil
+	f.optionSearchFocus = -1
+}
+
+// SetFieldOptions 替换某字段的选项列表。规则表单按「类型」重配值字段时用：
+// 直接改 field.Options 会绕过 optionsChanged，让选项过滤读到旧选项。
+func (f *Form) SetFieldOptions(key string, opts []Option) {
+	field := f.Field(key)
+	if field == nil {
+		return
+	}
+	field.Options = opts
+	f.optionsChanged()
+}
+
 func (f *Form) SetOptions(key string, values ...string) {
 	opts := make([]Option, 0, len(values))
 	for _, v := range values {
@@ -137,6 +169,7 @@ func (f *Form) SetOptions(key string, values ...string) {
 }
 
 func (f *Form) SetChoices(key string, opts []Option) {
+	changed := false
 	for i := range f.Fields {
 		if f.Fields[i].Key == key {
 			f.Fields[i].Choice = true
@@ -144,7 +177,11 @@ func (f *Form) SetChoices(key string, opts []Option) {
 			if f.Fields[i].Value() == "" && len(opts) > 0 {
 				f.Fields[i].SetValue(opts[0].Value)
 			}
+			changed = true
 		}
+	}
+	if changed {
+		f.optionsChanged()
 	}
 }
 
@@ -517,21 +554,46 @@ func (f *Form) openOptions() tea.Cmd {
 	return f.query.Focus()
 }
 
+// optionSearchKeys 返回当前焦点字段 Options 的小写搜索键，必要时重建（C19）。
+//
+// 重建只发生在焦点切换或选项被替换之后；按键路径上反复发生的只有 Contains 匹配。
+// 三键核对里的「缓存非空」不可省：零值 Form 的 optionSearchFocus 恰好也是 0，
+// 缺了它首次调用会误判命中并返回 nil，把所有选项都滤掉。
+func (f *Form) optionSearchKeys() []string {
+	if f.optionSearch != nil && f.optionSearchFocus == f.focus && f.optionSearchGen == f.optionsGen {
+		return f.optionSearch
+	}
+	opts := f.Fields[f.focus].Options
+	keys := make([]string, len(opts))
+	for i := range opts {
+		keys[i] = strings.ToLower(opts[i].Label + " " + opts[i].Value)
+	}
+	f.optionSearch, f.optionSearchFocus, f.optionSearchGen = keys, f.focus, f.optionsGen
+	return keys
+}
+
+// filterOptions 按查询词过滤当前焦点字段的选项。匹配读 optionSearchKeys 的缓存
+// （与 Options 下标一一对应），query 的 ToLower 在循环外做一次；循环内不得再出现
+// ToLower 或 Label/Value 拼接——TestFormOptionFilterReadsCachedSearchKeys 用哨兵
+// 钉住了这一点，TestFormOptionFilterMatchesReferenceSemantics 钉住匹配语义。
 func (f *Form) filterOptions() {
+	query := strings.ToLower(f.query.Value())
+	search := f.optionSearchKeys()
 	var items, keys []string
-	for _, opt := range f.Fields[f.focus].Options {
-		if strings.Contains(strings.ToLower(opt.Label+" "+opt.Value), strings.ToLower(f.query.Value())) {
-			label := opt.Label
-			if f.Fields[f.focus].Multi {
-				mark := "[ ] "
-				if f.selection[opt.Value] {
-					mark = "[x] "
-				}
-				label = mark + label
-			}
-			items = append(items, label)
-			keys = append(keys, opt.Value)
+	for i, opt := range f.Fields[f.focus].Options {
+		if !strings.Contains(search[i], query) {
+			continue
 		}
+		label := opt.Label
+		if f.Fields[f.focus].Multi {
+			mark := "[ ] "
+			if f.selection[opt.Value] {
+				mark = "[x] "
+			}
+			label = mark + label
+		}
+		items = append(items, label)
+		keys = append(keys, opt.Value)
 	}
 	f.options.SetItems(items, keys)
 }

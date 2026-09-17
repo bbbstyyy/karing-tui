@@ -255,7 +255,9 @@ func configureRuleValueField(form *components.Form, field *components.FormField)
 	field.Action = ""
 	field.Validate = required("规则值")
 	field.Choice, field.Multi = false, false
-	field.Options = nil
+	// 经 SetFieldOptions 而非直接赋值：Form 侧的选项搜索键缓存（C19）依赖
+	// optionsChanged 失效，直接改 field.Options 会让过滤读到旧选项。
+	form.SetFieldOptions(field.Key, nil)
 	switch form.ValueByKey("type") {
 	case "logical":
 		field.Action = "conditions"
@@ -277,7 +279,8 @@ func rebuildRuleValueOptions(app *application.App, form *components.Form, field 
 	if !field.Choice {
 		return
 	}
-	field.Options = referenceChoices(app, form.ValueByKey("type"), field.Value())
+	// 经 SetFieldOptions 写入：让 Form 的选项搜索键缓存随之失效（C19）。
+	form.SetFieldOptions(field.Key, referenceChoices(app, form.ValueByKey("type"), field.Value()))
 }
 
 func (p *Profiles) configureSubForm() {
