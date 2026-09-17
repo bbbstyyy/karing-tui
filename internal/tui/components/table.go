@@ -25,12 +25,26 @@ func (l *SimpleList) SetTableSelectable(columns []Column, rows [][]string, keys 
 	}
 	l.Columns, l.Rows = columns, rows
 	l.Selectable = selectable
+	l.tableVersion++
 	l.SetItems(items, keys)
 }
 
 type tableColumn struct{ index, width int }
 
-func (l *SimpleList) tableColumns(width int) []tableColumn {
+// tableColumnsFor 返回给定宽度下的列布局。
+// 布局只依赖 Columns 与 width：SetTable* 递增 tableVersion 使缓存失效，
+// 同一宽度下表头与全部可见行共享同一份布局，不再每行重算（C12 改法 1；
+// 每帧 31 次「排序/裁剪 + 分配」收敛为 1 次）。
+func (l *SimpleList) tableColumnsFor(width int) []tableColumn {
+	if l.tcols != nil && l.tcolsWidth == width && l.tcolsVersion == l.tableVersion {
+		return l.tcols
+	}
+	cols := l.computeTableColumns(width)
+	l.tcolsWidth, l.tcolsVersion, l.tcols = width, l.tableVersion, cols
+	return cols
+}
+
+func (l *SimpleList) computeTableColumns(width int) []tableColumn {
 	var cols []tableColumn
 	for i, c := range l.Columns {
 		cols = append(cols, tableColumn{i, max(4, c.Width)})
@@ -60,9 +74,10 @@ func (l *SimpleList) tableColumns(width int) []tableColumn {
 	return cols
 }
 
-func (l *SimpleList) tableRow(values []string, width int) string {
+// tableRow 按 cols 布局渲染一行；cols 由调用方经 tableColumnsFor 取得。
+func (l *SimpleList) tableRow(values []string, cols []tableColumn) string {
 	var cells []string
-	for _, c := range l.tableColumns(width) {
+	for _, c := range cols {
 		value := ""
 		if c.index < len(values) {
 			value = values[c.index]

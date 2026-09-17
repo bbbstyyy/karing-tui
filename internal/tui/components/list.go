@@ -26,6 +26,14 @@ type SimpleList struct {
 	// them and they render as plain (unstyled-by-column) text.
 	Selectable []bool
 	offset     int
+
+	// 列布局缓存（C12）：仅由 tableColumnsFor 读写，SetTableSelectable
+	// 递增 tableVersion 失效。Columns 是公开字段，除 SetTable* 外不得直写
+	// （全仓已收口，见 components/table.go）。
+	tableVersion uint32
+	tcols        []tableColumn
+	tcolsWidth   int
+	tcolsVersion uint32
 }
 
 func (l *SimpleList) Update(msg tea.Msg) (bool, tea.Cmd) {
@@ -178,13 +186,14 @@ func (l *SimpleList) View(empty string) string {
 		l.MoveCursor(1)
 	}
 	rows := max(1, height-1)
+	cols := l.tableColumnsFor(max(1, width-2))
 	var header string
 	if len(l.Columns) > 0 && height >= 3 {
 		titles := make([]string, len(l.Columns))
 		for i, c := range l.Columns {
 			titles[i] = c.Title
 		}
-		header = styles.Dim.Render("  " + l.tableRow(titles, max(1, width-2)))
+		header = styles.Dim.Render("  " + l.tableRow(titles, cols))
 		rows--
 	}
 	if l.Cursor < l.offset {
@@ -211,7 +220,7 @@ func (l *SimpleList) View(empty string) string {
 		}
 		item := l.Items[i]
 		if len(l.Columns) > 0 && i < len(l.Rows) {
-			item = l.tableRow(l.Rows[i], max(1, width-2))
+			item = l.tableRow(l.Rows[i], cols)
 		}
 		line := Clip(prefix+item, width)
 		if i == l.Cursor {

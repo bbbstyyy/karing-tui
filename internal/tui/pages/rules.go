@@ -154,6 +154,8 @@ func (r *Rules) Update(msg tea.Msg) (Page, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		r.SetSize(msg.Width, msg.Height)
+		// 宽度只影响行文本，重建表格即可，不必重新查库（C12）。
+		r.table()
 		return r, nil
 	case ActivateMsg:
 		r.reload()
@@ -627,6 +629,8 @@ func (r *Rules) reload() {
 			r.catRefsInUse = nil
 		}
 		r.list.SelectKey(selected)
+		// C12：表格只在数据变化时重建，View 不再每帧建行。
+		r.table()
 		return
 	}
 	r.list.Height = 0
@@ -634,6 +638,7 @@ func (r *Rules) reload() {
 	r.list.Keys = nil
 	r.buildGroupList()
 	r.list.SelectKey(selected)
+	r.table()
 }
 
 // buildGroupList 按层重建分流组列表（6.5）：层标题是不可选中行，层内为可选中行。
@@ -736,6 +741,8 @@ func (r *Rules) reloadGroupRules() {
 		r.list.Keys = append(r.list.Keys, fmt.Sprintf("rule:%d", rule.ID))
 	}
 	r.list.SelectKey(selected)
+	// C12：表格只在数据变化时重建，View 不再每帧建行。
+	r.table()
 }
 
 // selectedGroup 返回光标所在的分流组。光标落在层标题上时返回 false：
@@ -839,6 +846,8 @@ func (r *Rules) reloadCatalog() {
 	}
 	r.catHits = hits
 	r.list.SelectKey(selected)
+	// C12：表格只在数据变化时重建，View 不再每帧建行（搜索输入经此路径生效）。
+	r.table()
 }
 
 // cachedCatalogTags 一次列目录读出分类缓存状态。
@@ -1421,7 +1430,6 @@ func (r *Rules) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 // --- 渲染 ---
 
 func (r *Rules) View() string {
-	r.table()
 	r.preview = r.selectionDetails()
 	if r.detailActive {
 		return r.detailsView()

@@ -78,6 +78,7 @@ func (d *DNSPage) Update(msg tea.Msg) (Page, tea.Cmd) {
 		d.SetSize(msg.Width, msg.Height)
 		// 只按新宽度重建列表；resize 不查库（宽度只影响内存里的列宽计算）。
 		d.rebuildDNSList()
+		d.table()
 		return d, nil
 	case ActivateMsg:
 		d.reload()
@@ -162,6 +163,8 @@ func (d *DNSPage) handleKey(msg tea.KeyMsg) (Page, tea.Cmd) {
 		switch action {
 		case "cancel":
 			d.mode = d.formBackMode()
+			// 表单期间 resize 可能把 d.list 重建成了无列布局，回列表前重建表格。
+			d.table()
 		case "save":
 			d.submitForm()
 		}
@@ -333,6 +336,8 @@ func (d *DNSPage) reload() {
 		d.rules = rules
 	}
 	d.rebuildDNSList()
+	// C12：表格只在数据变化时重建，View 不再每帧建行。
+	d.table()
 }
 
 // rebuildDNSList 只基于内存缓存、当前宽度与模式重建列表项，不访问数据库。
@@ -473,6 +478,7 @@ func (d *DNSPage) submitForm() {
 		servers, i, ok := d.serverByID(d.editID)
 		if !ok {
 			d.mode = dnsServers
+			d.table()
 			return
 		}
 		s := servers[i]
@@ -498,6 +504,7 @@ func (d *DNSPage) submitForm() {
 		rules, i, ok := d.ruleByID(d.editID)
 		if !ok {
 			d.mode = dnsRules
+			d.table()
 			return
 		}
 		r := rules[i]
@@ -570,7 +577,6 @@ func (d *DNSPage) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 // --- 渲染 ---
 
 func (d *DNSPage) View() string {
-	d.table()
 	d.preview = d.selectionDetails()
 	if d.detailActive {
 		return d.detailsView()

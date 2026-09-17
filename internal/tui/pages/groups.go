@@ -108,6 +108,8 @@ func (g *Groups) Update(msg tea.Msg) (Page, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		g.SetSize(msg.Width, msg.Height)
+		// 宽度只影响行文本，重建表格即可，不必重新查库（C12：表格不再每帧重建）。
+		g.table()
 		return g, nil
 	case ActivateMsg:
 		g.reload()
@@ -116,6 +118,10 @@ func (g *Groups) Update(msg tea.Msg) (Page, tea.Cmd) {
 		if msg.startedAt.Equal(g.app.Core.Status().StartedAt) {
 			g.runtime = msg.proxies
 			g.runtimeAt = msg.startedAt
+			// 「运行中」标注来自 runtime 快照：快照变化时重建详情表。
+			if g.mode == groupsDetail {
+				g.table()
+			}
 		}
 		return g, nil
 	case actionDoneMsg:
@@ -308,6 +314,8 @@ func (g *Groups) reload() {
 		g.list.Keys = append(g.list.Keys, strconv.FormatInt(grp.ID, 10))
 	}
 	g.list.SelectKey(selectedKey)
+	// C12：表格只在数据/模式变化时重建，View 不再每帧建行。
+	g.table()
 }
 
 // reloadDetail 重建组详情视图的成员列表。
@@ -338,6 +346,8 @@ func (g *Groups) reloadDetail() {
 		g.list.Keys = append(g.list.Keys, mem.MemberKey())
 	}
 	g.list.SelectKey(selected)
+	// C12：表格只在数据变化时重建，View 不再每帧建行。
+	g.table()
 }
 
 // memberLabel 把成员键解析为展示文本。
@@ -720,7 +730,6 @@ func (g *Groups) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 // --- 渲染 ---
 
 func (g *Groups) View() string {
-	g.table()
 	g.preview = ""
 	if g.mode == groupsDetail {
 		g.preview = g.memberDetails()
