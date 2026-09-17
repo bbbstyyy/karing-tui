@@ -276,11 +276,15 @@ func TestSelectorGroupDefault(t *testing.T) {
 }
 
 func TestURLTestGroup(t *testing.T) {
+	nodes := []*Node{
+		{ID: 1, Name: "n1", Protocol: "trojan", Server: "1.1.1.1", Port: 443, Enabled: true,
+			Metadata: map[string]any{"password": "p"}},
+	}
 	groups := []*ProxyGroup{{
 		ID: 10, Name: "Auto", Type: "urltest", TestURL: "http://example.com/204", IntervalS: 300,
 		Members: []ProxyGroupMember{{Type: "all"}},
 	}}
-	m := mustGenerate(t, Snapshot{Settings: DefaultSettings(), ProxyGroups: groups})
+	m := mustGenerate(t, Snapshot{Settings: DefaultSettings(), Nodes: nodes, ProxyGroups: groups})
 	g := findOutbound(t, m, "Auto")
 	if g["type"] != "urltest" {
 		t.Fatalf("urltest 组类型不符: %v", g["type"])
@@ -288,9 +292,13 @@ func TestURLTestGroup(t *testing.T) {
 	if g["url"] != "http://example.com/204" || g["interval"] != "300s" {
 		t.Errorf("urltest url/interval 不符: %v", g)
 	}
-	// 空节点池：all 展开为空，回退 direct
-	if members := toStringSlice(t, g["outbounds"]); len(members) != 1 || members[0] != "direct" {
-		t.Errorf("空组应回退 direct: %v", members)
+	if members := toStringSlice(t, g["outbounds"]); len(members) != 1 || members[0] != "n1" {
+		t.Errorf("all 应展开为全部启用节点: %v", members)
+	}
+	// C15 反转了这里的旧断言：空节点池时 all 展开为空，旧行为注入 direct（静默直连），
+	// 现在必须 fail-closed。完整用例见 failclosed_test.go。
+	if _, err := Generate(Snapshot{Settings: DefaultSettings(), ProxyGroups: groups}); err == nil {
+		t.Error("空节点池下 urltest 组会展开为空，必须 fail-closed 而不是注入 direct")
 	}
 }
 
@@ -309,13 +317,14 @@ func TestNestedGroupAndCycle(t *testing.T) {
 		t.Errorf("嵌套组应展开为节点: %v", members)
 	}
 
-	// 循环引用
+	// 循环引用。必须带可用节点：否则 C15 的 ErrNoUsableNodes 会先返回，
+	// 这条断言就变成「永远为真」的假通过，循环检测实际上没被覆盖。
 	cycle := []*ProxyGroup{
 		{ID: 10, Name: "A", Type: "select", Members: []ProxyGroupMember{{Type: "group", ID: 11}}},
 		{ID: 11, Name: "B", Type: "select", Members: []ProxyGroupMember{{Type: "group", ID: 10}}},
 	}
-	if _, err := Generate(Snapshot{Settings: DefaultSettings(), ProxyGroups: cycle}); err == nil {
-		t.Error("循环引用应返回错误")
+	if _, err := Generate(Snapshot{Settings: DefaultSettings(), Nodes: nodes, ProxyGroups: cycle}); err == nil || !strings.Contains(err.Error(), "循环") {
+		t.Errorf("循环引用应返回循环成员引用错误，得到 %v", err)
 	}
 }
 
@@ -421,12 +430,16 @@ func TestRouteRulesAndFinal(t *testing.T) {
 }
 
 func TestRouteFinalGroup(t *testing.T) {
+	nodes := []*Node{
+		{ID: 1, Name: "n1", Protocol: "trojan", Server: "1.1.1.1", Port: 443, Enabled: true,
+			Metadata: map[string]any{"password": "p"}},
+	}
 	groups := []*ProxyGroup{{ID: 10, Name: "Auto", Type: "select", Members: []ProxyGroupMember{{Type: "all"}}}}
 	routings := []*RoutingGroup{{
 		Name: "Final", Target: "Auto", Enabled: true,
 		Rules: []Rule{{Type: "final", Enabled: true}},
 	}}
-	m := mustGenerate(t, Snapshot{Settings: DefaultSettings(), ProxyGroups: groups, RoutingGroups: routings})
+	m := mustGenerate(t, Snapshot{Settings: DefaultSettings(), Nodes: nodes, ProxyGroups: groups, RoutingGroups: routings})
 	route := m["route"].(map[string]any)
 	if route["final"] != "Auto" {
 		t.Errorf("route.final = %v, 期望 Auto", route["final"])
@@ -852,7 +865,11 @@ func TestRouteLogicalRule(t *testing.T) {
 		{ID: 1, Name: "cn", Tag: "geosite-cn", SourceType: "remote", Format: "srs",
 			URL: "https://example.com/cn.srs", Enabled: true},
 	}
-	groups := []*ProxyGroup{{ID: 1, Name: "Auto", Type: "urltest"}}
+	nodes := []*Node{
+		{ID: 1, Name: "n1", Protocol: "trojan", Server: "1.1.1.1", Port: 443, Enabled: true,
+			Metadata: map[string]any{"password": "p"}},
+	}
+	groups := []*ProxyGroup{{ID: 1, Name: "Auto", Type: "urltest", Members: []ProxyGroupMember{{Type: "all"}}}}
 	routings := []*RoutingGroup{{
 		Name: "G", Target: "Auto", Enabled: true,
 		Rules: []Rule{{
@@ -863,7 +880,7 @@ func TestRouteLogicalRule(t *testing.T) {
 			},
 		}},
 	}}
-	m := mustGenerate(t, Snapshot{Settings: DefaultSettings(), ProxyGroups: groups, RuleSets: ruleSets, RoutingGroups: routings})
+	m := mustGenerate(t, Snapshot{Settings: DefaultSettings(), Nodes: nodes, ProxyGroups: groups, RuleSets: ruleSets, RoutingGroups: routings})
 	rules := m["route"].(map[string]any)["rules"].([]any)
 	var r map[string]any
 	for _, item := range rules {

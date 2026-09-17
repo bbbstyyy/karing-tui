@@ -47,7 +47,8 @@ func RunService(paths *platform.Paths) int {
 	}
 	defer app.Close()
 	if err := app.GenerateConfig(context.Background()); err != nil {
-		st.Status, st.ExitError, st.StoppedAt = StatusCrashed, "生成配置失败: "+err.Error(), time.Now()
+		// err 已带「生成配置失败:」前缀（application.generateConfig），不再叠加。
+		st.Status, st.ExitError, st.StoppedAt = StatusCrashed, err.Error(), time.Now()
 		_ = WriteState(paths, st)
 		return 1
 	}

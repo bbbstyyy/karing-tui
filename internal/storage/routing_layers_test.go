@@ -119,8 +119,15 @@ func legacyGroupsByOldOrder(t *testing.T, raw *sql.DB) []*config.RoutingGroup {
 func legacySnapshot(groups []*config.RoutingGroup) config.Snapshot {
 	set := config.DefaultSettings()
 	return config.Snapshot{
-		Settings:      set,
-		ProxyGroups:   []*config.ProxyGroup{{ID: 1, Name: "Auto", Type: "urltest"}},
+		Settings: set,
+		// C15 起「没有任何可用节点」会 fail-closed，而本测试只关心层序迁移前后
+		// 生成的 route 是否逐条一致，因此需要给出一个可用节点 + 可解析的默认组。
+		Nodes: []*config.Node{{
+			ID: 1, Name: "n1", Protocol: "trojan", Server: "1.1.1.1", Port: 443,
+			Enabled: true, Metadata: map[string]any{"password": "p"},
+		}},
+		ProxyGroups: []*config.ProxyGroup{{ID: 1, Name: "Auto", Type: "urltest",
+			Members: []config.ProxyGroupMember{{Type: "all"}}}},
 		RoutingGroups: groups,
 	}
 }

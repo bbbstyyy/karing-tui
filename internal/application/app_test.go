@@ -52,6 +52,23 @@ func setupApp(t *testing.T) (*App, *platform.Paths) {
 	return app, paths
 }
 
+// seedEnabledNode 写入一个可用节点。C15 起「没有任何可用节点」会让配置生成
+// fail-closed（ErrNoUsableNodes），所以凡是要跑 GenerateConfig / StartCore /
+// RestartCore 的测试都必须先满足这个前置条件。
+func seedEnabledNode(t *testing.T, app *App) {
+	t.Helper()
+	if err := app.DB.CreateNode(&config.Node{
+		Name:     "seed-01",
+		Protocol: "shadowsocks",
+		Server:   "127.0.0.1",
+		Port:     8388,
+		Enabled:  true,
+		Metadata: map[string]any{"method": "aes-128-gcm", "password": "pw"},
+	}); err != nil {
+		t.Fatalf("写入种子节点: %v", err)
+	}
+}
+
 func TestAutoUpdateOnce(t *testing.T) {
 	app, paths := setupApp(t)
 
@@ -140,6 +157,8 @@ func TestGenerateConfigInstallsEmbeddedCatalogOffline(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { app.Close() })
+	// 至少一个可用节点：否则默认 Auto/Manual(all) 展开为空，生成会 fail-closed。
+	seedEnabledNode(t, app)
 
 	var fetches int
 	app.Rules.Fetch = func(context.Context, string, string, string, int64) ([]byte, error) {
@@ -227,6 +246,7 @@ func TestReopenDBRebindsManagers(t *testing.T) {
 
 func TestRestartCoreRegeneratesConfig(t *testing.T) {
 	app, paths := setupApp(t)
+	seedEnabledNode(t, app)
 
 	script := `#!/bin/sh
 case "$1" in

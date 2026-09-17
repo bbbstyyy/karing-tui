@@ -156,6 +156,10 @@ func Generate(snap Snapshot) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 兜底不变量：route 引用的出站必须真实存在（见 validateOutboundRefs）。
+	if err := validateOutboundRefs(outbounds, route); err != nil {
+		return nil, err
+	}
 	// buildDNS 也会标记它引用的规则集，必须先于 buildRuleSets——否则只被 DNS 规则
 	// 引用的规则集不会生成 route.rule_set 条目，sing-box 启动时报 rule-set not found。
 	dnsCfg, err := g.buildDNS(route)
@@ -237,6 +241,29 @@ func (g *generator) init() {
 
 // --- 出站 ---
 
+// ErrNoUsableNodes 表示全局没有任何可用代理节点：典型场景是首次安装、尚未添加订阅/节点，
+// 或全部节点都被禁用。这是 onboarding 状态而不是「用户配置损坏」，因此必须与
+// ErrEmptyProxyGroup 分开——两者的修法完全不同。
+//
+// 文案直接写在错误上：TUI 的 Ctrl+A / 任务回执与 CLI 各子命令都会原样把它显示给用户，
+// 无需调用方按类型分支挑文案。
+type ErrNoUsableNodes struct{}
+
+func (ErrNoUsableNodes) Error() string {
+	return "当前没有可用代理节点。请先添加订阅或节点（或启用已被禁用的节点），然后再应用配置。"
+}
+
+// ErrEmptyProxyGroup 表示全局存在可用节点，但该**顶层**代理组解析后成员为空：
+// 成员可能引用了已删除/已禁用的节点或代理组、子组失效，或筛选条件为空。
+// Group 是被判定为空的组名，供文案与测试定位。
+type ErrEmptyProxyGroup struct {
+	Group string
+}
+
+func (e ErrEmptyProxyGroup) Error() string {
+	return fmt.Sprintf("代理组 %q 没有可用成员：成员可能引用了已删除或已禁用的节点/代理组。请修复该组成员后重新应用配置。", e.Group)
+}
+
 func (g *generator) buildOutbounds() ([]any, error) {
 	out := []any{}
 
@@ -256,7 +283,19 @@ func (g *generator) buildOutbounds() ([]any, error) {
 		out = append(out, ob)
 	}
 
-	// 代理组出站
+	// 代理组出站。
+	//
+	// fail-closed（C15）：旧实现让 resolveMembers 在空组时注入 "direct"，于是「尚无节点」
+	// 或「组成员全失效」都会生成一份看起来正常、实际全部直连的配置——用户以为代理已生效。
+	// 现在改为报错，并区分两类：全局没有可用节点（onboarding）与某个顶层组为空（组配置问题）。
+	if len(g.snap.ProxyGroups) > 0 && len(g.enabledByID) == 0 {
+		// 前置条件 len(ProxyGroups) > 0：没有任何代理组时（config 包的纯骨架用法，
+		// 如 core 集成测试与 golden 骨架）不存在「组为空」这件事，仍应正常生成。
+		//
+		// 可用节点的判定与组解析保持一致：enabledByID 在 init() 里按 Enabled 装入。
+		// 不可生成的节点（协议不支持等）会在上面的节点循环里直接报错，不会走到这里。
+		return nil, ErrNoUsableNodes{}
+	}
 	seen := map[string]bool{}
 	for _, gp := range g.snap.ProxyGroups {
 		if seen[gp.Name] {
@@ -266,6 +305,12 @@ func (g *generator) buildOutbounds() ([]any, error) {
 		members, err := g.resolveMembers(gp, map[int64]bool{})
 		if err != nil {
 			return nil, err
+		}
+		if len(members) == 0 {
+			// 不复用「跳过不生成」的写法：usedTags 在 init() 里已按组名占位，路由规则
+			// 也可能指向该组。少生成一个 outbound 会造出悬空 tag，把错误推迟到
+			// sing-box check 阶段。这里直接失败，保证引用集合与实际出站集合一致。
+			return nil, ErrEmptyProxyGroup{Group: gp.Name}
 		}
 		out = append(out, g.groupOutbound(gp, members))
 	}
@@ -292,7 +337,11 @@ func (g *generator) assignNodeTag(n *Node) (string, error) {
 }
 
 // resolveMembers 解析代理组成员为出站 tag 列表（保序去重）。
-// 失效引用（节点禁用/已删除、嵌套组为空）静默跳过；全部失效时回退 direct，保证配置可用。
+// 失效引用（节点禁用/已删除、嵌套组已删除）静默跳过；**递归层允许返回空切片**。
+//
+// 不要在这里补回 `len(out) == 0 → []string{"direct"}`：那正是 C15 删掉的隐式直连。
+// 空组由 buildOutbounds 在顶层判定并报错（ErrNoUsableNodes / ErrEmptyProxyGroup）——
+// 父组拿到空子组时只应少一个成员，而不是多出一个 direct。
 func (g *generator) resolveMembers(gp *ProxyGroup, visiting map[int64]bool) ([]string, error) {
 	if visiting[gp.ID] {
 		return nil, fmt.Errorf("代理组 %q 存在循环成员引用", gp.Name)
@@ -335,7 +384,7 @@ func (g *generator) resolveMembers(gp *ProxyGroup, visiting map[int64]bool) ([]s
 		}
 	}
 	if len(out) == 0 {
-		return []string{"direct"}, nil
+		return nil, nil
 	}
 	return out, nil
 }
@@ -396,6 +445,39 @@ func (g *generator) resolveSelected(gp *ProxyGroup, members []string) string {
 }
 
 // --- 路由 ---
+
+// validateOutboundRefs 校验 route 里所有动作型引用（final 与各规则的 outbound）都指向
+// 真实生成的出站 tag。生成器自己就用同一份模型算出这些引用，正常路径不可能失败；
+// 它的价值是**挡住未来的回归**：一旦有人为了「跳过空组」之类的理由少生成某个出站，
+// 引用会立刻在这里暴露，而不是拖延到 sing-box check / 运行期才报 unknown outbound。
+func validateOutboundRefs(out []any, route *sbRoute) error {
+	tags := make(map[string]bool, len(out))
+	for _, ob := range out {
+		switch v := ob.(type) {
+		case sbDirectOutbound:
+			tags[v.Tag] = true
+		case map[string]any:
+			if tag, ok := v["tag"].(string); ok {
+				tags[tag] = true
+			}
+		}
+	}
+	check := func(tag, where string) error {
+		if tag == "" || tags[tag] {
+			return nil
+		}
+		return fmt.Errorf("%s引用了不存在的出站 %q", where, tag)
+	}
+	if err := check(route.Final, "route.final "); err != nil {
+		return err
+	}
+	for i := range route.Rules {
+		if err := check(route.Rules[i].Outbound, fmt.Sprintf("第 %d 条路由规则", i+1)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func (g *generator) buildRoute() (*sbRoute, error) {
 	route := &sbRoute{AutoDetectInterface: true}

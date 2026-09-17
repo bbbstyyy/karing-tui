@@ -43,7 +43,9 @@ func main() {
 
 	// 启动时生成一次配置，保证 Dashboard 有配置状态可展示。
 	if err := app.GenerateConfig(context.Background()); err != nil {
-		app.AppLog.AppendLine("生成配置失败: " + err.Error())
+		// err 已带「生成配置失败:」前缀（application.generateConfig），不再叠加。
+		// 首次安装尚无节点时这里会记录 onboarding 引导，配置状态保持「未生成」。
+		app.AppLog.AppendLine(err.Error())
 	}
 
 	// 订阅自动更新（间隔为 0 时立即返回）。

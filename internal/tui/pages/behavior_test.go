@@ -641,6 +641,13 @@ func TestLogsKeepAbsoluteAnchorAsNewLinesArrive(t *testing.T) {
 
 func TestDashboardRejectsOldInstanceAndResetsRateBaseline(t *testing.T) {
 	app := pageFixture(t)
+	// StartCore/RestartCore 会先生成配置；C15 起没有可用节点时生成会 fail-closed。
+	if err := app.DB.CreateNode(&config.Node{
+		Name: "seed-01", Protocol: "shadowsocks", Server: "127.0.0.1", Port: 8388,
+		Enabled: true, Metadata: map[string]any{"method": "aes-128-gcm", "password": "pw"},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	script := `#!/bin/sh
 case "$1" in
  version) echo 'sing-box version 1.14.0'; exit 0 ;;

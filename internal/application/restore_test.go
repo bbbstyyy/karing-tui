@@ -15,6 +15,9 @@ import (
 
 func startRestoreFixtureCore(t *testing.T, app *App) {
 	t.Helper()
+	// StartCore 会先生成配置；C15 起没有可用节点时生成会 fail-closed，
+	// 所以「启动核心」这个动作本身就以「库里有可用节点」为前提。
+	seedEnabledNode(t, app)
 	script := `#!/bin/sh
 case "$1" in
  version) echo 'sing-box version 1.14.0'; exit 0 ;;

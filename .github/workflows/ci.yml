@@ -86,6 +86,15 @@ jobs:
           "$RUNNER_TEMP/karing-release/karing" backup export "$RUNNER_TEMP/karing-init-backup"
           "$RUNNER_TEMP/karing-release/karing" status --json
           test -x "$KARING_HOME/runtime/bin/sing-box"
+          # C15：还没有任何节点时必须失败（不得静默生成一份全部直连的配置）
+          if "$RUNNER_TEMP/karing-release/karing" config check; then
+            echo "C15：无可用节点时 config check 不应成功" >&2
+            exit 1
+          fi
+          # C15 起「全局没有任何可用节点」会 fail-closed（不再生成一份全部直连的配置），
+          # 所以先补一个最小 Clash 配置建出节点，再验证真实的「生成 + 内核校验」路径。
+          printf 'proxies:\n  - name: ci-node\n    type: trojan\n    server: 127.0.0.1\n    port: 443\n    password: ci-password\n' > "$RUNNER_TEMP/karing-ci-node.yaml"
+          "$RUNNER_TEMP/karing-release/karing" import clash "$RUNNER_TEMP/karing-ci-node.yaml"
           "$RUNNER_TEMP/karing-release/karing" config check
           SINGBOX_BIN="$KARING_HOME/runtime/bin/sing-box" go test -count=1 ./internal/core -run TestIntegrationRealSingBox -v
       - name: 只读命令在未初始化数据目录上必须失败且不留数据库

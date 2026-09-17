@@ -561,7 +561,10 @@ func regenerateAndCheck(app *application.App, ctx context.Context, stdout, stder
 		return 0
 	}
 	if err := app.GenerateConfig(ctx); err != nil {
-		fmt.Fprintln(stderr, "生成配置失败:", err)
+		// application.generateConfig 已经把错误包成「生成配置失败: ...」，
+		// 这里不再叠加同样前缀，否则 C15 的 onboarding 文案会变成
+		// 「生成配置失败: 生成配置失败: 当前没有可用代理节点…」。
+		fmt.Fprintln(stderr, err)
 		return 1
 	}
 	fmt.Fprintf(stdout, "配置已生成: %s\n", app.Paths.Config)
@@ -1528,7 +1531,8 @@ func cmdConfig(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		if err := app.GenerateConfig(ctx); err != nil {
-			fmt.Fprintf(stderr, "生成配置失败: %v\n", err)
+			// 同上：application.generateConfig 已带「生成配置失败:」前缀。
+			fmt.Fprintln(stderr, err)
 			return 1
 		}
 		fmt.Fprintf(stdout, "配置已生成: %s\n", app.Paths.Config)
