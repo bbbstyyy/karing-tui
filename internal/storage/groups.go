@@ -93,13 +93,6 @@ func (d *DB) UpdateProxyGroupRenamed(g *config.ProxyGroup, oldName string) error
 	return tx.Commit()
 }
 
-// replaceGroupMembers 整体替换组成员（独立短事务）。
-func (d *DB) replaceGroupMembers(g *config.ProxyGroup) error {
-	return d.WithTx(context.Background(), func(tx *sql.Tx) error {
-		return replaceGroupMembersTx(tx, g)
-	})
-}
-
 func replaceGroupMembersTx(tx *sql.Tx, g *config.ProxyGroup) error {
 
 	if _, err := tx.Exec(`DELETE FROM proxy_group_members WHERE group_id=?`, g.ID); err != nil {

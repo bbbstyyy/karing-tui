@@ -240,16 +240,9 @@ func (m *Manager) relocateTx(tx *sql.Tx, g *config.RoutingGroup, kind string, po
 	return nil
 }
 
-// applyLayerOrder 按给定顺序把 kind 层的 position 重排为连续值 0..n-1（独立短事务）。
-// 只更新定位列（kind/kind_rank/position），不触碰规则。
-func (m *Manager) applyLayerOrder(kind string, ordered []*config.RoutingGroup) error {
-	return m.DB.WithTx(context.Background(), func(tx *sql.Tx) error {
-		return m.applyLayerOrderTx(tx, kind, ordered)
-	})
-}
-
-// applyLayerOrderTx 是 applyLayerOrder 的事务内版本（C14）：必须经 WithTx
-// 提供的事务执行。afterPlacement 测试注入缝同样在事务内生效——注入错误
+// applyLayerOrderTx 按给定顺序把 kind 层的 position 重排为连续值 0..n-1，
+// 只更新定位列（kind/kind_rank/position），不触碰规则（C14：必须在 WithTx
+// 提供的事务内执行）。afterPlacement 测试注入缝同样在事务内生效——注入错误
 // 会让整个外层事务回滚。
 func (m *Manager) applyLayerOrderTx(tx *sql.Tx, kind string, ordered []*config.RoutingGroup) error {
 	n := 0

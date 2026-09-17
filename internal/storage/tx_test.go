@@ -13,8 +13,6 @@ import (
 
 // C14：WithTx 统一事务封装 + 可写 DSN 的 _txlock=immediate（方案 A）验证。
 
-var errWithTxInjected = errors.New("injected WithTx failure")
-
 // TestWithTxCommitAndRollback fn 正常返回则提交，返回错误则整体回滚。
 func TestWithTxCommitAndRollback(t *testing.T) {
 	db := newTestDB(t)
