@@ -241,12 +241,12 @@ func BenchmarkGroupsSearch5000(b *testing.B) {
 	g := NewGroups(benchApp(b))
 	g.SetSize(140, 40)
 	g.cands = make([]pickCandidate, 0, 5001)
-	g.cands = append(g.cands, pickCandidate{key: "all", label: "全部节点（动态包含所有启用节点）"})
+	g.cands = append(g.cands, newPickCandidate("all", "全部节点（动态包含所有启用节点）"))
 	for i := range 5000 {
-		g.cands = append(g.cands, pickCandidate{
-			key:   fmt.Sprintf("node:%d", i+1),
-			label: fmt.Sprintf("node-%05d (vmess:443) [订阅 A]", i),
-		})
+		g.cands = append(g.cands, newPickCandidate(
+			fmt.Sprintf("node:%d", i+1),
+			fmt.Sprintf("node-%05d (vmess:443) [订阅 A]", i),
+		))
 	}
 	g.pickQuery = "node-01"
 	g.refreshPickItems()

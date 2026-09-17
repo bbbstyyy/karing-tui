@@ -28,9 +28,19 @@ const (
 )
 
 // pickCandidate 成员勾选候选项。
+//
+// search 是 label 的预计算小写副本（C10）：勾选列表每敲一个字符就对全部候选做一次
+// 不区分大小写的包含匹配，把 ToLower 挪到候选列表建立时，而不是在按键路径上对
+// 同一批 label 反复算（5000 候选 × 每键 1 次分配）。构造必须走 newPickCandidate——
+// search 为空的候选将永远匹配不到任何查询词。
 type pickCandidate struct {
-	key   string // "all" / "group:<id>" / "node:<id>"
-	label string
+	key    string // "all" / "group:<id>" / "node:<id>"
+	label  string
+	search string // strings.ToLower(label)，与 label 同源同变
+}
+
+func newPickCandidate(key, label string) pickCandidate {
+	return pickCandidate{key: key, label: label, search: strings.ToLower(label)}
 }
 
 // Groups 代理组管理页：组 CRUD、成员勾选（跨订阅节点/嵌套组/全部节点）、
@@ -384,15 +394,15 @@ func (g *Groups) openPick() {
 
 // buildCandidates 构建候选项：全部节点 + 其他代理组 + 全部节点池。
 func (g *Groups) buildCandidates() {
-	g.cands = []pickCandidate{{key: "all", label: "全部节点（动态包含所有启用节点）"}}
+	g.cands = []pickCandidate{newPickCandidate("all", "全部节点（动态包含所有启用节点）")}
 	for _, grp := range g.groups {
 		if g.cur != nil && grp.ID == g.cur.ID {
 			continue
 		}
-		g.cands = append(g.cands, pickCandidate{
-			key:   "group:" + strconv.FormatInt(grp.ID, 10),
-			label: "[组] " + grp.Name + " (" + grp.Type + ")",
-		})
+		g.cands = append(g.cands, newPickCandidate(
+			"group:"+strconv.FormatInt(grp.ID, 10),
+			"[组] "+grp.Name+" ("+grp.Type+")",
+		))
 	}
 	for _, n := range g.nodes {
 		src := "手动"
@@ -402,18 +412,23 @@ func (g *Groups) buildCandidates() {
 				break
 			}
 		}
-		g.cands = append(g.cands, pickCandidate{
-			key:   "node:" + strconv.FormatInt(n.ID, 10),
-			label: fmt.Sprintf("%s (%s:%d) [%s]", n.Name, n.Protocol, n.Port, src),
-		})
+		g.cands = append(g.cands, newPickCandidate(
+			"node:"+strconv.FormatInt(n.ID, 10),
+			fmt.Sprintf("%s (%s:%d) [%s]", n.Name, n.Protocol, n.Port, src),
+		))
 	}
 }
 
 // refreshPickItems 按勾选状态重建勾选列表项（已勾选的排前面，保持顺序）。
+//
+// 匹配读候选上的 search（建候选列表时算好的 label 小写副本，C10），query 的 ToLower
+// 在循环外做一次；循环内不得再出现 ToLower 或字符串拼接——TestMemberPickerSearch-
+// ReadsCachedSearchKey 用哨兵钉住了这一点。
 func (g *Groups) refreshPickItems() {
+	query := strings.ToLower(g.pickQuery)
 	var items, keys []string
 	for _, c := range g.cands {
-		if !strings.Contains(strings.ToLower(c.label), strings.ToLower(g.pickQuery)) {
+		if !strings.Contains(c.search, query) {
 			continue
 		}
 		mark := "[ ] "
@@ -768,7 +783,7 @@ func (g *Groups) curMember() (pickCandidate, bool) {
 		return pickCandidate{}, false
 	}
 	key := g.members[g.list.Cursor].MemberKey()
-	return pickCandidate{key: key, label: g.memberLabel(key)}, true
+	return newPickCandidate(key, g.memberLabel(key)), true
 }
 
 // Runtime feedback is bound to the core instance that supplied it.

@@ -877,6 +877,121 @@ func TestMemberPickerSearchEscapeRestoresFilterAndPosition(t *testing.T) {
 	}
 }
 
+// openMemberPicker 从代理组列表进入第一个组的详情，再打开成员勾选模式。
+func openMemberPicker(t *testing.T, app *application.App) *Groups {
+	t.Helper()
+	g := NewGroups(app)
+	g.SetSize(80, 21)
+	g.reload()
+	g.Update(tea.KeyMsg{Type: tea.KeyEnter}) // 进入组详情
+	g.Update(chars("m"))                     // 打开成员勾选
+	if g.mode != groupsPick {
+		t.Fatal("未能进入成员勾选模式")
+	}
+	return g
+}
+
+// pickItemsReference 是勾选列表过滤的独立参照实现：只读候选的 label，不复用
+// refreshPickItems 里的任何派生字段（C10 之前它就是生产实现的那两行）。
+func pickItemsReference(cands []pickCandidate, query string, set map[string]bool) []string {
+	lower := strings.ToLower(query)
+	var items []string
+	for _, c := range cands {
+		if !strings.Contains(strings.ToLower(c.label), lower) {
+			continue
+		}
+		mark := "[ ] "
+		if set[c.key] {
+			mark = "[x] "
+		}
+		items = append(items, mark+c.label)
+	}
+	return items
+}
+
+// TestMemberPickerSearchMatchesReferenceSemantics 用独立参照实现钉住勾选列表的过滤语义：
+// 「Label 不区分大小写地包含查询词」。C10 只是把 ToLower 的结果挪到候选列表建立时，
+// 语义必须逐项一致，勾选状态也不得影响结果集合。
+//
+// 参照实现直接写原始表达式，因此它在本项改动前后都通过——它证明的是「行为没变」；
+// 「改动真的落地」由 TestMemberPickerSearchReadsCachedSearchKey 负责。
+func TestMemberPickerSearchMatchesReferenceSemantics(t *testing.T) {
+	app := pageFixture(t)
+	for _, n := range []*config.Node{
+		{Name: "Hong Kong 01", Protocol: "http", Server: "hk1.example.com", Port: 443},
+		{Name: "东京 03", Protocol: "http", Server: "jp3.example.com", Port: 8080},
+		{Name: "UPPER", Protocol: "http", Server: "lo.example.com", Port: 80},
+	} {
+		if err := app.Proxy.SaveManual(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g := openMemberPicker(t, app)
+	last := g.cands[len(g.cands)-1].key
+	g.pickSet[last] = true // 有勾选项，且勾选不得改变搜索结果集合
+
+	// 勾选列表的 label 是「名称 (协议:端口) [来源]」加组前缀，不含 server，
+	// 因此这里只放会真正出现在 label 里的词。
+	queries := []string{"", "hong", "HONG", "01", "东京", "http", "upper", "[组]", "节点", "不存在"}
+	matchedAny := false
+	for _, q := range queries {
+		g.pickQuery = q
+		g.refreshPickItems()
+		want := pickItemsReference(g.cands, q, g.pickSet)
+		if len(want) > 0 {
+			matchedAny = true
+		}
+		if !slices.Equal(g.pickList.Items, want) {
+			t.Fatalf("关键词 %q：勾选列表 %v，参照实现 %v", q, g.pickList.Items, want)
+		}
+	}
+	if !matchedAny {
+		t.Fatal("没有任何关键词命中，前面对照失去意义")
+	}
+}
+
+// TestMemberPickerSearchReadsCachedSearchKey 钉住 C10 的实现要点：过滤循环读的是
+// 候选列表建立时算好的 pickCandidate.search，而不是每次按键当场对 label 做 ToLower。
+//
+// 手法与 C8 的 TestProfilesFilterReadsCachedSearchText 一致：把某个候选的 search
+// 换成 label 里不含的哨兵值，再用哨兵搜索——命中即证明读的是缓存字段。上面那条
+// 对照测试在旧实现上同样通过，无法区分两者。（实测：把过滤循环临时改回当场
+// ToLower，本测试报「未命中」而对照测试仍通过。）
+//
+// 末尾反向核对：哨兵不得出现在任何 label 里，否则命中可能来自现算。
+func TestMemberPickerSearchReadsCachedSearchKey(t *testing.T) {
+	app := pageFixture(t)
+	for _, name := range []string{"alpha", "bravo", "charlie"} {
+		if err := app.Proxy.SaveManual(&config.Node{Name: name, Protocol: "http", Server: "example.invalid", Port: 80}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g := openMemberPicker(t, app)
+
+	const canary = "zz-canary-zz"
+	patched := false
+	for i := range g.cands {
+		if strings.Contains(g.cands[i].label, "bravo") {
+			g.cands[i].search = canary
+			patched = true
+		}
+	}
+	if !patched {
+		t.Fatal("没找到用于打哨兵的候选")
+	}
+
+	g.pickQuery = canary
+	g.refreshPickItems()
+	if len(g.pickList.Items) != 1 || !strings.Contains(g.pickList.Items[0], "bravo") {
+		t.Fatalf("过滤没有使用候选项上缓存的小写搜索键: %v", g.pickList.Items)
+	}
+	for _, c := range g.cands {
+		if strings.Contains(c.label, canary) {
+			t.Fatal("哨兵出现在 label 里，断言失去意义")
+		}
+	}
+}
+
 func TestLogsKeepAbsoluteAnchorAsNewLinesArrive(t *testing.T) {
 	app := pageFixture(t)
 	l := NewLogs(app)
