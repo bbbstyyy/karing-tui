@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/bbbstyyy/karing-tui/internal/application"
 	"github.com/bbbstyyy/karing-tui/internal/catalog"
@@ -112,38 +113,111 @@ func ruleTypeChoices(logical bool) []components.Option {
 	return choices
 }
 
-func referenceChoices(app *application.App, typ, current string) []components.Option {
+// --- 值字段候选项 ---
+//
+// referenceChoices 把两类完全不同的数据源拼在一起：
+//
+//   - **静态**：内嵌分类库（geosite ≈1953、geoip ≈278、acl ≈171 条）。它随二进制
+//     发行，运行期不会变，只有程序版本/内嵌清单变化才失效，因此可以缓存派生结果。
+//   - **动态**：数据库里的规则集（rule_set 类型）。用户随时增删，必须每次现查。
+//
+// catalog 层已经用 sync.Once 缓存了底层清单，但「分类码 → components.Option」
+// 这层转换仍是每次 O(2400)、每条一次 "kind:code" 拼接的重复劳动。放在 TUI 层缓存
+// 是因为 catalog 是零依赖叶子包（catalog/catalog.go:10），不能反向引用 components。
+
+// ruleRefKey 区分同一份分类库数据的两种选项形态：geosite / geoip 用分类码本身
+// （"cn"），rule_set 用完整引用（"geosite:cn"）。kind 为空表示全部种类。
+type ruleRefKey struct {
+	kind    string
+	refForm bool
+}
+
+var (
+	ruleRefMu    sync.Mutex
+	ruleRefCache = map[ruleRefKey][]components.Option{}
+)
+
+// staticRuleRefOptions 返回静态分类库的候选项（进程级缓存，首次命中时构造）。
+//
+// 返回值是**共享只读切片**：容量已冻结（三段切片表达式），调用方 append 时会另开
+// 底层数组，不会写穿缓存；表单也只读 Options（过滤、校验、渲染都只遍历）。
+func staticRuleRefOptions(kind string, refForm bool) []components.Option {
+	key := ruleRefKey{kind: kind, refForm: refForm}
+	ruleRefMu.Lock()
+	defer ruleRefMu.Unlock()
+	if cached, ok := ruleRefCache[key]; ok {
+		return cached
+	}
+	refs := catalog.Search(kind, "", 0)
+	built := make([]components.Option, 0, len(refs))
+	for _, ref := range refs {
+		value := ref.Code
+		if refForm {
+			value = ref.String()
+		}
+		built = append(built, components.Option{Value: value, Label: ref.String()})
+	}
+	built = built[:len(built):len(built)]
+	ruleRefCache[key] = built
+	return built
+}
+
+// ruleSetChoices 读取数据库里的规则集。动态数据，每次调用都重新查询——
+// 表单打开时新建的规则集必须立刻可见。
+func ruleSetChoices(app *application.App) []components.Option {
+	sets, err := app.DB.ListRuleSets()
+	if err != nil {
+		return nil
+	}
 	var choices []components.Option
-	kind := ""
-	if typ == "geosite" || typ == "geoip" {
-		kind = typ
-	}
-	if typ == "rule_set" {
-		if sets, err := app.DB.ListRuleSets(); err == nil {
-			for _, rs := range sets {
-				if rs.Enabled {
-					choices = append(choices, components.Option{Value: rs.Tag, Label: rs.Name + " · " + rs.Tag})
-				}
-			}
-		}
-	}
-	for _, ref := range catalog.Search(kind, "", 0) {
-		value := ref.String()
-		if typ != "rule_set" {
-			value = ref.Code
-		}
-		choices = append(choices, components.Option{Value: value, Label: ref.String()})
-	}
-	// Keep valid legacy tag references selectable when editing an older model.
-	for _, v := range strings.Split(current, ",") {
-		v = strings.TrimSpace(v)
-		if typ == "rule_set" {
-			if ref, ok := catalog.Parse(v); ok && v != ref.String() {
-				choices = append(choices, components.Option{Value: v, Label: ref.String() + " · 兼容标识 " + v})
-			}
+	for _, rs := range sets {
+		if rs.Enabled {
+			choices = append(choices, components.Option{Value: rs.Tag, Label: rs.Name + " · " + rs.Tag})
 		}
 	}
 	return choices
+}
+
+// legacyRuleRefChoices 保留旧模型里合法的派生 tag 引用（"geosite-cn" 这类写法），
+// 使编辑老数据时原值仍可选中。只在 rule_set 类型下有意义。
+func legacyRuleRefChoices(typ, current string) []components.Option {
+	if typ != "rule_set" {
+		return nil
+	}
+	var choices []components.Option
+	for _, v := range strings.Split(current, ",") {
+		v = strings.TrimSpace(v)
+		if ref, ok := catalog.Parse(v); ok && v != ref.String() {
+			choices = append(choices, components.Option{Value: v, Label: ref.String() + " · 兼容标识 " + v})
+		}
+	}
+	return choices
+}
+
+func referenceChoices(app *application.App, typ, current string) []components.Option {
+	kind, refForm := "", false
+	switch typ {
+	case "geosite", "geoip":
+		kind = typ
+	case "rule_set":
+		refForm = true
+	}
+	static := staticRuleRefOptions(kind, refForm)
+
+	var dynamic []components.Option
+	if typ == "rule_set" {
+		dynamic = ruleSetChoices(app)
+	}
+	legacy := legacyRuleRefChoices(typ, current)
+	if len(dynamic) == 0 && len(legacy) == 0 {
+		// 纯静态路径：直接交出共享缓存，零分配。
+		return static
+	}
+	// 顺序与改动前一致：数据库条目 → 分类库条目 → 兼容引用。
+	choices := make([]components.Option, 0, len(dynamic)+len(static)+len(legacy))
+	choices = append(choices, dynamic...)
+	choices = append(choices, static...)
+	return append(choices, legacy...)
 }
 
 // syncRuleValueOnTypeChange 在「类型」字段真的变化时才重配值字段。

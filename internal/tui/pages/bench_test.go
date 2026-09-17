@@ -8,6 +8,7 @@ import (
 	"github.com/bbbstyyy/karing-tui/internal/application"
 	"github.com/bbbstyyy/karing-tui/internal/config"
 	"github.com/bbbstyyy/karing-tui/internal/platform"
+	"github.com/bbbstyyy/karing-tui/internal/tui/components"
 )
 
 // benchApp 构造一个真实但为空的应用实例（临时目录 + 完整迁移），
@@ -156,6 +157,51 @@ func BenchmarkRuleFormKeyPress(b *testing.B) {
 		_, _ = r.Update(key)
 	}
 }
+
+// BenchmarkRuleFormOpenGeosite 度量「表单打开 / 类型切换」时重建值字段选项的成本。
+//
+// geosite 的候选项来自编译期固定的内嵌清单，重复打开表单却在反复把同一份静态
+// 数据转成 []components.Option。C6 缓存该转换后，热身后 allocs/op 应降到 0。
+func BenchmarkRuleFormOpenGeosite(b *testing.B) {
+	r := NewRules(benchApp(b))
+	r.SetSize(140, 40)
+	r.cur = &config.RoutingGroup{ID: 1, Name: "基准组", Target: "DIRECT"}
+	r.openForm("add-rule")
+	r.form.SetValueByKey("type", "geosite")
+	configureRuleValue(r.app, &r.form)
+	if len(r.form.Field("value").Options) < 1000 {
+		b.Fatal("geosite 选项为空，基准失去意义")
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		configureRuleValue(r.app, &r.form)
+	}
+}
+
+// BenchmarkReferenceChoicesGeosite 度量静态分类库 → 表单选项的转换本身。
+func BenchmarkReferenceChoicesGeosite(b *testing.B) {
+	app := benchApp(b)
+	b.ReportAllocs()
+	for b.Loop() {
+		optionsSink = referenceChoices(app, "geosite", "")
+	}
+}
+
+// BenchmarkReferenceChoicesRuleSet 度量混合路径：数据库条目是动态的（每次都要查），
+// 分类库那一半是静态的（应命中缓存）。C6 只能消掉后者，allocs/op 应明显下降但不为 0。
+func BenchmarkReferenceChoicesRuleSet(b *testing.B) {
+	app := benchApp(b)
+	if err := app.DB.CreateRuleSet(&config.RuleSet{Name: "基准集", Tag: "bench-set", SourceType: "remote", Format: "srs", URL: "https://example.invalid/x.srs", Enabled: true}); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		optionsSink = referenceChoices(app, "rule_set", "")
+	}
+}
+
+// optionsSink 阻止编译器把基准里被丢弃的返回值优化掉。
+var optionsSink []components.Option
 
 // BenchmarkCatalogView 度量内置分类库浏览「每次按键」的成本（reloadCatalog + 渲染）。
 //

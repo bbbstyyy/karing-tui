@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bbbstyyy/karing-tui/internal/application"
+	"github.com/bbbstyyy/karing-tui/internal/catalog"
 	"github.com/bbbstyyy/karing-tui/internal/clashapi"
 	"github.com/bbbstyyy/karing-tui/internal/config"
 	"github.com/bbbstyyy/karing-tui/internal/platform"
@@ -695,4 +697,107 @@ exit 1
 	if d.active {
 		t.Fatal("deactivation left the page active")
 	}
+}
+
+// C6：geosite / geoip 的候选项来自**编译期固定**的内嵌分类库，转换一次后必须命中缓存；
+// 而 rule_set 与它共用同一个函数，其中数据库条目是动态的，不能被一起缓存。
+//
+// 判定手法用分配数而不是切片地址：缓存命中时该路径零分配，而把 1953 条分类码重新
+// 拼成 []components.Option 必然分配。地址稳定不作为验收标准。
+func TestRuleReferenceChoicesStaticCache(t *testing.T) {
+	app := pageFixture(t)
+	r := NewRules(app)
+	r.SetSize(120, 30)
+	r.cur = &config.RoutingGroup{ID: 1, Name: "基准组", Target: "DIRECT"}
+	r.openForm("add-rule")
+
+	want := geositeOptionExpectation(t)
+
+	r.form.SetValueByKey("type", "geosite")
+	configureRuleValue(r.app, &r.form)
+	field := r.form.Field("value")
+	if field == nil || !field.Choice || !field.Multi {
+		t.Fatal("geosite 类型没有把值字段配成多选")
+	}
+	if !slices.Equal(field.Options, want) {
+		t.Fatalf("geosite 选项与分类库不一致：得到 %d 条，期望 %d 条", len(field.Options), len(want))
+	}
+	// 反向核对：这条期望来自分类库本身，不是空的（否则 0 == 0 会假通过）。
+	if len(want) != catalog.Count("geosite") || !hasOption(field, "cn") {
+		t.Fatalf("geosite 期望 %d 条且含 cn，实际 %d 条", catalog.Count("geosite"), len(want))
+	}
+
+	// 再配一次（等价于重开表单 / 从别的类型切回 geosite）：静态转换不得重跑。
+	var short bool
+	if n := testing.AllocsPerRun(5, func() {
+		optionsSink = referenceChoices(app, "geosite", "")
+		if len(optionsSink) != len(want) {
+			short = true
+		}
+	}); n != 0 || short {
+		t.Fatalf("geosite 静态选项在缓存命中路径上仍有分配：%.1f allocs/op（期望 0）", n)
+	}
+
+	// 两种取值形态不能互相串味：geosite 用分类码（cn），rule_set 用完整引用（geosite:cn）。
+	r.form.SetValueByKey("type", "rule_set")
+	configureRuleValue(r.app, &r.form)
+	if !hasOption(r.form.Field("value"), "geosite:cn") {
+		t.Fatal("rule_set 选项缺少分类库引用（完整引用形态）")
+	}
+	if hasOption(r.form.Field("value"), "cn") {
+		t.Fatal("rule_set 选项混入了分类码形态的取值")
+	}
+	r.form.SetValueByKey("type", "geosite")
+	configureRuleValue(r.app, &r.form)
+	if !slices.Equal(r.form.Field("value").Options, want) {
+		t.Fatal("geosite 的缓存被 rule_set 形态污染")
+	}
+
+	// rule_set 的动态部分不能被缓存：新建的规则集必须立刻出现在选项里。
+	if err := app.DB.CreateRuleSet(&config.RuleSet{Name: "新建集", Tag: "fresh-set", SourceType: "remote", Format: "srs", URL: "https://example.invalid/y.srs", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	r.form.SetValueByKey("type", "rule_set")
+	configureRuleValue(r.app, &r.form)
+	if !hasOption(r.form.Field("value"), "fresh-set") {
+		t.Fatal("rule_set 选项没有反映新建的规则集（动态部分被误缓存）")
+	}
+	// 反向核对：数据库里禁用的规则集不出现（防止断言被「全量列出」蒙对）。
+	if err := app.DB.CreateRuleSet(&config.RuleSet{Name: "禁用集", Tag: "off-set", SourceType: "remote", Format: "srs", URL: "https://example.invalid/z.srs", Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	configureRuleValue(r.app, &r.form)
+	if hasOption(r.form.Field("value"), "off-set") {
+		t.Fatal("rule_set 选项带上了已禁用的规则集")
+	}
+
+	// 表单交互（打开选项面板 + 搜索过滤）必须把 Options 当作只读。
+	r.form.SetValueByKey("type", "geosite")
+	configureRuleValue(r.app, &r.form)
+	r.form.FocusKey("value")
+	r.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if !strings.Contains(r.View(), "Space 勾选") {
+		t.Fatal("没有打开多选选项面板，只读性断言会假通过")
+	}
+	for _, ch := range "cn" {
+		r.Update(chars(string(ch)))
+	}
+	if !slices.Equal(r.form.Field("value").Options, want) {
+		t.Fatal("表单交互改写了共享的静态选项")
+	}
+	// 共享缓存本身也必须原样：换一个表单再配一次应得到同一份内容。
+	if got := referenceChoices(app, "geosite", ""); !slices.Equal(got, want) {
+		t.Fatal("共享静态缓存被前一次表单交互改写")
+	}
+}
+
+// geositeOptionExpectation 按分类库现状构造期望选项（取值用分类码）。
+func geositeOptionExpectation(t *testing.T) []components.Option {
+	t.Helper()
+	refs := catalog.Search("geosite", "", 0)
+	want := make([]components.Option, 0, len(refs))
+	for _, ref := range refs {
+		want = append(want, components.Option{Value: ref.Code, Label: ref.String()})
+	}
+	return want
 }
