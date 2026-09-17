@@ -237,7 +237,7 @@ func cmdHeadless(action string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "未知参数 %q\n用法: karing %s [--json]\n", arg, action)
 		return 2
 	}
-	paths, err := platform.NewPaths()
+	paths, err := newPaths(stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "初始化数据目录失败:", err)
 		return 1
@@ -784,9 +784,26 @@ func routeMove(app *application.App, args []string, stdout, stderr io.Writer) in
 	return 0
 }
 
+// newPaths 是 CLI 获取数据目录的唯一入口：统一把 platform 的归属告警
+// （KARING_HOME 指向了一个与本应用无关的既有非空目录）向 stderr 输出一次。
+//
+// 让 platform 包自己打印是不行的——它不认识 stdout/stderr 约定；而每个
+// 子命令各写一遍也不行——漏掉一处，用户就永远看不到（V5-3 之前
+// Paths.RootWarning 全仓库零消费点，赋值了却从没展示过）。
+func newPaths(stderr io.Writer) (*platform.Paths, error) {
+	paths, err := platform.NewPaths()
+	if err != nil {
+		return nil, err
+	}
+	if paths.RootWarning != "" {
+		fmt.Fprintf(stderr, "警告: %s\n", paths.RootWarning)
+	}
+	return paths, nil
+}
+
 // withApp 初始化应用并执行 fn；初始化失败时输出错误并返回 1。
 func withApp(stderr io.Writer, fn func(*application.App) int) int {
-	paths, err := platform.NewPaths()
+	paths, err := newPaths(stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "初始化数据目录失败:", err)
 		return 1
@@ -811,7 +828,7 @@ func withApp(stderr io.Writer, fn func(*application.App) int) int {
 // instance lock. Commands that mutate the database, generated config, or
 // caches must use this path so they cannot race with the TUI/headless owner.
 func withExclusiveApp(stderr io.Writer, fn func(*application.App) int) int {
-	paths, err := platform.NewPaths()
+	paths, err := newPaths(stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "初始化数据目录失败:", err)
 		return 1
@@ -1323,7 +1340,7 @@ func cmdBackup(args []string, stdout, stderr io.Writer) int {
 
 // backupImport 检查无其他实例占用后恢复备份，并重新生成配置校验。
 func backupImport(archive string, stdout, stderr io.Writer) int {
-	paths, err := platform.NewPaths()
+	paths, err := newPaths(stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "初始化数据目录失败:", err)
 		return 1

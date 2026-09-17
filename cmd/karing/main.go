@@ -41,6 +41,14 @@ func main() {
 	}
 	defer app.Close()
 
+	// KARING_HOME 指向了与本应用无关的既有非空目录时，把它交给应用日志
+	// （Logs 页可见）。这里只取一次、启动阶段记录，不在 View() 里做任何
+	// 文件系统检查，也不向 stderr 打印——TUI 会立刻进入 alt-screen，
+	// 打上去的字符会被覆盖掉。
+	if paths.RootWarning != "" {
+		app.AppLog.AppendLine("警告: " + paths.RootWarning)
+	}
+
 	// 启动时生成一次配置，保证 Dashboard 有配置状态可展示。
 	if err := app.GenerateConfig(context.Background()); err != nil {
 		// err 已带「生成配置失败:」前缀（application.generateConfig），不再叠加。
