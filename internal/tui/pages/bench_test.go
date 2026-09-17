@@ -2,6 +2,7 @@ package pages
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,15 +83,54 @@ func benchNodes(n int, scrambled bool) []*config.Node {
 	return nodes
 }
 
-func benchProfilesNodes(b *testing.B, nodes int, scrambled bool) *Profiles {
+// benchNodesMixed 与 benchNodes 规模、排列完全一致，只把名称与服务器改成**含大写**的形态。
+//
+// 存在的理由不是"更像真实数据"，而是 C8 的目标成本恰好被全小写夹具藏住了：
+// strings.ToLower 在「没有大写字母」的 ASCII 串上**直接返回原串**（零分配、单趟扫描），
+// 于是每按键 N×2 次 ToLower 在基准上看起来完全免费。真实订阅的节点名（"Hong Kong 01"）
+// 与主机名普遍含大写，那才是 C8 要消掉的成本，所以这条基准必须单独一份夹具。
+//
+// 变换只加共享前缀/后缀与整体大写：保持原有相对顺序，让 scrambled=false 的版本
+// 仍然是名称序（与 benchNodes 的语义对齐）。
+func benchNodesMixed(n int, scrambled bool) []*config.Node {
+	nodes := benchNodes(n, scrambled)
+	for _, node := range nodes {
+		node.Name = strings.ToUpper(node.Name)
+		node.Server = "Relay." + node.Server + ".Example.ORG"
+	}
+	return nodes
+}
+
+// benchProfilesNodesFrom 让夹具来源与搜索词可替换，其余装配完全一致。
+//
+// 搜索词是独立参数而不是写死 "node"，是为了能构造「命中 0 条」的场景：
+// 命中为空时 rebuildNodeTable 建不出任何行、分配近乎为 0，于是这条基准量的
+// 就只剩过滤循环本身的扫描成本——这正是 C8 要消掉的那部分，不会被建行的
+// 分配淹没。
+func benchProfilesNodesFrom(b *testing.B, nodes int, scrambled bool, build func(int, bool) []*config.Node, query string) *Profiles {
 	b.Helper()
 	p := NewProfiles(benchApp(b))
 	p.SetSize(140, 40)
 	p.mode = profilesNodes
-	p.nodes = benchNodes(nodes, scrambled)
-	p.search = "node"
+	p.nodes = build(nodes, scrambled)
+	p.search = query
 	p.resortNodes() // 装载路径的预排序（C7）：放在计时之外，基准只量按键成本
 	p.applyNodeFilter()
+	return p
+}
+
+func benchProfilesNodes(b *testing.B, nodes int, scrambled bool) *Profiles {
+	b.Helper()
+	p := benchProfilesNodesFrom(b, nodes, scrambled, benchNodes, "node")
+	if len(p.filtered) == 0 {
+		b.Fatal("过滤后无节点，基准失去意义")
+	}
+	return p
+}
+
+func benchProfilesNodesMixed(b *testing.B, nodes int, scrambled bool) *Profiles {
+	b.Helper()
+	p := benchProfilesNodesFrom(b, nodes, scrambled, benchNodesMixed, "node")
 	if len(p.filtered) == 0 {
 		b.Fatal("过滤后无节点，基准失去意义")
 	}
@@ -122,6 +162,43 @@ func BenchmarkProfilesFilterScrambled(b *testing.B) {
 	for _, nodes := range []int{100, 1000, 5000, 10000} {
 		b.Run(fmt.Sprintf("N%d", nodes), func(b *testing.B) {
 			p := benchProfilesNodes(b, nodes, true)
+			b.ReportAllocs()
+			for b.Loop() {
+				p.applyNodeFilter()
+			}
+		})
+	}
+}
+
+// BenchmarkProfilesFilterMixedCase 度量「搜索按键」在**含大写**节点上的完整成本
+// （过滤 + 建行），C8 前后可直接对比。
+//
+// 夹具必须含大写：ToLower 在无大写的 ASCII 串上直接返回原串，零分配，
+// 用原夹具根本量不到 C8 要消掉的那笔分配（见 benchNodesMixed）。
+func BenchmarkProfilesFilterMixedCase(b *testing.B) {
+	for _, nodes := range []int{100, 1000, 5000, 10000} {
+		b.Run(fmt.Sprintf("N%d", nodes), func(b *testing.B) {
+			p := benchProfilesNodesMixed(b, nodes, true)
+			b.ReportAllocs()
+			for b.Loop() {
+				p.applyNodeFilter()
+			}
+		})
+	}
+}
+
+// BenchmarkProfilesFilterScanMixedCase 把「过滤循环本身」从建行里剥出来单独量：
+// 搜索词命中 0 条，于是 rebuildNodeTable 没有任何行可建，剩余成本全是
+// 「扫描 N 个节点 + 每节点对 Name/Server 各做一次 ToLower」。
+//
+// C8 之前约 N×2 allocs/op，之后应为 0——这是本项最干净的判据。
+func BenchmarkProfilesFilterScanMixedCase(b *testing.B) {
+	for _, nodes := range []int{100, 1000, 5000, 10000} {
+		b.Run(fmt.Sprintf("N%d", nodes), func(b *testing.B) {
+			p := benchProfilesNodesFrom(b, nodes, true, benchNodesMixed, "zzzz-no-such-node")
+			if len(p.filtered) != 0 {
+				b.Fatalf("夹具应当命中 0 条，实际 %d 条", len(p.filtered))
+			}
 			b.ReportAllocs()
 			for b.Loop() {
 				p.applyNodeFilter()

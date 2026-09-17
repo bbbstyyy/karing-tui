@@ -55,7 +55,8 @@ type Profiles struct {
 	protoFilter string         // "" = 全部
 	subFilter   string         // "" = 全部；"手动"；或订阅名
 	sortBy      string         // name / latency
-	sortedNodes []*config.Node // 装载时按 sortBy 排好一次的展示顺序来源（C7）
+	sortedNodes []nodeView     // 装载时按 sortBy 排好一次的展示顺序来源，并带上搜索用小写键（C7 / C8）
+	sortBuf     []*config.Node // 预排序用的指针暂存区，理由见 resortNodes
 	filtered    []*config.Node // 过滤结果，顺序直接取自 sortedNodes，过滤路径不再排序
 
 	form      components.Form
@@ -68,6 +69,39 @@ type Profiles struct {
 	err    error
 	status string
 	busy   bool
+}
+
+// nodeView 是节点列表的展示期视图模型（C8）。
+//
+// 它把「两次装载之间不会变化」的派生值提前算好，从**每次按键**的过滤循环里搬走：
+// Name / Server 各自的小写副本。过滤因此退化成两次 strings.Contains，循环内不再
+// 出现任何 ToLower。
+//
+// 为什么值得缓存：真实订阅的节点名普遍含大写（"Hong Kong 01"、机场常用的
+// "HK-01"），而 strings.ToLower 只在**无大写字母**的 ASCII 串上才零分配地原样
+// 返回；只要含一个大写字母，它就要新分配一个字符串。5000 节点 × 每次按键 × 两个
+// 字段 ≈ 每次按键 1 万次分配（实测 10001 allocs/op、281 KB/op、411 µs/op），
+// 正是 C8 要消掉的成本。注意原基准夹具的名称与地址**全小写**，把这笔成本整个藏住
+// 了——所以 C8 另配了 benchNodesMixed 夹具，见 bench_test.go。
+//
+// 为什么是两个字段，而不是清单原文建议的单个 searchText = ToLower(Name + "\x00"
+// + Server)：拼接结果是一个**新字符串**，与有没有大写无关，因此即使数据全小写也
+// 必须每节点每次装载分配一次。实测在原本全小写、0 allocs/op 的 ResortScrambled
+// 夹具上，拼接方案退化为 N 次分配（N=5000 → 5000 allocs/op，611 µs → 846 µs），
+// 而这笔开销落在每次启用切换、每次测速结束后的 reload 上。分成两个字段后，小写
+// 数据的 ToLower 直接返回原串（仍然 0 allocs/op），只有真正含大写、即真正需要
+// 复制时才付这一次。
+// 附带好处：逐字段比对从结构上就不可能出现「名称末尾 + 地址开头」的跨字段误匹配，
+// 连分隔符都不需要选。（测试仍保留 "a hk1" 探针，用来挡住今后把两个字段重新拼起来
+// 的改动：TestProfilesSearchTextMatchesReferenceSemantics。）
+//
+// 失效条件：Name / Server 变化后必须重建。改这两个字段的入口（手动节点表单保存、
+// 分享链接导入、订阅更新）都会经由 reload → reloadNodes → resortNodes 落到唯一的
+// 重建点，见 resortNodes 注释。
+type nodeView struct {
+	*config.Node
+	lowerName   string // strings.ToLower(Name)，小写数据下与原串同一份内存
+	lowerServer string // strings.ToLower(Server)
 }
 
 // NewProfiles 创建 Profiles 页。
@@ -411,7 +445,10 @@ func (p *Profiles) reloadNodes() {
 	p.applyNodeFilter()
 }
 
-// resortNodes 是**唯一**的重排入口（C7）。
+// resortNodes 是**唯一**的「重建预排序视图」入口（C7 排序 + C8 搜索键）。
+//
+// 它同时做两件事：由 p.nodes 重建 nodeView（顺带算好两个小写副本），再按 sortBy 排序。
+// 两件事必须绑在一起，因为它们共享同一个失效条件——排序键变化，以及 Name/Server 变化。
 //
 // 重排只在「排序键的输入发生变化」时才有意义，这样的时机只有三处：
 //
@@ -420,17 +457,41 @@ func (p *Profiles) reloadNodes() {
 //  2. 切换排序键（"o"）。
 //  3. 今后若新增绕过 reloadNodes 直接改写 p.nodes 的路径，必须同时调用本函数。
 //
+// C8 把 nodeView 的转换放在这里，而不是清单原文建议的 reloadNodes：resortNodes 才是
+// 唯一把 p.nodes 变成 sortedNodes 的地方，而第 2 条触发点（切排序键）**不经过**
+// reloadNodes——若转换只做在 reloadNodes，切排序键后 sortedNodes 里就会是两份来源的
+// 混合视图。放在这里，不变量只有一条：sortedNodes 永远由本函数产出。
+//
 // 用稳定排序而非它替换掉的插入排序：两者输出完全一致（同键保持原有相对顺序），
 // 但最坏复杂度从 O(N²) 降到 O(N log N)。**不要改回手写插入排序**——名称无序的
 // 5000 节点订阅（真实订阅的常态）会让每次 reload 多付十几毫秒，而 reload 发生在
 // 每次启用切换、每次测速结束之后。
 func (p *Profiles) resortNodes() {
-	p.sortedNodes = append(p.sortedNodes[:0], p.nodes...)
+	// 排序在 8 字节的指针暂存区上做，再按结果构造视图。
+	//
+	// 直接排 []nodeView 也能得到同样结果，但 nodeView 有 40 字节（指针 + 两个
+	// string header），symMerge 的每次交换都要多搬 32 字节：N=5000 实测
+	// resortNodes 611 µs → 1.11 ms（+82%），而这笔开销落在每次启用切换、每次
+	// 测速结束、每次切排序键之后的 reload 上。C7 把排序从按键路径挪到 reload 路径
+	// 是为了省时间，不是为了换一个地方变慢——所以宁可多一趟 O(N) 建视图。
+	// （指针暂存后为 817 µs / 0 allocs/op，剩下的 +206 µs 是建视图本身的固定
+	// 成本，也是任何 ViewModel 方案都躲不掉的。）
+	p.sortBuf = append(p.sortBuf[:0], p.nodes...)
 	if p.sortBy == "latency" {
-		sortNodesByLatency(p.sortedNodes)
+		sortNodesByLatency(p.sortBuf)
 	} else {
-		sortNodesByName(p.sortedNodes)
+		sortNodesByName(p.sortBuf)
 	}
+
+	views := p.sortedNodes[:0]
+	for _, n := range p.sortBuf {
+		views = append(views, nodeView{
+			Node:        n,
+			lowerName:   strings.ToLower(n.Name),
+			lowerServer: strings.ToLower(n.Server),
+		})
+	}
+	p.sortedNodes = views
 }
 
 // applyNodeFilter 对**已排好序**的 p.sortedNodes 顺序扫描过滤，得到 p.filtered 后
@@ -439,6 +500,14 @@ func (p *Profiles) resortNodes() {
 // 这里刻意**不排序**：搜索/协议/订阅筛选都不改变排序键，重新排序只是把 O(N) 抬成
 // O(N²)（旧实现是插入排序，5000 个名称无序节点实测 13.9ms/按键，已越过 16ms 帧预算）。
 // 需要重排时由调用方显式调用 resortNodes，触发点见其注释。
+//
+// 搜索比对只用视图里装载期算好的 nv.lowerName / nv.lowerServer（C8），循环内
+// **不得**再出现 ToLower——那是每按键 N×2 次分配。p.search 自身的 ToLower 每次
+// 调用算一次，不在循环里，可以保留。
+//
+// 两个字段分开比对，与改动前的表达式结构逐字对应（名称不中才比地址），因此语义
+// 完全一致，同时天然杜绝跨字段误匹配。**不要**把两个字段拼成一个字符串来省一次
+// Contains：那既会让每次装载多付一次分配，又会引入跨字段误匹配（见 nodeView 注释）。
 func (p *Profiles) applyNodeFilter() {
 	subIDByName := map[string]int64{}
 	for _, s := range p.subs {
@@ -447,12 +516,13 @@ func (p *Profiles) applyNodeFilter() {
 	search := strings.ToLower(p.search)
 
 	filtered := make([]*config.Node, 0, len(p.sortedNodes))
-	for _, n := range p.sortedNodes {
+	for _, nv := range p.sortedNodes {
 		if search != "" &&
-			!strings.Contains(strings.ToLower(n.Name), search) &&
-			!strings.Contains(strings.ToLower(n.Server), search) {
+			!strings.Contains(nv.lowerName, search) &&
+			!strings.Contains(nv.lowerServer, search) {
 			continue
 		}
+		n := nv.Node
 		if p.protoFilter != "" && n.Protocol != p.protoFilter {
 			continue
 		}

@@ -581,12 +581,12 @@ func TestProfilesFilterUsesPreSortedOrderAndDoesNotResort(t *testing.T) {
 	}
 
 	slices.Reverse(p.sortedNodes)
-	reversed := nodeNamesOf(p.sortedNodes)
+	reversed := nodeViewNamesOf(p.sortedNodes)
 
 	// 真实按键路径：进入搜索态并逐字输入。
 	p.Update(chars("/"))
 	p.Update(chars("a"))
-	if got := nodeNamesOf(p.sortedNodes); got != reversed {
+	if got := nodeViewNamesOf(p.sortedNodes); got != reversed {
 		t.Fatalf("搜索路径重排了预排序结果: %s", got)
 	}
 	if got := nodeNamesOf(p.filtered); got != "charlie,bravo,alpha" {
@@ -600,6 +600,181 @@ func TestProfilesFilterUsesPreSortedOrderAndDoesNotResort(t *testing.T) {
 	p.Update(chars("h"))
 	if got := nodeNamesOf(p.filtered); got != "charlie" {
 		t.Fatalf("搜索没有生效，前一条断言失去意义: %s", got)
+	}
+}
+
+// searchReference 是**与实现无关**的搜索语义参照：对 Name 与 Server 各自单独做
+// ToLower 再判断是否包含关键词。C8 只是把这两次 ToLower 提前到装载期，语义必须
+// 逐项保持相等，因此这份参照不引用被测代码的任何派生字段。
+func searchReference(n *config.Node, lowerQuery string) bool {
+	return strings.Contains(strings.ToLower(n.Name), lowerQuery) ||
+		strings.Contains(strings.ToLower(n.Server), lowerQuery)
+}
+
+// matchedNamesOf 把一次过滤的结果取成便于比较的排序名称集。
+func matchedNamesOf(nodes []*config.Node) []string {
+	names := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		names = append(names, n.Name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// TestProfilesSearchTextMatchesReferenceSemantics 钉住 C8 的「行为零变化」：
+// 同一组节点 + 同一批关键词，过滤结果必须与逐字段 ToLower 的参照实现逐项相等。
+//
+// 关键词表刻意覆盖三件事：
+//   - "HK" / "hong" / "EXAMPLE"：大小写不敏感；
+//   - "hk1.example" / "e.com"：按**服务器地址**也能搜到；
+//   - "a hk1"：这是**跨字段误匹配**的探针。"relay A" 的名称与 "hk1.example.com"
+//     的地址一旦被拼成一个字符串（无论空格还是 \x00 分隔），这个词就会凭空命中；
+//     逐字段比对则不会。当前实现不需要分隔符，这条探针用来挡住今后「拼成一个
+//     searchText 省一次 Contains」的改动。
+//
+// 反向核对放在末尾：至少一个关键词必须真的命中过，否则整轮断言可能因「过滤压根
+// 没跑」而全部假通过。
+func TestProfilesSearchTextMatchesReferenceSemantics(t *testing.T) {
+	app := pageFixture(t)
+	nodes := []*config.Node{
+		{ID: 1, Name: "relay A", Server: "hk1.example.com", Protocol: "vmess", Enabled: true, LatencyMS: -1},
+		{ID: 2, Name: "Hong Kong 01", Server: "10.0.0.1", Protocol: "trojan", Enabled: true, LatencyMS: -1},
+		{ID: 3, Name: "东京 03", Server: "jp3.Example.COM", Protocol: "vless", Enabled: true, LatencyMS: -1},
+		{ID: 4, Name: "UPPER", Server: "lower.host", Protocol: "http", Enabled: false, LatencyMS: -1},
+	}
+	p := NewProfiles(app)
+	p.SetSize(80, 21)
+	p.mode = profilesNodes
+	p.nodes = nodes
+	p.resortNodes()
+	p.applyNodeFilter()
+
+	queries := []string{
+		"", "hk", "HK", "hong kong", "hong", "01",
+		"example", "EXAMPLE", "hk1.example", "e.com",
+		"relay", "东京", "upper", "lower.host",
+		"a hk1", "kong 01 10.0", "不存在",
+	}
+	matchedAny := false
+	for _, query := range queries {
+		p.search = query
+		p.applyNodeFilter()
+
+		var want []*config.Node
+		for _, n := range nodes {
+			if searchReference(n, strings.ToLower(query)) {
+				want = append(want, n)
+			}
+		}
+		if len(want) > 0 {
+			matchedAny = true
+		}
+		got, want2 := matchedNamesOf(p.filtered), matchedNamesOf(want)
+		if !slices.Equal(got, want2) {
+			t.Fatalf("关键词 %q：过滤结果 %v，参照实现 %v", query, got, want2)
+		}
+	}
+	if !matchedAny {
+		t.Fatal("没有任何关键词命中，前面对照失去意义")
+	}
+}
+
+// TestProfilesFilterReadsCachedSearchText 钉住 C8 的实现要点：过滤循环读的是装载期
+// 算好的 nodeView.lowerName / lowerServer，而不是当场对 Name/Server 做 ToLower。
+//
+// 手法是把某条视图的小写副本换成一个人为哨兵值（Name/Server 里都不含它），再用哨兵值
+// 搜索：命中即证明过滤读的是缓存字段。这正是「C8 真的落地了」的直接证据——上面那条
+// 行为对照测试在旧实现上同样会通过，无法区分两者。（实测：把过滤循环临时改回
+// 当场 ToLower，本测试报 "过滤没有使用装载期缓存的 searchText"，对照测试仍通过。）
+//
+// 反向核对在末尾：哨兵必须不出现在任何 Name/Server 里，否则命中可能来自现算。
+func TestProfilesFilterReadsCachedSearchText(t *testing.T) {
+	app := pageFixture(t)
+	p := NewProfiles(app)
+	p.SetSize(80, 21)
+	p.mode = profilesNodes
+	p.nodes = []*config.Node{
+		{ID: 1, Name: "alpha", Server: "a.example.invalid", Protocol: "http", Enabled: true, LatencyMS: -1},
+		{ID: 2, Name: "bravo", Server: "b.example.invalid", Protocol: "http", Enabled: true, LatencyMS: -1},
+	}
+	p.resortNodes()
+	p.applyNodeFilter()
+
+	const canary = "zz-canary-zz"
+	patched := false
+	for i := range p.sortedNodes {
+		if p.sortedNodes[i].Name == "bravo" {
+			p.sortedNodes[i].lowerName = canary
+			patched = true
+		}
+	}
+	if !patched {
+		t.Fatal("没找到用于打哨兵的视图")
+	}
+
+	p.search = canary
+	p.applyNodeFilter()
+	if got := nodeNamesOf(p.filtered); got != "bravo" {
+		t.Fatalf("过滤没有使用装载期缓存的 searchText: %s", got)
+	}
+	for _, n := range p.nodes {
+		if strings.Contains(n.Name, canary) || strings.Contains(n.Server, canary) {
+			t.Fatal("哨兵出现在 Name/Server 里，断言失去意义")
+		}
+	}
+}
+
+// nodeViewNamesOf 把预排序视图拼成便于断言的顺序串。
+func nodeViewNamesOf(views []nodeView) string {
+	names := make([]string, 0, len(views))
+	for _, v := range views {
+		names = append(names, v.Name)
+	}
+	return strings.Join(names, ",")
+}
+
+// TestProfilesRenameRebuildsSearchText 覆盖 C8 改法第 4 条：searchText 是装载期派生值，
+// 改名 / 改服务器之后必须重建，否则搜索命中的是旧名字。
+//
+// 走真实编辑路径（SaveManual 落库 → reloadNodes，也就是 submitNodeForm 保存后的那一步），
+// 而不是直接改结构体字段——只有前者能证明「改 Name/Server 的入口确实覆盖到了」。
+func TestProfilesRenameRebuildsSearchText(t *testing.T) {
+	app := pageFixture(t)
+	node := &config.Node{Name: "旧名字", Protocol: "http", Server: "old.example.com", Port: 80}
+	if err := app.Proxy.SaveManual(node); err != nil {
+		t.Fatal(err)
+	}
+	p := NewProfiles(app)
+	p.SetSize(80, 21)
+	p.mode = profilesNodes
+	p.reloadNodes()
+
+	p.search = "旧名字"
+	p.applyNodeFilter()
+	if len(p.filtered) != 1 {
+		t.Fatalf("按原名搜索应命中 1 条，实际 %d 条", len(p.filtered))
+	}
+
+	node.Name, node.Server = "新名字", "new.example.com"
+	if err := app.Proxy.SaveManual(node); err != nil {
+		t.Fatal(err)
+	}
+	p.reloadNodes()
+
+	p.search = "新名字"
+	p.applyNodeFilter()
+	if len(p.filtered) != 1 {
+		t.Fatalf("改名后按新名搜索应命中 1 条，实际 %d 条", len(p.filtered))
+	}
+	p.search = "旧名字"
+	p.applyNodeFilter()
+	if len(p.filtered) != 0 {
+		t.Fatal("改名后仍能按旧名搜到，searchText 未重建")
+	}
+	p.search = "new.example"
+	p.applyNodeFilter()
+	if len(p.filtered) != 1 {
+		t.Fatalf("改服务器后按新地址搜索应命中 1 条，实际 %d 条", len(p.filtered))
 	}
 }
 
