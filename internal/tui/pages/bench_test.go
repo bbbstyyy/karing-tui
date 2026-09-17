@@ -256,11 +256,13 @@ func BenchmarkGroupsSearch5000(b *testing.B) {
 	}
 }
 
-// BenchmarkLogsFilter1000 度量日志过滤一次的成本。
+// BenchmarkLogsFilter1000 度量日志页按键/渲染路径取过滤结果的成本。
 //
-// LogBuf 上限 1000 行，因此这是满缓冲下的最坏情况。当前实现每帧调用两次
-// （Update 导航 + View 渲染），每次都做全量拷贝 + 逐行 ANSI strip + ToLower。
-// C11 引入版本号缓存后，未变化时该次调用应退化为命中缓存。
+// LogBuf 上限 1000 行，因此这是满缓冲下的最坏情况。C11 之前每次调用都是
+// 全量拷贝 + 逐行 ANSI strip + ToLower（且每帧两次）；引入 (version, query,
+// level, source) 缓存后，输入未变化时应命中缓存——本基准即回归门，
+// ns/op 与 allocs/op 应接近零。有新日志到达时的重算路径另见
+// BenchmarkLogsRefreshAppend（净账）。
 func BenchmarkLogsFilter1000(b *testing.B) {
 	app := benchApp(b)
 	l := NewLogs(app)
@@ -270,12 +272,38 @@ func BenchmarkLogsFilter1000(b *testing.B) {
 	}
 	l.query = "node-01"
 	l.level = "info"
-	if hits := l.lines(); len(hits) == 0 {
+	if hits := l.hits(); len(hits) == 0 {
 		b.Fatal("过滤后无日志，基准失去意义")
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = l.lines()
+		_ = l.hits()
+	}
+}
+
+// BenchmarkLogsRefreshAppend 度量 C11 后「有新日志到达」时的重算路径：
+// 每次 op 追加 1 行再刷新过滤（缓冲满后自然回绕，即稳态日志场景）。
+// 旧实现重算=全量拷贝 + 1000 行 Strip+ToLower；新实现只对新行 Strip，
+// 旧行命中 plainByID，但仍需全量 Contains 匹配 + 一次快照拷贝——
+// 这是缓存未命中路径的净账，不能只报命中路径的收益。
+func BenchmarkLogsRefreshAppend(b *testing.B) {
+	app := benchApp(b)
+	l := NewLogs(app)
+	l.SetSize(140, 40)
+	for i := range 1000 {
+		app.AppLog.AppendLine(fmt.Sprintf("\x1b[32mINFO\x1b[0m node-%04d handshake done in %dms", i, i%200))
+	}
+	l.query = "node-01"
+	l.level = "info"
+	if hits := l.hits(); len(hits) == 0 {
+		b.Fatal("过滤后无日志，基准失去意义")
+	}
+	n := 0
+	b.ReportAllocs()
+	for b.Loop() {
+		n++
+		app.AppLog.AppendLine(fmt.Sprintf("\x1b[32mINFO\x1b[0m node-%04d handshake done in %dms", n, n%200))
+		_ = l.hits()
 	}
 }
 

@@ -8,10 +8,11 @@ import (
 
 // LogBuf 是线程安全的定长日志环形缓冲，供 TUI 实时查看最近日志。
 type LogBuf struct {
-	mu    sync.Mutex
-	lines []string
-	max   int
-	drop  int // 因缓冲满而丢弃的总行数
+	mu      sync.Mutex
+	lines   []string
+	max     int
+	drop    int    // 因缓冲满而丢弃的总行数（即 Snapshot 的绝对行号基准）
+	version uint64 // 单调递增写入计数：每次 AppendLine 自增（含回绕挤掉的写入）
 }
 
 // NewLogBuf 创建容量为 max 行的日志缓冲。
@@ -42,14 +43,29 @@ func (b *LogBuf) AppendLine(line string) {
 		b.drop++
 	}
 	b.lines = append(b.lines, line)
+	b.version++
 }
 
-// Snapshot returns absolute line identities and content under the same lock.
-// Anchors remain stable when new lines arrive or the ring buffer wraps.
-func (b *LogBuf) Snapshot() (first int, lines []string) {
+// Snapshot returns absolute line identities, content, and a monotonically
+// increasing write counter under the same lock. Anchors remain stable when new
+// lines arrive or the ring buffer wraps.
+//
+// version 在每次 AppendLine 后自增（回绕那次写入同样自增，drop 另计）：
+// 调用方（logs 页）用它做增量缓存的失效键——C11 之前 drop 只在回绕时变化，
+// 无法表达「有新行写入」，非回绕的追加会被误判为「无变化」。
+func (b *LogBuf) Snapshot() (first int, version uint64, lines []string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.drop, append([]string(nil), b.lines...)
+	return b.drop, b.version, append([]string(nil), b.lines...)
+}
+
+// Version 返回当前写入计数。供调用方做增量缓存的廉价预检（C11）：只读
+// 一个整数、不拷贝内容；内容本身以 Snapshot 为准（两次加锁之间可能又有
+// 写入，以 Snapshot 返回的 version 为权威值）。
+func (b *LogBuf) Version() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.version
 }
 
 // Tail 返回最近 n 行日志；n <= 0 表示全部。

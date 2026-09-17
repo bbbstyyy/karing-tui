@@ -18,6 +18,7 @@ import (
 	"github.com/bbbstyyy/karing-tui/internal/catalog"
 	"github.com/bbbstyyy/karing-tui/internal/clashapi"
 	"github.com/bbbstyyy/karing-tui/internal/config"
+	"github.com/bbbstyyy/karing-tui/internal/core"
 	"github.com/bbbstyyy/karing-tui/internal/platform"
 	"github.com/bbbstyyy/karing-tui/internal/tui/components"
 	tea "github.com/charmbracelet/bubbletea"
@@ -1028,6 +1029,158 @@ func TestLogsKeepAbsoluteAnchorAsNewLinesArrive(t *testing.T) {
 	}
 	if _, cmd := l.Update(ActivateMsg{}); cmd == nil || !l.active {
 		t.Fatal("re-activation did not restart the refresh chain")
+	}
+}
+
+// C11 验收：按住 ↓ 移动 20 次，日志过滤只执行 1 次（缓冲无新写入时），
+// 且 View 不触发重算（不再 Snapshot / Strip）。recalcs 是被测路径上的
+// 重算计数器；「base == 0 则夹具失效」与「连续按键渲染内容必须变化」
+// 是两条反向核对，防止断言因永不触发而假通过。
+func TestLogsNavigationReusesFilterCache(t *testing.T) {
+	app := pageFixture(t)
+	l := NewLogs(app)
+	l.SetSize(80, 10)
+	l.Update(ActivateMsg{})
+	for i := range 100 {
+		app.AppLog.AppendLine(fmt.Sprintf("fixture-%03d", i))
+	}
+	// 首次导航：缓冲在 Activate 后有新写入，必须重算一次。
+	l.Update(tea.KeyMsg{Type: tea.KeyUp})
+	base := l.recalcs
+	if base == 0 {
+		t.Fatal("首次导航应触发一次重算，夹具失效")
+	}
+	if l.positions[0].following {
+		t.Fatal("KeyUp 后应处于回看状态，导航未生效")
+	}
+	for range 20 {
+		l.Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	if got := l.recalcs - base; got != 0 {
+		t.Fatalf("20 次导航触发了 %d 次重算，期望 0（缓存未变化）", got)
+	}
+	v1 := l.View()
+	l.Update(tea.KeyMsg{Type: tea.KeyUp})
+	v2 := l.View()
+	if v1 == v2 {
+		t.Fatal("连续两次按键渲染内容相同，导航未生效，重算断言失去意义")
+	}
+	before := l.recalcs
+	_ = l.View()
+	_ = l.View()
+	if l.recalcs != before {
+		t.Fatalf("View 触发了 %d 次重算；View 应只读缓存", l.recalcs-before)
+	}
+}
+
+// C11 兼容性：过滤结果与独立重写的朴素参照实现逐项一致（不复用被测代码
+// 的 refresh/plainByID，仅共用 ansi.Strip 这个库原语）。夹具覆盖 ANSI 控制序列、
+// 大写（触发 ToLower 分配）、无命中的反例。
+func TestLogsFilterMatchesReferenceImplementation(t *testing.T) {
+	app := pageFixture(t)
+	l := NewLogs(app)
+	l.SetSize(80, 10)
+	fixture := []string{
+		"\x1b[32mINFO\x1b[0m Node-001 handshake done",
+		"\x1b[31mERROR\x1b[0m node-002 timeout",
+		"plain warn text NODE-003",
+		"\x1b[2J\x1b[HDEBUG\x1b[0m node-004 started",
+		"info level-mixed Info node-005",
+		"—— 这一行不匹配任何用例 ————",
+	}
+	for _, line := range fixture {
+		app.AppLog.AppendLine(line)
+	}
+	l.Update(ActivateMsg{})
+	sawHit, sawMiss := false, false
+	for _, tc := range []struct{ name, query, level string }{
+		{"无过滤", "", ""},
+		{"查询命中大小写混合", "node-00", ""},
+		{"查询大写", "NODE", ""},
+		{"仅级别", "", "error"},
+		{"级别加查询", "node", "info"},
+		{"查询无命中", "zzz-none", ""},
+	} {
+		l.query, l.level = tc.query, tc.level
+		l.Update(tickMsg{Generation: l.tickGeneration})
+		first, _, all := app.AppLog.Snapshot()
+		var want []logLine
+		q := strings.ToLower(tc.query)
+		for i, line := range all {
+			plain := strings.ToLower(ansi.Strip(line))
+			if tc.query != "" && !strings.Contains(plain, q) {
+				continue
+			}
+			if tc.level != "" && !strings.Contains(plain, tc.level) {
+				continue
+			}
+			want = append(want, logLine{id: first + i, text: line})
+		}
+		got := l.cachedHits
+		if len(got) != len(want) {
+			t.Fatalf("%s: 结果数 %d != 参照 %d", tc.name, len(got), len(want))
+		}
+		for j := range want {
+			if got[j] != want[j] {
+				t.Errorf("%s: 第 %d 项 got %+v, want %+v", tc.name, j, got[j], want[j])
+			}
+		}
+		if tc.name == "查询命中大小写混合" && len(got) > 0 {
+			sawHit = true
+		}
+		if tc.name == "查询无命中" && len(got) == 0 {
+			sawMiss = true
+		}
+	}
+	if !sawHit || !sawMiss {
+		t.Fatalf("夹具失效：命中/无命中反例缺失（hit=%v miss=%v）", sawHit, sawMiss)
+	}
+}
+
+// C11：锚点被轮转挤出缓冲时，钳制与「更早日志已轮转」提示必须发生在
+// Update 侧（refresh），View 只读状态——旧行为在 View 里改写锚点，
+// 同一状态两次渲染字节不同；双渲染字节一致即证明副作用已移出 View。
+func TestLogsRotationClampMovesOutOfView(t *testing.T) {
+	app := pageFixture(t)
+	app.AppLog = core.NewLogBuf(10) // 小缓冲便于触发回绕
+	l := NewLogs(app)
+	l.SetSize(80, 10)
+	l.Update(ActivateMsg{})
+	for i := range 25 {
+		app.AppLog.AppendLine(fmt.Sprintf("L%02d", i))
+	}
+	l.Update(tea.KeyMsg{Type: tea.KeyUp}) // 固定锚点：hits ids 15..24，anchor=17
+	if l.positions[0].following {
+		t.Fatal("KeyUp 后应处于回看状态")
+	}
+	for i := 25; i < 30; i++ {
+		app.AppLog.AppendLine(fmt.Sprintf("L%02d", i))
+	}
+	l.Update(tickMsg{Generation: l.tickGeneration})
+	// 回绕后 ids 20..29：anchor 17 < hits[0].id 20，应钳到 20 并记录状态。
+	if got := l.positions[0].anchor; got != 20 {
+		t.Fatalf("锚点应钳到最旧行 20, got %d", got)
+	}
+	v1 := l.View()
+	if !strings.Contains(v1, "更早日志已轮转") {
+		t.Fatal("锚点被轮转挤出后应显示提示")
+	}
+	v2 := l.View()
+	if v1 != v2 {
+		t.Fatal("同一状态两次渲染字节不同——View 里仍有状态改写")
+	}
+	before := l.recalcs
+	_ = l.View()
+	if l.recalcs != before {
+		t.Fatalf("View 触发了重算（Snapshot/Strip 应只在 Update 侧）")
+	}
+	l.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	v3 := l.View()
+	if strings.Contains(v3, "更早日志已轮转") {
+		t.Fatal("跟随中不应显示轮转提示")
+	}
+	if !strings.Contains(v3, "L29") {
+		t.Fatal("End 后应跟随显示最新日志")
 	}
 }
 
