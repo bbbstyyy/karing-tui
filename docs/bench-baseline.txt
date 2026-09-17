@@ -1,0 +1,148 @@
+PASS
+ok  	github.com/bbbstyyy/karing-tui/internal/tui	0.299s
+PASS
+ok  	github.com/bbbstyyy/karing-tui/internal/tui/components	0.268s
+?   	github.com/bbbstyyy/karing-tui/internal/tui/keys	[no test files]
+goos: darwin
+goarch: arm64
+pkg: github.com/bbbstyyy/karing-tui/internal/tui/pages
+cpu: Apple M4
+BenchmarkProfilesFilter/N100-10 	   22962	     52231 ns/op	   33526 B/op	     838 allocs/op
+BenchmarkProfilesFilter/N100-10 	   22395	     54727 ns/op	   33526 B/op	     838 allocs/op
+BenchmarkProfilesFilter/N100-10 	   22572	     52951 ns/op	   33526 B/op	     838 allocs/op
+BenchmarkProfilesFilter/N100-10 	   22615	     53727 ns/op	   33526 B/op	     838 allocs/op
+BenchmarkProfilesFilter/N100-10 	   22784	     52768 ns/op	   33526 B/op	     838 allocs/op
+BenchmarkProfilesFilter/N100-10 	   22462	     53183 ns/op	   33526 B/op	     838 allocs/op
+BenchmarkProfilesFilter/N100-10 	   22357	     53558 ns/op	   33526 B/op	     838 allocs/op
+BenchmarkProfilesFilter/N100-10 	   22456	     53789 ns/op	   33526 B/op	     838 allocs/op
+BenchmarkProfilesFilter/N100-10 	   22765	     53300 ns/op	   33526 B/op	     838 allocs/op
+BenchmarkProfilesFilter/N100-10 	   22369	     53677 ns/op	   33526 B/op	     838 allocs/op
+BenchmarkProfilesFilter/N1000-10         	    2352	    530297 ns/op	  315902 B/op	    9116 allocs/op
+BenchmarkProfilesFilter/N1000-10         	    2262	    537005 ns/op	  315908 B/op	    9116 allocs/op
+BenchmarkProfilesFilter/N1000-10         	    2176	    531098 ns/op	  315898 B/op	    9116 allocs/op
+BenchmarkProfilesFilter/N1000-10         	    2174	    531590 ns/op	  315899 B/op	    9116 allocs/op
+BenchmarkProfilesFilter/N1000-10         	    2288	    533965 ns/op	  315902 B/op	    9116 allocs/op
+BenchmarkProfilesFilter/N1000-10         	    2226	    546929 ns/op	  315911 B/op	    9116 allocs/op
+BenchmarkProfilesFilter/N1000-10         	    2167	    554493 ns/op	  315920 B/op	    9116 allocs/op
+BenchmarkProfilesFilter/N1000-10         	    2203	    557228 ns/op	  315918 B/op	    9116 allocs/op
+BenchmarkProfilesFilter/N1000-10         	    2162	    556983 ns/op	  315912 B/op	    9116 allocs/op
+BenchmarkProfilesFilter/N1000-10         	    2138	    561808 ns/op	  315909 B/op	    9116 allocs/op
+BenchmarkProfilesFilter/N5000-10         	     430	   2808900 ns/op	 1718813 B/op	   45894 allocs/op
+BenchmarkProfilesFilter/N5000-10         	     424	   2791423 ns/op	 1718798 B/op	   45893 allocs/op
+BenchmarkProfilesFilter/N5000-10         	     454	   2709811 ns/op	 1718787 B/op	   45893 allocs/op
+BenchmarkProfilesFilter/N5000-10         	     447	   2670089 ns/op	 1718765 B/op	   45893 allocs/op
+BenchmarkProfilesFilter/N5000-10         	     448	   2675234 ns/op	 1718787 B/op	   45893 allocs/op
+BenchmarkProfilesFilter/N5000-10         	     447	   2747575 ns/op	 1718791 B/op	   45893 allocs/op
+BenchmarkProfilesFilter/N5000-10         	     428	   2806246 ns/op	 1718807 B/op	   45893 allocs/op
+BenchmarkProfilesFilter/N5000-10         	     427	   2834874 ns/op	 1718804 B/op	   45894 allocs/op
+BenchmarkProfilesFilter/N5000-10         	     423	   2709771 ns/op	 1718792 B/op	   45893 allocs/op
+BenchmarkProfilesFilter/N5000-10         	     451	   2654626 ns/op	 1718793 B/op	   45893 allocs/op
+BenchmarkProfilesFilter/N10000-10        	     226	   5288112 ns/op	 3812205 B/op	   91861 allocs/op
+BenchmarkProfilesFilter/N10000-10        	     225	   5294918 ns/op	 3812204 B/op	   91861 allocs/op
+BenchmarkProfilesFilter/N10000-10        	     223	   5372855 ns/op	 3812200 B/op	   91861 allocs/op
+BenchmarkProfilesFilter/N10000-10        	     223	   5387269 ns/op	 3812213 B/op	   91861 allocs/op
+BenchmarkProfilesFilter/N10000-10        	     222	   5410474 ns/op	 3812224 B/op	   91861 allocs/op
+BenchmarkProfilesFilter/N10000-10        	     222	   5401764 ns/op	 3812218 B/op	   91861 allocs/op
+BenchmarkProfilesFilter/N10000-10        	     199	   5690208 ns/op	 3812213 B/op	   91861 allocs/op
+BenchmarkProfilesFilter/N10000-10        	     222	   5338840 ns/op	 3812211 B/op	   91861 allocs/op
+BenchmarkProfilesFilter/N10000-10        	     224	   5474612 ns/op	 3812236 B/op	   91861 allocs/op
+BenchmarkProfilesFilter/N10000-10        	     223	   5451024 ns/op	 3812220 B/op	   91861 allocs/op
+BenchmarkProfilesView5000-10             	    1740	    681802 ns/op	 1438235 B/op	   16539 allocs/op
+BenchmarkProfilesView5000-10             	    1795	    692532 ns/op	 1437820 B/op	   16539 allocs/op
+BenchmarkProfilesView5000-10             	    1773	    688128 ns/op	 1438129 B/op	   16539 allocs/op
+BenchmarkProfilesView5000-10             	    1798	    666073 ns/op	 1437304 B/op	   16539 allocs/op
+BenchmarkProfilesView5000-10             	    1774	    676590 ns/op	 1437646 B/op	   16539 allocs/op
+BenchmarkProfilesView5000-10             	    1777	    676787 ns/op	 1438018 B/op	   16539 allocs/op
+BenchmarkProfilesView5000-10             	    1798	    670285 ns/op	 1437841 B/op	   16539 allocs/op
+BenchmarkProfilesView5000-10             	    1819	    673424 ns/op	 1438323 B/op	   16539 allocs/op
+BenchmarkProfilesView5000-10             	    1797	    676786 ns/op	 1438110 B/op	   16539 allocs/op
+BenchmarkProfilesView5000-10             	    1764	    672151 ns/op	 1437967 B/op	   16539 allocs/op
+BenchmarkGroupsSearch5000-10             	    2258	    518624 ns/op	  358368 B/op	    6022 allocs/op
+BenchmarkGroupsSearch5000-10             	    2293	    519166 ns/op	  358368 B/op	    6022 allocs/op
+BenchmarkGroupsSearch5000-10             	    2292	    517391 ns/op	  358368 B/op	    6022 allocs/op
+BenchmarkGroupsSearch5000-10             	    2366	    510591 ns/op	  358368 B/op	    6022 allocs/op
+BenchmarkGroupsSearch5000-10             	    2342	    518464 ns/op	  358368 B/op	    6022 allocs/op
+BenchmarkGroupsSearch5000-10             	    2307	    512427 ns/op	  358368 B/op	    6022 allocs/op
+BenchmarkGroupsSearch5000-10             	    2404	    514026 ns/op	  358368 B/op	    6022 allocs/op
+BenchmarkGroupsSearch5000-10             	    2318	    512538 ns/op	  358368 B/op	    6022 allocs/op
+BenchmarkGroupsSearch5000-10             	    2413	    528550 ns/op	  358368 B/op	    6022 allocs/op
+BenchmarkGroupsSearch5000-10             	    2233	    512024 ns/op	  358368 B/op	    6022 allocs/op
+BenchmarkLogsFilter1000-10               	    4786	    242944 ns/op	  183888 B/op	    3008 allocs/op
+BenchmarkLogsFilter1000-10               	    4830	    240830 ns/op	  183888 B/op	    3008 allocs/op
+BenchmarkLogsFilter1000-10               	    5028	    238682 ns/op	  183888 B/op	    3008 allocs/op
+BenchmarkLogsFilter1000-10               	    4964	    239315 ns/op	  183888 B/op	    3008 allocs/op
+BenchmarkLogsFilter1000-10               	    4773	    243273 ns/op	  183888 B/op	    3008 allocs/op
+BenchmarkLogsFilter1000-10               	    4878	    243242 ns/op	  183888 B/op	    3008 allocs/op
+BenchmarkLogsFilter1000-10               	    4838	    243118 ns/op	  183888 B/op	    3008 allocs/op
+BenchmarkLogsFilter1000-10               	    4904	    241633 ns/op	  183888 B/op	    3008 allocs/op
+BenchmarkLogsFilter1000-10               	    4942	    242103 ns/op	  183888 B/op	    3008 allocs/op
+BenchmarkLogsFilter1000-10               	    4902	    241252 ns/op	  183888 B/op	    3008 allocs/op
+BenchmarkRuleFormKeyPress-10             	    6511	    178342 ns/op	  673750 B/op	    4884 allocs/op
+BenchmarkRuleFormKeyPress-10             	    6548	    179335 ns/op	  673751 B/op	    4884 allocs/op
+BenchmarkRuleFormKeyPress-10             	    6496	    181238 ns/op	  673751 B/op	    4884 allocs/op
+BenchmarkRuleFormKeyPress-10             	    6536	    181376 ns/op	  673751 B/op	    4884 allocs/op
+BenchmarkRuleFormKeyPress-10             	    6463	    182760 ns/op	  673751 B/op	    4884 allocs/op
+BenchmarkRuleFormKeyPress-10             	    6524	    197944 ns/op	  673750 B/op	    4884 allocs/op
+BenchmarkRuleFormKeyPress-10             	    6578	    188041 ns/op	  673750 B/op	    4884 allocs/op
+BenchmarkRuleFormKeyPress-10             	    6477	    191758 ns/op	  673751 B/op	    4884 allocs/op
+BenchmarkRuleFormKeyPress-10             	    6465	    181203 ns/op	  673751 B/op	    4884 allocs/op
+BenchmarkRuleFormKeyPress-10             	    6480	    181914 ns/op	  673750 B/op	    4884 allocs/op
+BenchmarkCatalogView-10                  	     433	   2748953 ns/op	 1516268 B/op	   18724 allocs/op
+BenchmarkCatalogView-10                  	     438	   2748789 ns/op	 1517583 B/op	   18725 allocs/op
+BenchmarkCatalogView-10                  	     435	   2737730 ns/op	 1516838 B/op	   18724 allocs/op
+BenchmarkCatalogView-10                  	     439	   2732965 ns/op	 1517262 B/op	   18724 allocs/op
+BenchmarkCatalogView-10                  	     441	   2789833 ns/op	 1515955 B/op	   18724 allocs/op
+BenchmarkCatalogView-10                  	     438	   2734097 ns/op	 1515663 B/op	   18724 allocs/op
+BenchmarkCatalogView-10                  	     435	   2733111 ns/op	 1515414 B/op	   18724 allocs/op
+BenchmarkCatalogView-10                  	     403	   2883674 ns/op	 1516936 B/op	   18725 allocs/op
+BenchmarkCatalogView-10                  	     418	   2835911 ns/op	 1517350 B/op	   18725 allocs/op
+BenchmarkCatalogView-10                  	     415	   2770582 ns/op	 1515506 B/op	   18724 allocs/op
+BenchmarkDNSView-10                      	    2412	    496594 ns/op	  194177 B/op	    4410 allocs/op
+BenchmarkDNSView-10                      	    2455	    493254 ns/op	  194021 B/op	    4410 allocs/op
+BenchmarkDNSView-10                      	    2436	    492482 ns/op	  194277 B/op	    4410 allocs/op
+BenchmarkDNSView-10                      	    2455	    493316 ns/op	  194234 B/op	    4410 allocs/op
+BenchmarkDNSView-10                      	    2445	    498392 ns/op	  193971 B/op	    4410 allocs/op
+BenchmarkDNSView-10                      	    2425	    495475 ns/op	  194247 B/op	    4410 allocs/op
+BenchmarkDNSView-10                      	    2425	    494112 ns/op	  194416 B/op	    4410 allocs/op
+BenchmarkDNSView-10                      	    2446	    505492 ns/op	  194108 B/op	    4410 allocs/op
+BenchmarkDNSView-10                      	    2409	    493011 ns/op	  194550 B/op	    4410 allocs/op
+BenchmarkDNSView-10                      	    2409	    495714 ns/op	  194190 B/op	    4410 allocs/op
+PASS
+ok  	github.com/bbbstyyy/karing-tui/internal/tui/pages	122.597s
+?   	github.com/bbbstyyy/karing-tui/internal/tui/styles	[no test files]
+goos: darwin
+goarch: arm64
+pkg: github.com/bbbstyyy/karing-tui/internal/catalog
+cpu: Apple M4
+BenchmarkCatalogSearch/geosite/google-10         	   48555	     22819 ns/op	     998 B/op	       5 allocs/op
+BenchmarkCatalogSearch/geosite/google-10         	   52000	     22893 ns/op	     992 B/op	       5 allocs/op
+BenchmarkCatalogSearch/geosite/google-10         	   53280	     22370 ns/op	     992 B/op	       5 allocs/op
+BenchmarkCatalogSearch/geosite/google-10         	   52695	     22775 ns/op	     992 B/op	       5 allocs/op
+BenchmarkCatalogSearch/geosite/google-10         	   58191	     22293 ns/op	     992 B/op	       5 allocs/op
+BenchmarkCatalogSearch/geosite/google-10         	   56228	     22272 ns/op	     992 B/op	       5 allocs/op
+BenchmarkCatalogSearch/geosite/google-10         	   51058	     23079 ns/op	     992 B/op	       5 allocs/op
+BenchmarkCatalogSearch/geosite/google-10         	   52598	     21480 ns/op	     992 B/op	       5 allocs/op
+BenchmarkCatalogSearch/geosite/google-10         	   53414	     21759 ns/op	     992 B/op	       5 allocs/op
+BenchmarkCatalogSearch/geosite/google-10         	   56509	     22203 ns/op	     992 B/op	       5 allocs/op
+BenchmarkCatalogSearch/geosite/a-10              	   41538	     29147 ns/op	  119392 B/op	      12 allocs/op
+BenchmarkCatalogSearch/geosite/a-10              	   42273	     28693 ns/op	  119392 B/op	      12 allocs/op
+BenchmarkCatalogSearch/geosite/a-10              	   43131	     27961 ns/op	  119392 B/op	      12 allocs/op
+BenchmarkCatalogSearch/geosite/a-10              	   43773	     28906 ns/op	  119392 B/op	      12 allocs/op
+BenchmarkCatalogSearch/geosite/a-10              	   42022	     29110 ns/op	  119392 B/op	      12 allocs/op
+BenchmarkCatalogSearch/geosite/a-10              	   41157	     29698 ns/op	  119392 B/op	      12 allocs/op
+BenchmarkCatalogSearch/geosite/a-10              	   42855	     28508 ns/op	  119392 B/op	      12 allocs/op
+BenchmarkCatalogSearch/geosite/a-10              	   41948	     27742 ns/op	  119392 B/op	      12 allocs/op
+BenchmarkCatalogSearch/geosite/a-10              	   45429	     26068 ns/op	  119392 B/op	      12 allocs/op
+BenchmarkCatalogSearch/geosite/a-10              	   45823	     28068 ns/op	  119392 B/op	      12 allocs/op
+BenchmarkCatalogCodes-10                         	223785752	         5.335 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCatalogCodes-10                         	221617152	         5.383 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCatalogCodes-10                         	222238066	         5.417 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCatalogCodes-10                         	226321398	         5.331 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCatalogCodes-10                         	224524970	         5.329 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCatalogCodes-10                         	224470774	         5.346 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCatalogCodes-10                         	224504844	         5.377 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCatalogCodes-10                         	223605140	         5.371 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCatalogCodes-10                         	224032320	         5.402 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCatalogCodes-10                         	219175629	         5.440 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/bbbstyyy/karing-tui/internal/catalog	36.377s
