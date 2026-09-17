@@ -19,6 +19,11 @@
 #   ns/op:            退化超过 T 只打 WARN（时间抖动大，不拦截）
 #   仅 base / 仅 head: WARN（基准被改名/删除/新增，不拦截）
 #
+# 完整性判据只认内存指标（nmem = allocs/op 或 B/op 存在可比值的基准数）:
+# 若误删 -benchmem，allocs/op 与 B/op 全为 n/a 而 ns/op 仍有值，旧判据会把
+# 它算成「有可比数据」而放行。因此 nmem == 0 一律判完整性失败（exit 2）。
+# ns/op 只用于观察，**不能**用来证明 -benchmem 已启用。
+#
 # 环境变量:
 #   BENCH_GATE_THRESHOLD  退化阈值百分比（默认 10）
 #   BENCH_GATE=off        观察模式：照常输出报告，但恒放行
@@ -141,7 +146,7 @@ awk -F'\t' -v threshold="$threshold" -v mode="$mode" '
     }
     printf "bench_gate：门禁 allocs/op 与 B/op（阈值 %s%%，超阈值即拦），模式=%s\n", threshold, mode
     printf "%-42s %-22s %-22s %-24s %s\n", "benchmark", "allocs/op", "B/op", "ns/op（不拦截）", "判定"
-    nfail = 0; nwarn = 0; nok = 0; ncmp = 0
+    nfail = 0; nwarn = 0; nok = 0; nmem = 0
     for (k = 1; k <= n; k++) {
       name = ord[k]
       inb = (name in bhave); inh = (name in hhave)
@@ -158,15 +163,16 @@ awk -F'\t' -v threshold="$threshold" -v mode="$mode" '
       cella = fmtcmp(ba[name], ha[name], "FAIL"); fa = (g_flag == "FAIL")
       cellb = fmtcmp(bb[name], hb[name], "FAIL"); fb = (g_flag == "FAIL")
       cellt = fmtcmp(bt[name], ht[name], "WARN"); wt = (g_flag == "WARN")
-      if (cella != "n/a" || cellb != "n/a" || cellt != "n/a") ncmp++
+      # 只按内存指标统计可比对数：ns/op 有值不能证明 -benchmem 已启用。
+      if (cella != "n/a" || cellb != "n/a") nmem++
       if (fa || fb)      { nfail++; verdict = "FAIL" }
       else if (wt)       { nwarn++; verdict = "WARN(时间)" }
       else               { nok++;   verdict = "OK" }
       printf "%-42s %-22s %-22s %-24s %s\n", name, cella, cellb, cellt, verdict
     }
     printf "\n"
-    if (ncmp == 0) {
-      print "错误：base/head 之间没有任何可对比的 allocs/B/op 数据（-benchmem 未开？）" > "/dev/stderr"
+    if (nmem == 0) {
+      print "错误：base/head 之间没有任何可对比的 allocs/op 或 B/op 数据（-benchmem 未开？）" > "/dev/stderr"
       exit 3
     }
     if (nfail > 0 && mode == "on") {
@@ -182,7 +188,7 @@ awk -F'\t' -v threshold="$threshold" -v mode="$mode" '
 ' "$tmpdir/base.tsv" "$tmpdir/head.tsv" || gate_rc=$?
 
 if [ "$gate_rc" -eq 3 ]; then
-  die "没有任何可对比的 allocs/B/op 数据（-benchmem 未开？）"
+  die "没有任何可对比的 allocs/op 或 B/op 数据（-benchmem 未开？）"
 fi
 if [ "$gate_rc" -ne 0 ] && [ "$gate_rc" -ne 1 ]; then
   die "对比阶段异常退出（rc=$gate_rc）"

@@ -34,10 +34,39 @@ jobs:
       - name: golangci-lint
         run: golangci-lint run ./...
       - name: 检查脚本语法
+        # V5-5：自动发现 scripts/**/*.sh，按 shebang 分派解释器。
+        # 不能统一用 bash -n：build-release.sh 是 #!/usr/bin/env sh，CI 里也是
+        # 按 sh 真跑的（ubuntu 的 /bin/sh 是 dash），bash -n 会放行 bashism。
+        # 也不能用 `find ... -exec bash -n {} +`：已实测它在子脚本语法错误时
+        # 仍返回 0。未知/缺失 shell shebang 一律 fail-closed，逼新增脚本显式
+        # 声明由哪个 shell 解释。
         run: |
-          sh -n scripts/build-release.sh
-          bash -n scripts/gen-catalog.sh
-          bash -n scripts/sync-builtin-rulesets.sh
+          set -u
+          tmp_list="$(mktemp)"
+          trap 'rm -f "$tmp_list"' EXIT
+          find scripts -type f -name '*.sh' -print0 >"$tmp_list" || exit 1
+          n=0
+          while IFS= read -r -d '' f; do
+            shebang="$(head -n 1 "$f")" || exit 1
+            case "$shebang" in
+              *"env sh"|*"/bin/sh")
+                sh -n "$f" || exit 1
+                ;;
+              *"env bash"|*"/bin/bash")
+                bash -n "$f" || exit 1
+                ;;
+              *)
+                echo "unsupported or missing shell shebang: $f: $shebang" >&2
+                exit 1
+                ;;
+            esac
+            n=$((n + 1))
+          done <"$tmp_list"
+          echo "shell syntax OK: $n 个脚本"
+      - name: bench gate fixture 测试
+        # V5-5：固定 fixture 钉住 bench_gate.sh 的完整性判据（只有 ns/op 时
+        # 必须失败），不依赖真实 benchmark 的抖动。
+        run: ./scripts/bench_gate_test.sh
 
   test:
     name: Test (${{ matrix.os }})

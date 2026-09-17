@@ -1,0 +1,8 @@
+goos: linux
+goarch: amd64
+pkg: example
+cpu: fixture
+BenchmarkFoo-8   1000   1234 ns/op   16 B/op   1 allocs/op
+BenchmarkBar-8   2000   5678 ns/op   32 B/op   2 allocs/op
+PASS
+ok  	example	0.123s
