@@ -37,6 +37,16 @@ func RunService(paths *platform.Paths) int {
 	defer lock.Close()
 	started := time.Now()
 	st := State{Status: StatusStarting, SupervisorPID: os.Getpid(), StartedAt: started, Config: paths.Config}
+	// 拿到自己的身份才写状态。Acquire 已经要求过一次 processIdentity，所以这里
+	// 失败属于异常；宁可记 crashed 也不要写下一份以后必然被判为 unverifiable、
+	// 把用户锁在「需手工清理」里的状态。
+	self, err := processIdentity(os.Getpid())
+	if err != nil {
+		st.Status, st.ExitError, st.StoppedAt = StatusCrashed, err.Error(), time.Now()
+		_ = WriteState(paths, st)
+		return 1
+	}
+	st.SupervisorStartToken = self.Token
 	_ = WriteState(paths, st)
 
 	app, err := application.NewExclusive(paths)
@@ -58,7 +68,27 @@ func RunService(paths *platform.Paths) int {
 		return 1
 	}
 	coreStatus := app.Core.Status()
-	st.Status, st.CorePID, st.Version, st.MixedPort = StatusRunning, app.Core.PID(), coreStatus.Version, app.GetSettings().MixedPort
+	st.Status, st.CorePID = StatusRunning, app.Core.PID()
+	st.Version, st.MixedPort = coreStatus.Version, app.GetSettings().MixedPort
+	// core 的可验证身份与 PGID 必须在 core 刚启动、leader 一定还活着的时候
+	// 立刻记录：supervisor 一旦被杀，这两个字段就是「这个进程组属于旧 core」
+	// 的唯一证据，事后无法再推导。
+	id, idErr := processIdentity(st.CorePID)
+	if idErr != nil {
+		// 刚才还能读到自己（Acquire 里），此刻却读不到刚启动的 child：拒绝
+		// 继续。让一个无法验证、因而永远无法自动清理的 core 跑下去，比启动
+		// 失败更糟——残留 core 会一直占着端口。
+		_ = app.StopCore()
+		st.Status, st.ExitError, st.StoppedAt, st.CorePID = StatusCrashed,
+			"无法读取 sing-box 进程身份: "+idErr.Error(), time.Now(), 0
+		_ = WriteState(paths, st)
+		return 1
+	}
+	st.CoreStartToken = id.Token
+	st.CorePGID = st.CorePID
+	if pgid, err := processGroupID(st.CorePID); err == nil {
+		st.CorePGID = pgid
+	}
 	_ = WriteState(paths, st)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -85,18 +115,19 @@ func RunService(paths *platform.Paths) int {
 		select {
 		case <-stopSignals:
 			_ = app.StopCore()
-			st.Status, st.StoppedAt, st.CorePID = StatusStopped, time.Now(), 0
+			markStopped(&st)
 			_ = WriteState(paths, st)
 			return 0
 		case <-ticker.C:
 			if consumeStop(paths) {
 				_ = app.StopCore()
-				st.Status, st.StoppedAt, st.CorePID = StatusStopped, time.Now(), 0
+				markStopped(&st)
 				_ = WriteState(paths, st)
 				return 0
 			}
 			if !app.Core.IsRunning() {
-				st.Status, st.StoppedAt, st.CorePID = StatusCrashed, time.Now(), 0
+				markCoreGone(&st)
+				st.Status, st.StoppedAt = StatusCrashed, time.Now()
 				if st.ExitError == "" {
 					st.ExitError = "sing-box 运行期间退出"
 				}

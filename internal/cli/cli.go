@@ -207,7 +207,11 @@ func cmdStatusJSON(app *application.App, stdout, stderr io.Writer) int {
 	} else if !running && st.Status == headless.StatusRunning {
 		st.Status = headless.StatusCrashed
 		if st.ExitError == "" {
-			st.ExitError = "supervisor PID 已退出"
+			if headless.IdentityUnverifiable(st) {
+				st.ExitError = "supervisor 身份不可验证（旧版本状态或 PID 被复用）"
+			} else {
+				st.ExitError = "supervisor PID 已退出"
+			}
 		}
 	}
 	if running && st.Status != headless.StatusCrashed {
@@ -242,30 +246,29 @@ func cmdHeadless(action string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "初始化数据目录失败:", err)
 		return 1
 	}
+	// start / restart / stop 都必须先过同一关：把落盘状态与实际进程对齐，
+	// 只在能取得身份证据时才清理孤儿 core。这是 V5-2 的核心——PID 会被复用，
+	// 任何绕过它的裸 PID 判活都可能误杀无关进程组，或者反过来放进第二份 core。
+	st, readErr := headless.ReadState(paths)
+	if readErr != nil {
+		fmt.Fprintln(stderr, readErr)
+		return 1
+	}
+	st, outcome, recErr := headless.ReconcileRecordedState(st)
+	if recErr != nil {
+		fmt.Fprintln(stderr, recErr)
+		return 1
+	}
+
 	if action == "stop" {
-		st, readErr := headless.ReadState(paths)
-		if readErr != nil {
-			fmt.Fprintln(stderr, readErr)
-			return 1
-		}
-		if st.Status != headless.StatusRunning && st.Status != headless.StatusStarting {
-			return headlessResult(action, jsonOut, stdout, "stopped", 0, "")
-		}
-		if !headless.Active(st) {
-			// A supervisor can be killed without getting a chance to persist its
-			// terminal state. Repair the stale snapshot so subsequent status and
-			// stop calls do not keep treating the dead service as running. The core
-			// is normally a child of that supervisor, so clean up an orphan too.
-			if err := headless.StopRecordedCore(st); err != nil {
-				fmt.Fprintf(stderr, "清理残留 sing-box 失败: %v\n", err)
-				return 1
-			}
-			st.Status = headless.StatusStopped
-			st.SupervisorPID, st.CorePID = 0, 0
-			st.StoppedAt = time.Now()
+		if outcome != headless.ReconcileRunning {
+			// supervisor 已死（或残留刚按身份验证清理完毕）：写回对齐后的
+			// 快照，后续 status / stop 不再把它当成运行中。
 			_ = headless.WriteState(paths, st)
 			return headlessResult(action, jsonOut, stdout, "stopped", 0, "")
 		}
+		// 服务确实在运行：走 supervisor 自己的优雅停止协议（文件请求），
+		// 不在这里直接向进程发信号。
 		if err := headless.RequestStop(paths); err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
@@ -281,9 +284,9 @@ func cmdHeadless(action string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "等待 headless 服务停止超时")
 		return 1
 	}
+
 	if action == "restart" {
-		st, _ := headless.ReadState(paths)
-		if headless.Active(st) {
+		if outcome == headless.ReconcileRunning {
 			if err := headless.RequestStop(paths); err != nil {
 				fmt.Fprintln(stderr, err)
 				return 1
@@ -296,9 +299,19 @@ func cmdHeadless(action string, args []string, stdout, stderr io.Writer) int {
 				}
 				time.Sleep(100 * time.Millisecond)
 			}
+			// 超时未停下时不能直接启动第二份：下面重新读状态会再判一次。
+		} else {
+			_ = headless.WriteState(paths, st)
 		}
+	} else {
+		if outcome == headless.ReconcileRunning {
+			fmt.Fprintln(stderr, "headless 服务已在运行")
+			return 1
+		}
+		_ = headless.WriteState(paths, st)
 	}
-	st, _ := headless.ReadState(paths)
+
+	st, _ = headless.ReadState(paths)
 	if headless.Active(st) {
 		fmt.Fprintln(stderr, "headless 服务已在运行")
 		return 1
