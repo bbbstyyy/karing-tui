@@ -347,3 +347,79 @@ func TestDeleteRuleSetChecksLogicalAndDNSRefs(t *testing.T) {
 		}
 	})
 }
+
+// C9：分类库缓存状态必须一次列目录建索引，语义与逐条 CatalogCached 一致。
+//
+// 逐条 os.Stat 在分类库浏览页是每次按键近 2000 次的系统调用（C9 实测 ≈2.7ms/帧），
+// 因此热路径改为「列一次目录 + map 查表」。
+func TestCachedCatalogTagsIndexesCacheDir(t *testing.T) {
+	m := newTestManager(t)
+	dir := m.CacheDir()
+
+	// 从未下载过任何分类：目录不存在是正常状态，返回空集合而不是错误
+	tags, err := m.CachedCatalogTags()
+	if err != nil {
+		t.Fatalf("缓存目录不存在时 CachedCatalogTags 出错: %v", err)
+	}
+	if len(tags) != 0 {
+		t.Errorf("缓存目录不存在时应为空集合，实得 %v", tags)
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cn := catalog.Ref{Kind: catalog.KindGeosite, Code: "cn"}
+	if err := os.WriteFile(m.CatalogCachePath(cn), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 干扰项：非 .srs 后缀（自定义规则集的 json 缓存、写入中的临时文件）都不算已缓存
+	if err := os.WriteFile(filepath.Join(dir, "custom.json"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".ruleset-1.tmp"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 干扰项：同名目录不算已缓存（与 CatalogCached 的 !info.IsDir() 一致）
+	if err := os.MkdirAll(filepath.Join(dir, "geosite-dir.srs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tags, err = m.CachedCatalogTags()
+	if err != nil {
+		t.Fatalf("CachedCatalogTags: %v", err)
+	}
+	if !tags["geosite-cn"] {
+		t.Errorf("geosite-cn 应记为已缓存，实得 %v", tags)
+	}
+	if tags["geosite-dir"] {
+		t.Error("同名目录不应记为已缓存")
+	}
+	if tags["custom"] || tags[".ruleset-1"] {
+		t.Errorf("非 .srs 文件不应记为已缓存，实得 %v", tags)
+	}
+	// 索引与逐条探测必须给出相同结论（两种取数方式可互换）
+	for _, ref := range []catalog.Ref{
+		cn,
+		{Kind: catalog.KindGeoIP, Code: "cn"},
+		{Kind: catalog.KindGeosite, Code: "dir"},
+	} {
+		if want := m.CatalogCached(ref); want != tags[ref.Tag()] {
+			t.Errorf("%s: 索引 = %v，CatalogCached = %v", ref, tags[ref.Tag()], want)
+		}
+	}
+
+	// 反向核对：索引确实走可替换的列目录实现（否则上面的断言无法说明调用次数）
+	calls := 0
+	m.ReadDir = func(d string) ([]os.DirEntry, error) {
+		calls++
+		return os.ReadDir(d)
+	}
+	for range 5 {
+		if _, err := m.CachedCatalogTags(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 5 {
+		t.Errorf("5 次查询共列目录 %d 次，期望每次查询恰好 1 次", calls)
+	}
+}

@@ -424,6 +424,17 @@ func (a *App) MarkConfigDirty() {
 	a.configStateMu.Unlock()
 }
 
+// ConfigRevision 返回配置变更代数：MarkConfigDirty 每成功写入一次模型就自增。
+//
+// 供界面把「按模型推导出来的数据」按代数缓存：代数变了就重算，没变就直接复用。
+// 它只保证「写入过就一定变」，不保证「没变就一定没写入」——因此只适合做
+// 失效式缓存（多算几次无害），不能拿它证明某次写入没有发生。
+func (a *App) ConfigRevision() uint64 {
+	a.configStateMu.RLock()
+	defer a.configStateMu.RUnlock()
+	return a.revision
+}
+
 func (a *App) ConfigStage() string {
 	running := a.Core.IsRunning()
 	a.configStateMu.RLock()

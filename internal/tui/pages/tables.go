@@ -123,19 +123,20 @@ func (r *Rules) table() {
 		}
 		r.list.SetTable([]components.Column{col("规则集", 18, 0, false), col("标识", 22, 2, false), col("缓存", 6, 0, false), col("状态", 4, 0, false), col("格式", 4, 1, false)}, rows, r.list.Keys)
 	case rulesCatalog:
-		// reloadCatalog caches the filesystem and reference checks in list.Items.
-		for i, ref := range r.catHits {
+		// 只消费 reloadCatalog 已物化的命中（≤ catalogHitLimit 条）：这里既不回查文件
+		// 系统，也不解析 Items 文案反推标注——那份标注已随命中一起存在 catHits 上。
+		for _, hit := range r.catHits {
 			cached, inUse, kind := "未缓存", "未引用", "域名"
-			if i < len(r.list.Items) && strings.Contains(r.list.Items[i], "已缓存") {
+			if hit.cached {
 				cached = "已缓存"
 			}
-			if i < len(r.list.Items) && (strings.HasPrefix(r.list.Items[i], "* ") || strings.Contains(r.list.Items[i], "已引用")) {
+			if hit.inUse {
 				inUse = "已引用"
 			}
-			if ref.NeedsResolve() {
+			if hit.ref.NeedsResolve() {
 				kind = "IP 条件"
 			}
-			rows = append(rows, []string{ref.String(), inUse, cached, kind})
+			rows = append(rows, []string{hit.ref.String(), inUse, cached, kind})
 		}
 		r.list.SetTable([]components.Column{col("分类", 22, 0, false), col("引用", 6, 0, false), col("缓存", 6, 0, false), col("条件", 7, 1, false)}, rows, r.list.Keys)
 	}

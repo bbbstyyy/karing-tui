@@ -361,6 +361,28 @@ func BenchmarkCatalogView(b *testing.B) {
 	}
 }
 
+// BenchmarkCatalogViewSparseQuery 与 BenchmarkCatalogView 配对：查询词 "zzzzzz"
+// 在 geosite 命中 0 条。
+//
+// C9 之前，两者的成本差 ≈ 命中数 × 逐条 os.Stat（"a" 命中 1090 条 → 每次按键
+// 约 2.7ms），曲线随**总命中数**线性增长；C9 之后物化上限把「a」压到与无命中同阶
+// （相差的部分只是多出来的 ≤limit 行建模），两条基准的 ns/op 应当接近。
+func BenchmarkCatalogViewSparseQuery(b *testing.B) {
+	r := NewRules(benchApp(b))
+	r.SetSize(140, 40)
+	r.openCatalog(rulesGroups)
+	r.catQuery = "zzzzzz"
+	r.reloadCatalog()
+	if len(r.catHits) != 0 {
+		b.Fatalf("夹具失效：查询应为 0 命中，实得 %d 条", len(r.catHits))
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		r.reloadCatalog()
+		_ = r.View()
+	}
+}
+
 // BenchmarkDNSView 度量 DNS 服务器页单帧渲染成本。
 //
 // 当前 View 会查两次 SQLite（table + selectionDetails），且同一次渲染里

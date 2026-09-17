@@ -347,3 +347,51 @@ func TestSearch(t *testing.T) {
 		t.Errorf("Search(非法种类) = %v, 期望 nil", got)
 	}
 }
+
+// C9：受限搜索必须「扫描不变、物化受限」——命中总数仍要准确（界面用它提示
+// 「N 条命中 · 仅列前 M 条」），但 append 出去的 Ref 不得超过 limit 条。
+func TestSearchLimitedCapsMaterialization(t *testing.T) {
+	const limit = 200
+	full := Search(KindGeosite, "a", 0) // 参照实现：旧行为（全量物化）
+	// 反向核对：夹具本身必须让上限真正生效，否则下面的断言全是空转
+	if len(full) <= limit {
+		t.Fatalf("夹具失效：geosite 查询 %q 只命中 %d 条（需 > %d）", "a", len(full), limit)
+	}
+
+	hits, total := SearchLimited(KindGeosite, "a", limit)
+	if len(hits) != limit {
+		t.Errorf("物化 %d 条，期望恰好 %d 条", len(hits), limit)
+	}
+	if total != len(full) {
+		t.Errorf("total = %d，期望与全量命中 %d 一致", total, len(full))
+	}
+	for i, ref := range hits {
+		if ref != full[i] { // 截断只能取前缀，不得改变顺序或内容
+			t.Fatalf("第 %d 条 = %v，期望 %v", i, ref, full[i])
+		}
+	}
+
+	// limit <= 0 表示不限物化条数（与 Search 一致），此时 total == len(hits)
+	all, allTotal := SearchLimited(KindGeosite, "a", 0)
+	if len(all) != len(full) || allTotal != len(full) {
+		t.Errorf("不限条数时物化 %d 条 / total %d，期望 %d", len(all), allTotal, len(full))
+	}
+
+	// 跨种类：total 统计的是全部种类，而物化仍受 limit 约束
+	cross, crossTotal := SearchLimited("", "telegram", 1)
+	if len(cross) != 1 {
+		t.Errorf("跨种类物化 %d 条，期望 1 条", len(cross))
+	}
+	if crossTotal < 3 {
+		t.Errorf("跨种类命中总数 = %d，期望覆盖 geosite/geoip/acl 至少 3 条", crossTotal)
+	}
+
+	// 非法种类：与 Search 一致地返回 nil（用于区分「种类非法」与「无命中」）
+	if h, n := SearchLimited("bogus", "cn", 10); h != nil || n != 0 {
+		t.Errorf("SearchLimited(非法种类) = (%v, %d)，期望 (nil, 0)", h, n)
+	}
+	// 无命中：非 nil 空切片 + total 0
+	if h, n := SearchLimited(KindGeosite, "zzzzzz", 10); n != 0 || h == nil || len(h) != 0 {
+		t.Errorf("无命中 = (%v, %d)，期望 (空切片, 0)", h, n)
+	}
+}

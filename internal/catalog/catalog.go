@@ -195,7 +195,7 @@ func Search(kind, query string, limit int) []Ref {
 		}
 		kinds = []string{kind}
 	}
-	q := strings.ToLower(strings.TrimSpace(query))
+	q := normalizeQuery(query)
 	out := []Ref{}
 	for _, k := range kinds {
 		for _, code := range byKind[k] {
@@ -210,6 +210,43 @@ func Search(kind, query string, limit int) []Ref {
 	}
 	return out
 }
+
+// SearchLimited 在某种类中按子串（忽略大小写）搜索分类码，最多物化 limit 条，
+// 同时返回命中总数。kind 为空时搜索全部种类，limit <= 0 表示不限物化条数。
+//
+// 与 Search(kind, query, limit>0) 的分工：Search 一凑满 limit 就提前返回，拿不到总数；
+// SearchLimited 始终扫完（仍是纯内存的 O(N)，与命中数无关），但只 append 前 limit 条。
+// 界面因此可以在「不物化全部命中」的前提下显示真实命中数（C9）——geosite 单字符
+// 搜索命中上千条，逐条查缓存状态与建行才是成本所在，扫描本身不是。
+//
+// 返回区分两种情况：种类非法时 hits 为 nil；无命中时 hits 为空的非 nil 切片。
+func SearchLimited(kind, query string, limit int) (hits []Ref, total int) {
+	load()
+	kinds := Kinds
+	if kind != "" {
+		if !KindValid(kind) {
+			return nil, 0
+		}
+		kinds = []string{kind}
+	}
+	q := normalizeQuery(query)
+	hits = []Ref{}
+	for _, k := range kinds {
+		for _, code := range byKind[k] {
+			if q != "" && !strings.Contains(strings.ToLower(code), q) {
+				continue
+			}
+			total++
+			if limit <= 0 || len(hits) < limit {
+				hits = append(hits, Ref{Kind: k, Code: code})
+			}
+		}
+	}
+	return hits, total
+}
+
+// normalizeQuery 归一化搜索词：搜索始终忽略大小写与首尾空白。
+func normalizeQuery(query string) string { return strings.ToLower(strings.TrimSpace(query)) }
 
 // Parse 解析分类引用。接受两种写法：
 //   - "kind:code"（推荐，与 karing 一致）——冒号后即分类码

@@ -1085,3 +1085,210 @@ func geositeOptionExpectation(t *testing.T) []components.Option {
 	}
 	return want
 }
+
+// --- C9 · 分类库浏览的物化上限与标注缓存 ---
+
+// TestCatalogListMaterializesAtMostLimit 分类库列表必须「物化受限、总数准确」：
+// 单字符搜索 geosite 命中上千条，此前会为每一条查缓存状态、建列表项与表格行。
+func TestCatalogListMaterializesAtMostLimit(t *testing.T) {
+	app := pageFixture(t)
+	r := NewRules(app)
+	r.SetSize(140, 40)
+	r.openCatalog(rulesGroups)
+	r.catQuery = "a"
+	r.reloadCatalog()
+
+	full := catalog.Search(catalog.KindGeosite, "a", 0) // 独立参照：旧行为（全量物化）
+	// 反向核对：夹具必须让上限真正生效，否则下面的断言全是空转
+	if len(full) <= catalogHitLimit {
+		t.Fatalf("夹具失效：geosite 查询 %q 只命中 %d 条（需 > 上限 %d）", "a", len(full), catalogHitLimit)
+	}
+	if len(r.catHits) != catalogHitLimit {
+		t.Errorf("物化 %d 条，期望恰好上限 %d 条", len(r.catHits), catalogHitLimit)
+	}
+	if r.catTotal != len(full) {
+		t.Errorf("catTotal = %d，期望与全量命中 %d 一致", r.catTotal, len(full))
+	}
+	for i, hit := range r.catHits {
+		if hit.ref != full[i] { // 截断只能取前缀，不得改变顺序或内容
+			t.Fatalf("第 %d 条 = %v，期望 %v", i, hit.ref, full[i])
+		}
+	}
+	if len(r.list.Items) != len(r.catHits) || len(r.list.Keys) != len(r.catHits) {
+		t.Errorf("列表项 %d 条 / 键 %d 个，期望与命中 %d 条一致", len(r.list.Items), len(r.list.Keys), len(r.catHits))
+	}
+	// View 每帧经 table() 重建表格行，同样不得超出上限
+	r.table()
+	if len(r.list.Rows) != len(r.catHits) {
+		t.Errorf("表格行 %d，期望与命中 %d 条一致", len(r.list.Rows), len(r.catHits))
+	}
+	// 标题要给出真实总数并说明被截断，否则用户会以为总共就这么多条
+	view := ansi.Strip(r.View())
+	if !strings.Contains(view, strconv.Itoa(len(full))) {
+		t.Errorf("标题未给出真实命中总数 %d：\n%s", len(full), view)
+	}
+	if !strings.Contains(view, "仅列前") {
+		t.Errorf("标题未提示列表被截断：\n%s", view)
+	}
+	// 光标索引仍与命中下标一一对应（截断后不能有偏移）
+	r.list.Cursor = len(r.catHits) - 1
+	if ref, ok := r.selectedCatalogRef(); !ok || ref != full[catalogHitLimit-1] {
+		t.Errorf("末尾选中 = %v（ok=%v），期望 %v", ref, ok, full[catalogHitLimit-1])
+	}
+}
+
+// TestCatalogMarksFollowRuleChanges 引用 / 缓存标记必须准确，且引用集合的缓存要随
+// 规则变更失效——在同一个分类库会话里新增引用后标记立刻跟上，不必切页重进。
+//
+// 夹具说明：首次启动会导入地区预置 cn，因此 geosite:cn 天然处于「已引用」；
+// 本节另给 cn 造一个缓存文件，于是同一个命中项同时钉住两个方向的正例与反例。
+func TestCatalogMarksFollowRuleChanges(t *testing.T) {
+	app := pageFixture(t)
+	dir := app.Rules.CacheDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cn := catalog.Ref{Kind: catalog.KindGeosite, Code: "cn"}
+	if err := os.WriteFile(app.Rules.CatalogCachePath(cn), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	grp := &config.RoutingGroup{Name: "基准组", Target: "DIRECT", Enabled: true}
+	if err := app.DB.CreateRoutingGroup(grp); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRules(app)
+	r.SetSize(140, 40)
+	r.cur = grp
+	r.mode = rulesGroupRl
+	r.openCatalog(rulesGroupRl)
+	r.catQuery = "cn"
+	r.reloadCatalog()
+
+	find := func(ref catalog.Ref) (catalogHit, bool) {
+		for _, hit := range r.catHits {
+			if hit.ref == ref {
+				return hit, true
+			}
+		}
+		return catalogHit{}, false
+	}
+	hit, ok := find(cn)
+	if !ok {
+		t.Fatalf("查询 %q 未命中 cn，夹具失效：%v", r.catQuery, r.catHits)
+	}
+	if !hit.cached {
+		t.Error("cn 有缓存文件，应标为已缓存")
+	}
+	if !hit.inUse {
+		t.Error("地区预置 cn 引用了 geosite:cn，应标为已引用")
+	}
+
+	// 反例方向：同一次搜索结果里挑一个既无缓存、也未被引用的命中。
+	// 找不到就说明夹具失效（否则下面的断言会因为「全都已引用」而假通过）。
+	target := catalog.Ref{}
+	for _, h := range r.catHits {
+		if h.ref != cn && !h.cached && !h.inUse {
+			target = h.ref
+			break
+		}
+	}
+	if target.Code == "" {
+		t.Fatalf("查询 %q 的结果里没有既未缓存也未引用的条目，夹具失效：%v", r.catQuery, r.catHits)
+	}
+
+	// 走页面真实写入路径新增引用：UpdateGroup + MarkConfigDirty，随后 reloadCatalog。
+	// 若引用集合缓存只在「进入分类库时」算一次，这里的标记不会更新。
+	r.addCatalogRule(target)
+	got, ok := find(target)
+	if !ok {
+		t.Fatalf("新增引用后 %s 从列表消失：%v", target, r.catHits)
+	}
+	if !got.inUse {
+		t.Error("新增引用后标记未跟上（引用集合缓存未随配置变更失效）")
+	}
+	if got.cached {
+		t.Errorf("%s 没有缓存文件，却标为已缓存", target)
+	}
+	// 表格「引用」列消费同一份已物化标注
+	r.table()
+	idx := slices.IndexFunc(r.catHits, func(h catalogHit) bool { return h.ref == target })
+	if idx < 0 || idx >= len(r.list.Rows) || r.list.Rows[idx][1] != "已引用" {
+		t.Errorf("表格「引用」列 = %v，期望 已引用", r.list.Rows[idx])
+	}
+}
+
+// TestCatalogViewReadsCacheIndexNotPerHitStat 判决性测试：缓存标记必须来自
+// 「列一次目录」的索引，而不是逐条 CatalogCached（os.Stat）。
+//
+// 手法：把缓存目录设成**不可列但可 stat**（0111）。目录里确实放着 cn 的缓存文件，
+// 因此 CatalogCached(cn) 仍为 true（按名 stat 只需目录的搜索权限），而列目录失败。
+// 标记若来自索引，cn 必须显示「未缓存」；若回退成逐条 os.Stat 就会显示「已缓存」。
+// 反向核对就在同一处：断言时刻 CatalogCached(cn) 必须为 true，否则本测试无法区分两者。
+//
+// 本测试不主张「目录不可列 ⇒ 未缓存」是产品语义（真实用户的缓存目录永远可列），
+// 只用来钉住标记的取数来源。
+func TestCatalogViewReadsCacheIndexNotPerHitStat(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 会绕过目录权限检查，本探针失效")
+	}
+	app := pageFixture(t)
+	dir := app.Rules.CacheDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cn := catalog.Ref{Kind: catalog.KindGeosite, Code: "cn"}
+	if err := os.WriteFile(app.Rules.CatalogCachePath(cn), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// TempDir 的清理需要写权限，本回调在它之前执行（cleanup 后进先出）
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	if err := os.Chmod(dir, 0o111); err != nil {
+		t.Fatal(err)
+	}
+	if !app.Rules.CatalogCached(cn) {
+		t.Fatal("目录 0111 下按名 stat 应仍成功——否则本测试区分不出两种取数方式")
+	}
+
+	r := NewRules(app)
+	r.SetSize(140, 40)
+	r.openCatalog(rulesGroups)
+	r.catQuery = "cn"
+	r.reloadCatalog()
+	for _, hit := range r.catHits {
+		if hit.ref == cn {
+			if hit.cached {
+				t.Error("缓存标记不是来自列目录索引（仍存在逐条 os.Stat）")
+			}
+			return
+		}
+	}
+	t.Fatalf("查询 %q 未命中 cn，夹具失效：%v", r.catQuery, r.catHits)
+}
+
+// TestCatalogViewListsCacheDirOncePerReload 每次按键只允许列一次缓存目录：
+// 调用次数与命中总数无关（此前是「每个命中一次 os.Stat」）。
+func TestCatalogViewListsCacheDirOncePerReload(t *testing.T) {
+	app := pageFixture(t)
+	calls := 0
+	app.Rules.ReadDir = func(dir string) ([]os.DirEntry, error) {
+		calls++
+		return os.ReadDir(dir)
+	}
+	r := NewRules(app)
+	r.SetSize(140, 40)
+	r.openCatalog(rulesGroups) // 内部也会重载一次
+	r.catQuery = "a"
+
+	calls = 0
+	for range 20 {
+		r.reloadCatalog()
+	}
+	// 反向核对：这次搜索确实命中上千条，否则「1 次」没有说服力
+	if r.catTotal <= catalogHitLimit {
+		t.Fatalf("夹具失效：查询 %q 只命中 %d 条", r.catQuery, r.catTotal)
+	}
+	if calls != 20 {
+		t.Errorf("20 次重载共列目录 %d 次，期望每次重载恰好 1 次（而非每个命中一次）", calls)
+	}
+}

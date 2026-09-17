@@ -81,8 +81,15 @@ type Rules struct {
 	catQuery  string          // 搜索词
 	catSearch textinput.Model // 搜索输入框
 	catTyping bool            // 搜索输入中
-	catHits   []catalog.Ref   // 当前筛选结果
+	catHits   []catalogHit    // 当前已物化的命中（≤ catalogHitLimit 条）
+	catTotal  int             // 命中总数（含未物化的，供标题提示）
 	catBack   rulesMode       // 退出分类库后回到的模式
+
+	// catRefTags / catRefRev 缓存「被规则引用的内置分类」集合：键是 app 的配置
+	// 变更代数，规则增删后自动失效，不与每个字符输入绑定（C9）。
+	// catRefTags 为 nil 表示尚未扫描过。
+	catRefTags map[string]bool
+	catRefRev  uint64
 
 	// catRefsInUse 规则集管理页里列出的「引用中的内置分类」（只读行，排在自定义规则集之后）
 	catRefsInUse []catalog.Ref
@@ -105,6 +112,23 @@ type Rules struct {
 // NewRules 创建 Rules 页。
 func NewRules(app *application.App) *Rules {
 	return &Rules{base: base{app: app}}
+}
+
+// catalogHitLimit 是分类库列表一次物化的上限。
+//
+// 单字符搜索 geosite 会命中上千条（实测 "a" 命中 1090 条），逐条查缓存状态、
+// 建列表项与表格行曾是每次按键的主要成本（C9 实测 ≈2.7ms/帧）。扫描仍是 O(N)
+// 纯内存操作，被限制的是「命中之后的每条成本」；超出部分由标题提示继续输入。
+const catalogHitLimit = 200
+
+// catalogHit 是分类库列表的一行：引用本身 + 装载期算好的标注。
+//
+// 缓存状态此前由 reloadCatalog 写进 list.Items 的文案里，再由 Rules.table() 反解
+// 字符串（每次按键都做一次）；现在直接带字段，table() 只消费已物化的命中。
+type catalogHit struct {
+	ref    catalog.Ref
+	cached bool // 本地已有 <tag>.srs 缓存
+	inUse  bool // 已被启用中的规则引用
 }
 
 func (r *Rules) Title() string { return "分流规则" }
@@ -533,6 +557,8 @@ func (r *Rules) confirmMoveLayer() {
 
 func (r *Rules) reload() {
 	if r.mode == rulesCatalog {
+		// 重载入口（切页、任务回执）必须重扫引用集合：本页之外的写入不一定都经过按键路径
+		r.invalidateCatalogRefs()
 		r.reloadCatalog()
 		return
 	}
@@ -769,33 +795,38 @@ func (r *Rules) openCatalog(back rulesMode) {
 	r.err = nil
 	r.mode = rulesCatalog
 	r.list.Cursor = 0
+	// 进入分类库时重扫一次引用集合（与 reload() 同理，不沿用别处的缓存）
+	r.invalidateCatalogRefs()
 	r.reloadCatalog()
 }
 
 // reloadCatalog 按当前种类与搜索词重建分类列表，并标注缓存与引用状态。
+//
+// 每次按键都会走这里，因此两条昂贵的取数都必须摊销：缓存状态来自一次目录列举
+// （cachedCatalogTags），引用集合按配置代数缓存（referencedCatalogTags），
+// 命中物化条数则由 catalogHitLimit 封顶。
 func (r *Rules) reloadCatalog() {
 	selected := r.list.SelectedKey()
-	r.catHits = catalog.Search(r.catKind, r.catQuery, 0)
+	refs, total := catalog.SearchLimited(r.catKind, r.catQuery, catalogHitLimit)
+	r.catTotal = total
 
-	// 已被规则引用的分类（用于标注），失败不致命
-	referenced := map[string]bool{}
-	if refs, err := r.app.Rules.ReferencedCatalog(); err == nil {
-		for _, ref := range refs {
-			referenced[ref.Tag()] = true
-		}
-	}
+	referenced := r.referencedCatalogTags()
+	cached := r.cachedCatalogTags()
 
 	r.list.Height = r.catalogViewHeight()
 	r.list.Items = nil
 	r.list.Keys = nil
-	for _, ref := range r.catHits {
-		cached := r.app.Rules.CatalogCached(ref)
+	hits := make([]catalogHit, 0, len(refs))
+	for _, ref := range refs {
+		hit := catalogHit{ref: ref, cached: cached[ref.Tag()], inUse: referenced[ref.Tag()]}
+		hits = append(hits, hit)
+
 		mark := "  "
-		if referenced[ref.Tag()] {
+		if hit.inUse {
 			mark = "* " // 已被规则引用
 		}
 		state := "未缓存"
-		if cached {
+		if hit.cached {
 			state = "已缓存"
 		}
 		ipHint := ""
@@ -806,7 +837,57 @@ func (r *Rules) reloadCatalog() {
 			fmt.Sprintf("%s%-42s %-8s%s", mark, ref.String(), state, ipHint))
 		r.list.Keys = append(r.list.Keys, ref.String())
 	}
+	r.catHits = hits
 	r.list.SelectKey(selected)
+}
+
+// cachedCatalogTags 一次列目录读出分类缓存状态。
+//
+// 不能用 CatalogCached 逐条探测：单字符搜索命中上千条时，那就是每次按键上千次
+// os.Stat（C9 的主要成本）。列目录失败时按「都没有缓存」处理，与改动前
+// CatalogCached 出错返回 false 的表现一致，不把目录异常升级成页面错误。
+func (r *Rules) cachedCatalogTags() map[string]bool {
+	tags, err := r.app.Rules.CachedCatalogTags()
+	if err != nil {
+		return nil // nil map 读作「全部未缓存」
+	}
+	return tags
+}
+
+// referencedCatalogTags 返回「已被规则引用的内置分类」tag 集合。
+//
+// ReferencedCatalog 要扫全部分流组与 DNS 规则（实测 605µs/次，28 个分流组），
+// 不能挂在每个字符的输入路径上，因此按 app 的配置变更代数缓存：规则增删
+// （MarkConfigDirty）后自动重扫。需要无条件重扫时用 invalidateCatalogRefs。
+func (r *Rules) referencedCatalogTags() map[string]bool {
+	rev := r.app.ConfigRevision()
+	if r.catRefTags != nil && r.catRefRev == rev {
+		return r.catRefTags
+	}
+	refs, err := r.app.Rules.ReferencedCatalog()
+	if err != nil {
+		return map[string]bool{} // 扫描失败不缓存，下次重试
+	}
+	tags := make(map[string]bool, len(refs))
+	for _, ref := range refs {
+		tags[ref.Tag()] = true
+	}
+	r.catRefTags, r.catRefRev = tags, rev
+	return tags
+}
+
+// invalidateCatalogRefs 丢弃引用集合缓存，强制下次重扫。
+//
+// 按键路径按配置代数复用缓存即可；但「重新进入」的入口（切页重载、进入分类库）
+// 必须重扫——本页之外的写入（DNS 页、表单提交）不保证都经过配置代数。
+func (r *Rules) invalidateCatalogRefs() { r.catRefTags = nil }
+
+// catalogHitSummary 标题里的命中数：被上限截断时说明只列出了一部分。
+func (r *Rules) catalogHitSummary() string {
+	if r.catTotal > len(r.catHits) {
+		return fmt.Sprintf("%d 条命中 · 仅列前 %d 条", r.catTotal, len(r.catHits))
+	}
+	return fmt.Sprintf("%d 条命中", r.catTotal)
 }
 
 // catalogViewHeight 分类列表可见行数：给标题/搜索框/状态栏/帮助行留出空间。
@@ -822,7 +903,7 @@ func (r *Rules) selectedCatalogRef() (catalog.Ref, bool) {
 	if r.list.Cursor < 0 || r.list.Cursor >= len(r.catHits) {
 		return catalog.Ref{}, false
 	}
-	return r.catHits[r.list.Cursor], true
+	return r.catHits[r.list.Cursor].ref, true
 }
 
 func (r *Rules) handleCatalogKey(msg tea.KeyMsg) (Page, tea.Cmd) {
@@ -1378,7 +1459,7 @@ func (r *Rules) View() string {
 }
 
 func (r *Rules) catalogView() string {
-	head := fmt.Sprintf("分类库 / [%s] · %d 条 · [/] 种类 · %s", r.catKind, len(r.catHits), r.catQuery)
+	head := fmt.Sprintf("分类库 / [%s] · %s · [/] 种类 · %s", r.catKind, r.catalogHitSummary(), r.catQuery)
 	if r.catBack == rulesGroupRl && r.cur != nil {
 		head += "\n添加到: " + r.cur.Name + " → " + r.cur.Target
 	}

@@ -5,8 +5,10 @@ package rules
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/bbbstyyy/karing-tui/internal/validation"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -54,6 +56,10 @@ type Manager struct {
 
 	// Fetch 下载实现，默认 core.FetchHTTP；测试可替换以避免真实联网。
 	Fetch func(ctx context.Context, rawURL, proxyURL, userAgent string, limit int64) ([]byte, error)
+
+	// ReadDir 目录列举实现，默认 os.ReadDir；测试可替换以统计调用次数
+	// （CachedCatalogTags 必须「每次查询列一次目录」，不能退化成逐条 os.Stat）。
+	ReadDir func(dir string) ([]os.DirEntry, error)
 }
 
 // NewManager 创建规则集管理器。proxy/logf 可为 nil。
@@ -327,9 +333,50 @@ func (m *Manager) CatalogCachePath(ref catalog.Ref) string {
 }
 
 // CatalogCached 报告某内置分类已有本地缓存。
+//
+// 单条探测，供详情页 / CLI / EnsureCatalogCached 等冷路径使用（每次只问一个分类）。
+// 需要批量判断分类库列表的缓存状态时用 CachedCatalogTags：那是每次按键都会走的
+// 热路径，逐条 os.Stat 会退化成上千次系统调用（C9）。
 func (m *Manager) CatalogCached(ref catalog.Ref) bool {
 	info, err := os.Stat(m.CatalogCachePath(ref))
 	return err == nil && !info.IsDir()
+}
+
+// CachedCatalogTags 列出规则集缓存目录中「已缓存的分类 tag」集合（一次 ReadDir）。
+//
+// 分类库浏览页要为每个命中项标注缓存状态，而单字符搜索 geosite 会命中近 2000 条
+// （C9 实测逐条 os.Stat 约 2.7ms/帧），因此热路径改为「列一次目录 + map 查表」。
+//
+// 语义与逐条 CatalogCached 保持一致：只认 `<tag>.srs` 文件，同名目录不算，
+// 因此自定义规则集的 `<tag>.json` 缓存与写入中的临时文件都不会被误判。
+// 缓存目录不存在（从未下载过任何分类）返回空集合而不是错误。
+func (m *Manager) CachedCatalogTags() (map[string]bool, error) {
+	entries, err := m.readCacheDir(m.CacheDir())
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return map[string]bool{}, nil
+		}
+		return nil, err
+	}
+	tags := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if tag, ok := strings.CutSuffix(entry.Name(), ".srs"); ok && tag != "" {
+			tags[tag] = true
+		}
+	}
+	return tags, nil
+}
+
+// readCacheDir 走可替换的目录列举实现（与 Fetch 同样的测试缝：测试需要统计
+// 「每次按键列几次目录」，而不是照着源码推断）。
+func (m *Manager) readCacheDir(dir string) ([]os.DirEntry, error) {
+	if m.ReadDir != nil {
+		return m.ReadDir(dir)
+	}
+	return os.ReadDir(dir)
 }
 
 // DownloadCatalog 下载（或更新）一个内置分类的规则集到本地缓存。
