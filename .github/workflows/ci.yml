@@ -62,12 +62,16 @@ jobs:
 
   benchmark:
     name: Benchmark (ubuntu-latest)
-    # C-BENCH-CI：性能回归观察。独立于 lint/test，不阻塞合并——
-    # 初期只把 base→head 的 benchstat 对比写进 Run Summary，不做硬门禁；
-    # 稳定后再考虑按 allocs/op / B/op 的相对退化收紧（避免跨 runner 的
-    # 绝对时间抖动误报）。
+    # C-BENCH-CI：性能回归。独立于 lint/test。同一 runner 采集 base→head，
+    # benchstat 对比写进 Run Summary；硬门禁只看 allocs/op 与 B/op 的相对退化
+    # （由代码路径唯一决定，跨 runner 稳定），sec/op 绝对时间抖动大，仅告警
+    # 不拦截（建议 3/4 的分工，见 scripts/bench_gate.sh 头注释）。
+    # 观察模式逃生口：仓库变量 BENCH_GATE=off；阈值经 BENCH_GATE_THRESHOLD
+    # 调整（默认 10%）。
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    env:
+      BENCH_GATE: ${{ vars.BENCH_GATE || 'on' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -97,7 +101,7 @@ jobs:
         run: |
           git checkout "$GITHUB_SHA"
           go test -run=xxx -bench=. -benchmem -count=6 ./internal/tui/... | tee "$RUNNER_TEMP/bench-head.txt"
-      - name: benchstat 对比（写入 Run Summary，不拦截）
+      - name: benchstat 对比（写入 Run Summary）
         run: |
           {
             echo "## Benchmark 对比（base → head，同一 runner）"
@@ -115,6 +119,21 @@ jobs:
             || benchstat "$RUNNER_TEMP/bench-head.txt"
         env:
           BASE_NONE: ${{ steps.base.outputs.base == 'none' && '1' || '0' }}
+      - name: 门禁：allocs/op 与 B/op 相对退化（建议 4）
+        if: steps.base.outputs.base != 'none'
+        run: |
+          set -o pipefail
+          scripts/bench_gate.sh "$RUNNER_TEMP/bench-base.txt" "$RUNNER_TEMP/bench-head.txt" \
+            > "$RUNNER_TEMP/bench-gate.txt" || gate_rc=$?
+          {
+            echo "## Bench gate（allocs/op 与 B/op 相对退化，建议 4）"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/bench-gate.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/bench-gate.txt"
+          exit "${gate_rc:-0}"
 
   build:
     name: Build (Linux/macOS)
