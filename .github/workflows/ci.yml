@@ -60,6 +60,62 @@ jobs:
       - name: go test
         run: go test -race -coverprofile=coverage.out ./...
 
+  benchmark:
+    name: Benchmark (ubuntu-latest)
+    # C-BENCH-CI：性能回归观察。独立于 lint/test，不阻塞合并——
+    # 初期只把 base→head 的 benchstat 对比写进 Run Summary，不做硬门禁；
+    # 稳定后再考虑按 allocs/op / B/op 的相对退化收紧（避免跨 runner 的
+    # 绝对时间抖动误报）。
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: 解析 base 提交
+        id: base
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base="$(git merge-base "origin/${GITHUB_BASE_REF:-main}" HEAD)"
+          else
+            base="$(git rev-parse HEAD~1 2>/dev/null || true)"
+          fi
+          echo "base=${base:-none}" >> "$GITHUB_OUTPUT"
+      - name: 安装 benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+      - name: 采集 base 基准
+        if: steps.base.outputs.base != 'none'
+        run: |
+          git checkout "$BASE"
+          go test -run=xxx -bench=. -benchmem -count=6 ./internal/tui/... | tee "$RUNNER_TEMP/bench-base.txt"
+        env:
+          BASE: ${{ steps.base.outputs.base }}
+      - name: 采集 head 基准
+        run: |
+          git checkout "$GITHUB_SHA"
+          go test -run=xxx -bench=. -benchmem -count=6 ./internal/tui/... | tee "$RUNNER_TEMP/bench-head.txt"
+      - name: benchstat 对比（写入 Run Summary，不拦截）
+        run: |
+          {
+            echo "## Benchmark 对比（base → head，同一 runner）"
+            echo
+            if [ "${BASE_NONE:-0}" = "1" ]; then
+              echo "（无 base 提交，仅记录 head 数据）"
+              echo
+            fi
+            echo '```'
+            benchstat "$RUNNER_TEMP/bench-base.txt" "$RUNNER_TEMP/bench-head.txt" 2>/dev/null \
+              || benchstat "$RUNNER_TEMP/bench-head.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          benchstat "$RUNNER_TEMP/bench-base.txt" "$RUNNER_TEMP/bench-head.txt" 2>/dev/null \
+            || benchstat "$RUNNER_TEMP/bench-head.txt"
+        env:
+          BASE_NONE: ${{ steps.base.outputs.base == 'none' && '1' || '0' }}
+
   build:
     name: Build (Linux/macOS)
     runs-on: ubuntu-latest
