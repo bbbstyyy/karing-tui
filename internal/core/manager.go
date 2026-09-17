@@ -51,6 +51,11 @@ type Manager struct {
 	running   bool
 	startedAt time.Time
 	stopping  bool // 正在主动停止，用于区分崩溃
+	stuck     bool // 停止超时且进程组仍存活；Start/Restart 拒绝新实例（C16）
+
+	// stop 汇集停止流程可注入参数（timeout / signal / probe），
+	// 零值取默认实现；仅供测试在启动前覆盖。
+	stop stopCtl
 
 	// OnExit 在 sing-box 进程退出时回调（含崩溃）；参数为退出错误（主动停止为 nil）。
 	OnExit func(err error)
@@ -108,6 +113,11 @@ func (m *Manager) Start(ctx context.Context, configPath string) error {
 		return err
 	}
 	m.mu.Lock()
+	if m.stuck {
+		// 上一次停止两段超时后进程组仍存活，新实例可能与残留进程抢端口（C16 第 6 条）。
+		m.mu.Unlock()
+		return fmt.Errorf("上一次停止未完成（可能存在残留子进程），请稍后重试")
+	}
 	if m.running {
 		m.mu.Unlock()
 		return fmt.Errorf("sing-box 已在运行中")
@@ -169,12 +179,25 @@ func (m *Manager) Start(ctx context.Context, configPath string) error {
 func (m *Manager) watch(cmd *exec.Cmd, logFile io.WriteCloser, cancel context.CancelFunc, exited chan struct{}) {
 	err := cmd.Wait()
 
+	// C16 第 5 条：cmd.Wait 只回收 direct child，同 PGID 的 descendant
+	// 可能仍存活并持有继承的管道（这正是 Wait 迟迟不返回的常见原因）。
+	// 状态转为 stopped 的最终条件必须包含「目标进程组已不存在」。
+	// sing-box 正常不派生子进程，此探测在生产路径上几乎立即通过。
+	pgid := 0
+	if cmd.Process != nil {
+		pgid = cmd.Process.Pid
+	}
+	if pgid > 0 {
+		awaitGroupGone(pgid, m.stopCtl())
+	}
+
 	m.mu.Lock()
 	wasStopping := m.stopping
 	m.cmd = nil
 	m.cancel = nil
 	m.logFile = nil
 	m.running = false
+	m.stuck = false // stuck 期间进程组一旦消失，在这里恢复 stopped
 	m.startedAt = time.Time{}
 	m.mu.Unlock()
 
@@ -207,7 +230,16 @@ func (m *Manager) PID() int {
 	return m.cmd.Process.Pid
 }
 
-// Stop 停止 sing-box：先 SIGTERM，超时后 SIGKILL。
+// stopCtl 返回补全默认值后的停止参数快照。
+func (m *Manager) stopCtl() stopCtl {
+	return m.stop.withDefaults()
+}
+
+// Stop 停止 sing-box：先对进程组 SIGTERM，超时后 SIGKILL，再超时则进入
+// stuck 并返回 ErrProcessGroupDidNotExit（C16）。
+//
+// exited 由 watch 保证在「direct child 已回收且进程组已消失」后关闭，
+// 因此等待 exited 即等待停止的最终条件成立，不会无限阻塞。
 func (m *Manager) Stop() error {
 	m.mu.Lock()
 	if !m.running || m.cmd == nil {
@@ -217,17 +249,40 @@ func (m *Manager) Stop() error {
 	m.stopping = true
 	cmd := m.cmd
 	exited := m.exited
+	pgid := 0
+	if cmd.Process != nil {
+		pgid = cmd.Process.Pid
+	}
 	m.mu.Unlock()
 
-	killGroup(cmd.Process.Pid, syscallSIGTERM)
-
-	select {
-	case <-exited:
-	case <-time.After(5 * time.Second):
-		killGroup(cmd.Process.Pid, syscallSIGKILL)
+	// 防御：pgid<=0 时 kill(-pgid) 的语义会变成「发给调用者自己的进程组」，
+	// 绝不能执行。正常路径 cmd.Process 恒非空。
+	if pgid <= 0 {
 		<-exited
+		return nil
 	}
-	return nil
+
+	ctl := m.stopCtl()
+	warn := func(err error) {
+		m.Output.AppendLine(fmt.Sprintf("[karing] 向进程组发送信号失败: %v", err))
+	}
+	if stopProcess(pgid, exited, ctl, warn) {
+		return nil
+	}
+
+	// 两段宽限后进程组仍存活：进入 stuck，Start/Restart 拒绝新实例；
+	// watch 在组最终消失后完成收尾并恢复 stopped（C16 第 6/7 条）。
+	m.mu.Lock()
+	if !m.running {
+		// watch 恰在超时判定与加锁之间完成收尾，进程组实际已消失。
+		m.mu.Unlock()
+		return nil
+	}
+	m.stuck = true
+	m.mu.Unlock()
+
+	m.Output.AppendLine("[karing] 进程组停止超时，可能存在残留子进程")
+	return &ErrProcessGroupDidNotExit{Group: pgid}
 }
 
 // Restart 重启 sing-box。
