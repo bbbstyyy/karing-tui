@@ -83,7 +83,11 @@ func (d *Dashboard) Title() string { return "概览" }
 
 func (d *Dashboard) Editing() bool { return d.detailActive || d.confirm.Active }
 
-func (d *Dashboard) Init() tea.Cmd { return tickAt(time.Second) }
+// dashboardTickInterval 是概览页的刷新节拍：刷新核心状态、流量与配置状态。
+const dashboardTickInterval = time.Second
+
+// Init 不再启动 tick：周期刷新由 ActivateMsg 启动，隐藏页面不再空转。
+func (d *Dashboard) Init() tea.Cmd { return nil }
 
 func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 	if !d.Editing() {
@@ -105,6 +109,11 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 		// Root delivers the single refresh chain even while another page is open.
 		d.reloadModel()
 		d.status = d.app.Core.Status()
+		return d, d.startTick(dashboardTickInterval)
+	case DeactivateMsg:
+		// 切走即停：请求自愈与测速超时都由激活中的 tick 驱动，
+		// 隐藏时不再轮询（切回时由 ActivateMsg + startTick 重新开始）。
+		d.stopTick()
 		return d, nil
 	case components.ConfirmMsg:
 		if msg.ID == "restart" && msg.Confirmed {
@@ -118,6 +127,10 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 		return d, d.runAction("start", d.app.StartCore)
 
 	case tickMsg:
+		renew, ok := d.acceptTick(msg, dashboardTickInterval)
+		if !ok {
+			return d, nil
+		}
 		d.tickCount++
 		d.status = d.app.Core.Status()
 		d.configGenerated, d.checkedAt, d.checkErr = d.app.ConfigStatus()
@@ -142,9 +155,9 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 		} else if client := d.app.ClashClient(); client != nil && !d.fetching {
 			d.fetching = true
 			d.fetchStartedAt = time.Now()
-			return d, tea.Batch(d.fetchSnapshot(client), tickAt(time.Second))
+			return d, tea.Batch(d.fetchSnapshot(client), renew)
 		}
-		return d, tickAt(time.Second)
+		return d, renew
 
 	case snapMsg:
 		if msg.id != d.fetchID {

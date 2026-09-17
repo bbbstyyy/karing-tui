@@ -180,6 +180,103 @@ func (p taskStatusPage) TaskStatus() (bool, string) {
 	return p.active, "进行中"
 }
 
+// lifecyclePage 记录生命周期消息，用来孤立地验证 Root 的切页义务。
+type lifecyclePage struct {
+	activations   int
+	deactivations int
+	// reactivations 统计「已经激活时又被激活」的次数：那是 timer 链
+	// 会倍增的信号，正常切页流程里必须恒为 0。
+	reactivations int
+	active        bool
+}
+
+func (p *lifecyclePage) Title() string { return "life" }
+func (p *lifecyclePage) Init() tea.Cmd { return nil }
+func (p *lifecyclePage) Update(msg tea.Msg) (pages.Page, tea.Cmd) {
+	switch msg.(type) {
+	case pages.ActivateMsg:
+		if p.active {
+			p.reactivations++
+		}
+		p.activations++
+		p.active = true
+	case pages.DeactivateMsg:
+		p.deactivations++
+		p.active = false
+	}
+	return p, nil
+}
+func (p *lifecyclePage) View() string  { return "" }
+func (p *lifecyclePage) Editing() bool { return false }
+
+// runCmds 展开并投递一个命令树（含嵌套 batch），用于驱动 Init 之类的批量命令。
+func runCmds(t *testing.T, m *RootModel, cmd tea.Cmd) {
+	t.Helper()
+	if cmd == nil {
+		return
+	}
+	if batch, ok := cmd().(tea.BatchMsg); ok {
+		for _, child := range batch {
+			runCmds(t, m, child)
+		}
+		return
+	}
+	send(m, cmd())
+}
+
+// C2：切页必须先停用旧页再激活新页；快速来回切换不得让 timer 链倍增。
+func TestRootSwitchesPageLifecycle(t *testing.T) {
+	a, b, c := &lifecyclePage{}, &lifecyclePage{}, &lifecyclePage{}
+	m := RootModel{pages: []pages.Page{a, b, c}, current: 0}
+	runCmds(t, &m, m.Init())
+	if !a.active || a.activations != 1 {
+		t.Fatal("首次启动没有激活可见页")
+	}
+	if b.active || c.active {
+		t.Fatal("首次启动激活了隐藏页")
+	}
+
+	send(&m, runeKey("2"))
+	if m.current != 1 || !b.active || a.active {
+		t.Fatal("切页没有先停用旧页再激活新页")
+	}
+
+	send(&m, pages.NavigateMsg{Page: 2})
+	if m.current != 2 || !c.active || b.active {
+		t.Fatal("NavigateMsg 绕过了生命周期")
+	}
+
+	for i := range 20 {
+		send(&m, runeKey(string(rune('1'+i%2))))
+	}
+	for i, p := range []*lifecyclePage{a, b, c} {
+		if p.active != (i == m.current) {
+			t.Fatalf("页 %d active=%v 但当前页是 %d", i, p.active, m.current)
+		}
+		if p.reactivations != 0 {
+			t.Fatalf("页 %d 被重复激活 %d 次，timer 链会倍增", i, p.reactivations)
+		}
+		if p.activations > p.deactivations+1 {
+			t.Fatalf("页 %d 启动了 %d 条 timer 链却只停用 %d 次", i, p.activations, p.deactivations)
+		}
+	}
+}
+
+// C2：切走后不得再有批量命令/消息进隐藏页，否则切页前那一代 tick 会被处理。
+func TestRootDoesNotRefreshHiddenPages(t *testing.T) {
+	a, b := &lifecyclePage{}, &lifecyclePage{}
+	m := RootModel{pages: []pages.Page{a, b}, current: 0}
+	runCmds(t, &m, m.Init())
+	send(&m, runeKey("2"))
+	beforeA := a.activations
+	if cmd := send(&m, runeKey("7")); cmd != nil {
+		t.Fatal("菜单键不应产生命令")
+	}
+	if a.activations != beforeA {
+		t.Fatal("切走后旧页仍被激活")
+	}
+}
+
 type messagePage struct{ received []tea.Msg }
 
 func (*messagePage) Title() string { return "test" }

@@ -42,14 +42,29 @@ func NewLogs(app *application.App) *LogsPage {
 
 func (l *LogsPage) Title() string { return "日志" }
 func (l *LogsPage) Editing() bool { return l.typing }
-func (l *LogsPage) Init() tea.Cmd { return tickAt(500 * time.Millisecond) }
+
+// logTickInterval 是日志页的刷新节拍。日志由后台持续写入，页面只需按这个
+// 节拍重绘以跟随尾部。
+const logTickInterval = 500 * time.Millisecond
+
+// Init 不再启动 tick：周期刷新由 ActivateMsg 启动，隐藏页面不再空转。
+func (l *LogsPage) Init() tea.Cmd { return nil }
 
 func (l *LogsPage) Update(msg tea.Msg) (Page, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		l.SetSize(msg.Width, msg.Height)
+	case ActivateMsg:
+		return l, l.startTick(logTickInterval)
+	case DeactivateMsg:
+		l.stopTick()
+		return l, nil
 	case tickMsg:
-		return l, tickAt(500 * time.Millisecond)
+		renew, ok := l.acceptTick(msg, logTickInterval)
+		if !ok {
+			return l, nil
+		}
+		return l, renew
 	case tea.KeyMsg:
 		key := msg.String()
 		if l.typing {

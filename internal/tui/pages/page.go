@@ -28,15 +28,26 @@ type Page interface {
 	Editing() bool
 }
 
-// ActivateMsg 在页面被切换为当前页时发送，页面可借此刷新数据。
+// ActivateMsg 在页面被切换为当前页时发送，页面可借此刷新数据并启动周期刷新。
 type ActivateMsg struct{}
 
-// tickMsg 周期刷新消息。
-type tickMsg time.Time
+// DeactivateMsg 在页面被切换离开时发送。带周期 timer 的页面必须据此停止续期，
+// 否则隐藏页面仍会持续产生 Update/View 乃至后台请求。
+type DeactivateMsg struct{}
 
-// tickAt 返回一个在 d 之后触发 tickMsg 的命令。
-func tickAt(d time.Duration) tea.Cmd {
-	return tea.Tick(d, func(t time.Time) tea.Msg { return tickMsg(t) })
+// tickMsg 周期刷新消息。
+//
+// Generation 是启动这次 tick 时页面的「激活代次」。tea.Tick 是一次性且
+// 不可取消的命令：页面快速切走又切回时，切走后那一代 tick 仍会到达，
+// 若不加代次判定就会在重新激活后再续出一条链，造成 timer 叠加。
+type tickMsg struct {
+	Generation uint64
+	At         time.Time
+}
+
+// tickAt 返回一个在 d 之后触发 tickMsg 的命令，携带启动时的激活代次。
+func tickAt(d time.Duration, generation uint64) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg { return tickMsg{Generation: generation, At: t} })
 }
 
 // actionDoneMsg 异步操作完成消息。
@@ -82,6 +93,12 @@ type base struct {
 	retryTask               func() tea.Cmd
 	feedbackText            string
 	feedbackUntil           time.Time
+	// active / tickGeneration 是页面生命周期状态（C2）：
+	//   active          — 本页是否是当前可见页（带 timer 的页面据它决定是否续期）
+	//   tickGeneration  — 激活代次，用于丢弃切页前启动、切页后才到达的在途 tick
+	// 递增点只有 startTick / stopTick 两处，见各自说明。
+	active         bool
+	tickGeneration uint64
 }
 
 func (b *base) SetSize(width, height int) {
@@ -90,6 +107,34 @@ func (b *base) SetSize(width, height int) {
 	if width < 120 {
 		b.previewFocus = false
 	}
+}
+
+// startTick 在页面被激活时启动一代新的周期刷新，并返回第一发 tick。
+//
+// 代次在这里递增：停用时也会再递增一次，于是「停用前启动、停用后才到达」
+// 的 tick 因代次不匹配而被丢弃，无法在重新激活后续出新链。
+func (b *base) startTick(interval time.Duration) tea.Cmd {
+	b.active = true
+	b.tickGeneration++
+	return tickAt(interval, b.tickGeneration)
+}
+
+// stopTick 在页面被切换离开时让在途 tick 全部失效。
+func (b *base) stopTick() {
+	b.active = false
+	b.tickGeneration++
+}
+
+// acceptTick 处理周期刷新消息：返回该 tick 是否属于当前激活代次，以及
+// 属于当前代次时应续发的下一发 tick。
+//
+// 只有能被接受的 tick 才会续期——旧代次在切页之后到达时直接丢弃，
+// 重新激活时由 startTick 另起一代，因此 timer 链不会叠加。
+func (b *base) acceptTick(msg tickMsg, interval time.Duration) (tea.Cmd, bool) {
+	if !b.active || msg.Generation != b.tickGeneration {
+		return nil, false
+	}
+	return tickAt(interval, b.tickGeneration), true
 }
 
 // Editing 默认不处于编辑状态；有文本输入的页面自行覆盖。

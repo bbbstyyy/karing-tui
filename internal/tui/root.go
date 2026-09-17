@@ -143,6 +143,28 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // 见 Update 的说明。
 func (m *RootModel) touch() { m.pageTouched = true }
 
+// switchTo 把可见页切到 idx：先向旧页发 DeactivateMsg（带 timer 的页面据此
+// 停止续期），再向新页发 ActivateMsg（页面据此刷新数据并启动新一代 tick）。
+//
+// 所有切页入口都必须走这里——快捷键、NavigateMsg 与后续新增的入口；
+// 只发 ActivateMsg 会让旧页的 timer 继续在后台空转。
+func (m *RootModel) switchTo(idx int) tea.Cmd {
+	if idx < 0 || idx >= len(m.pages) {
+		return nil
+	}
+	var stop tea.Cmd
+	if idx != m.current {
+		p, cmd := m.pages[m.current].Update(pages.DeactivateMsg{})
+		m.pages[m.current] = p
+		stop = cmd
+	}
+	m.current = idx
+	m.touch()
+	p, start := m.pages[idx].Update(pages.ActivateMsg{})
+	m.pages[idx] = p
+	return tea.Batch(stop, start)
+}
+
 // wakeup 按当前状态决定是否排定一个一次性唤醒。三个布尔返回值的含义：
 // 唤醒命令、spinner 定时器是否在途、收尾重绘是否在途。
 func (m RootModel) wakeup() (tea.Cmd, bool, bool) {
@@ -207,14 +229,7 @@ func (m RootModel) update(msg tea.Msg) (RootModel, tea.Cmd) {
 		}
 	}
 	if nav, ok := msg.(pages.NavigateMsg); ok {
-		if nav.Page >= 0 && nav.Page < len(m.pages) {
-			m.current = nav.Page
-			m.touch()
-			p, cmd := m.pages[m.current].Update(pages.ActivateMsg{})
-			m.pages[m.current] = p
-			return m, route(m.current, cmd)
-		}
-		return m, nil
+		return m, route(max(0, min(nav.Page, len(m.pages)-1)), m.switchTo(nav.Page))
 	}
 	if routed, ok := msg.(pageMsg); ok {
 		if nav, ok := routed.Msg.(pages.NavigateMsg); ok {
@@ -350,11 +365,7 @@ func (m RootModel) update(msg tea.Msg) (RootModel, tea.Cmd) {
 				}
 			}
 			if idx != m.current {
-				m.current = idx
-				m.touch()
-				p, cmd := m.pages[idx].Update(pages.ActivateMsg{})
-				m.pages[idx] = p
-				return m, route(idx, cmd)
+				return m, route(idx, m.switchTo(idx))
 			}
 		}
 	}

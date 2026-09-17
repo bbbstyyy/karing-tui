@@ -467,6 +467,10 @@ func TestLogsKeepAbsoluteAnchorAsNewLinesArrive(t *testing.T) {
 	app := pageFixture(t)
 	l := NewLogs(app)
 	l.SetSize(80, 10)
+	// C2：周期刷新由激活启动，不再是 Init。
+	if _, cmd := l.Update(ActivateMsg{}); cmd == nil {
+		t.Fatal("activation did not start the refresh chain")
+	}
 	for i := range 100 {
 		app.AppLog.AppendLine(fmt.Sprintf("fixture-line-%03d", i))
 	}
@@ -475,7 +479,7 @@ func TestLogsKeepAbsoluteAnchorAsNewLinesArrive(t *testing.T) {
 	for i := 100; i < 110; i++ {
 		app.AppLog.AppendLine(fmt.Sprintf("fixture-line-%03d", i))
 	}
-	l.Update(tickMsg(time.Now()))
+	l.Update(tickMsg{Generation: l.tickGeneration})
 	after := strings.Join(strings.Split(l.View(), "\n")[1:8], "\n")
 	if before != after {
 		t.Fatal("new logs moved the reader's anchor")
@@ -484,8 +488,17 @@ func TestLogsKeepAbsoluteAnchorAsNewLinesArrive(t *testing.T) {
 	if !strings.Contains(l.View(), "fixture-line-109") {
 		t.Fatal("End did not resume following")
 	}
-	if _, cmd := l.Update(ActivateMsg{}); cmd != nil {
-		t.Fatal("activation duplicated the refresh chain")
+	// 切走之后，切走前那一代在途 tick 到达时必须被丢弃，不得续出新链。
+	stale := l.tickGeneration
+	l.Update(DeactivateMsg{})
+	if _, cmd := l.Update(tickMsg{Generation: stale}); cmd != nil {
+		t.Fatal("stale tick renewed the refresh chain")
+	}
+	if l.active {
+		t.Fatal("deactivation left the page active")
+	}
+	if _, cmd := l.Update(ActivateMsg{}); cmd == nil || !l.active {
+		t.Fatal("re-activation did not restart the refresh chain")
 	}
 }
 
@@ -533,7 +546,18 @@ exit 1
 	if d.upTotal == 999999 {
 		t.Fatal("snapshot from old core was accepted")
 	}
-	if _, cmd := d.Update(ActivateMsg{}); cmd != nil {
-		t.Fatal("activation duplicated the refresh chain")
+	// C2：周期刷新由激活启动；切走之后，切走前那一代在途 tick 必须被丢弃。
+	if _, cmd := d.Update(ActivateMsg{}); cmd == nil {
+		t.Fatal("activation did not start the refresh chain")
+	}
+	stale := d.tickGeneration
+	if _, cmd := d.Update(DeactivateMsg{}); cmd != nil {
+		t.Fatal("deactivation produced a command")
+	}
+	if _, cmd := d.Update(tickMsg{Generation: stale}); cmd != nil {
+		t.Fatal("stale tick renewed the refresh chain")
+	}
+	if d.active {
+		t.Fatal("deactivation left the page active")
 	}
 }
