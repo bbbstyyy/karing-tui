@@ -4,15 +4,71 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动
 
 	"github.com/bbbstyyy/karing-tui/internal/platform"
 )
+
+// 只读（query-only）打开策略。
+//
+// 术语：这里的「只读」指**应用/SQL 逻辑只读 + 不创建主数据库文件**，不是
+// 「文件系统绝对零写入」——SQLite 的 WAL reader 仍可能需要在数据目录创建或
+// 维护 -shm/-wal sidecar，这不属于应用的业务写操作。
+var (
+	// ErrNotInitialized 表示数据库不存在、为 0 字节，或从未被主程序迁移过。
+	ErrNotInitialized = errors.New("数据库尚未初始化")
+	// ErrSchemaTooOld 表示数据库 schema 版本低于本程序支持的版本。
+	ErrSchemaTooOld = errors.New("数据库 schema 版本较旧")
+	// ErrSchemaTooNew 表示数据库 schema 版本高于本程序支持的版本。
+	ErrSchemaTooNew = errors.New("数据库 schema 版本较新")
+	// ErrDataDirNotWritable 表示数据目录不允许 SQLite 创建 sidecar/锁文件。
+	ErrDataDirNotWritable = errors.New("数据目录不可写")
+)
+
+// ReadOnlyUnavailable 报告错误是否属于「只读打开不可用」族：未初始化、
+// schema 版本不匹配、数据目录不可写。这些错误的文案本身就是可操作指引，
+// 调用方应原样呈现，不要套「初始化失败」之类的通用前缀。
+func ReadOnlyUnavailable(err error) bool {
+	return errors.Is(err, ErrNotInitialized) || errors.Is(err, ErrSchemaTooOld) ||
+		errors.Is(err, ErrSchemaTooNew) || errors.Is(err, ErrDataDirNotWritable)
+}
+
+// writableDSNPragmas 可写连接的 DSN 参数。
+//
+// _time_format=sqlite 让时间类型按 SQLite 原生存储，便于跨驱动读取；
+// foreign_keys(1) 启用外键级联（SQLite 默认关闭）。
+const writableDSNPragmas = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_time_format=sqlite"
+
+// queryOnlyDSNPragmas 只读连接的 DSN 参数**白名单**。
+//
+// 显式列举，而不是「复制可写 DSN 再删掉危险项」：可写侧以后新增 pragma 时不得
+// 自动继承到这里。实测（探针记录见 CHECKLIST-v4 的 C13 节）`_pragma=journal_mode(WAL)`
+// 在 `_query_only` 生效**之前**执行，能把非 WAL 库持久改成 WAL——只读连接会因此
+// 留下一条真实的写入路径。
+//
+//	mode=ro              打开阶段不允许创建数据库文件（库不存在即失败）。
+//	                     只加 _query_only 时，库不存在会被 SQLite 创建成 0 字节文件，
+//	                     从而掩盖「KARING_HOME 指错路径」这类问题。
+//	_query_only=1        连接建立后拒绝 INSERT/UPDATE/DDL/`PRAGMA user_version=`
+//	busy_timeout(5000)   与可写连接一致的锁等待行为
+//	foreign_keys(1)      与可写连接一致的外键语义
+//	_time_format=sqlite  **必须保留**，DATETIME 列的扫描行为依赖它
+//
+// 禁止出现 `_pragma=journal_mode(...)` / `_auto_vacuum` 以及任何会在 connection
+// init 阶段改写数据库文件/header/schema 的参数。
+const queryOnlyDSNPragmas = "mode=ro&_query_only=1&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_time_format=sqlite"
+
+// fileDSN 拼出 file: DSN。query 由调用方以上述常量显式给出（见白名单注释）。
+func fileDSN(path, query string) string {
+	return (&url.URL{Scheme: "file", Path: path}).String() + "?" + query
+}
 
 // DB 封装 SQLite 连接，提供迁移与各领域读写方法。
 type DB struct {
@@ -22,10 +78,7 @@ type DB struct {
 
 // Open 打开（必要时创建）数据库并执行 schema 迁移。
 func Open(paths *platform.Paths) (*DB, error) {
-	// _time_format=sqlite 让时间类型按 SQLite 原生存储，便于跨驱动读取；
-	// foreign_keys(1) 启用外键级联（SQLite 默认关闭）。
-	dsn := (&url.URL{Scheme: "file", Path: paths.DB}).String() + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_time_format=sqlite"
-	sqlDB, err := sql.Open("sqlite", dsn)
+	sqlDB, err := sql.Open("sqlite", fileDSN(paths.DB, writableDSNPragmas))
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库 %s 失败: %w", paths.DB, err)
 	}
@@ -47,6 +100,68 @@ func Open(paths *platform.Paths) (*DB, error) {
 // Close 关闭数据库连接。
 func (d *DB) Close() error {
 	return d.db.Close()
+}
+
+// OpenQueryOnly 以只读方式打开**既有**数据库，供 CLI 只读命令使用。
+//
+// 与 Open 的差别：不迁移 schema、不写 user_version、不 chmod、不补默认数据，
+// 且数据库不存在时打开失败而不是创建它（ErrNotInitialized）。
+func OpenQueryOnly(paths *platform.Paths) (*DB, error) {
+	sqlDB, err := sql.Open("sqlite", fileDSN(paths.DB, queryOnlyDSNPragmas))
+	if err != nil {
+		return nil, fmt.Errorf("打开数据库 %s 失败: %w", paths.DB, err)
+	}
+	// 与可写连接一致：单连接，避免 SQLITE_BUSY。
+	sqlDB.SetMaxOpenConns(1)
+	wrapped := &DB{db: sqlDB, Paths: paths}
+	if err := wrapped.checkQueryOnlySchema(); err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
+	return wrapped, nil
+}
+
+// checkQueryOnlySchema 在不写库的前提下确认 schema 版本与本程序一致。
+//
+// 严格匹配是刻意的：只读连接不能自己迁移，遇到旧 schema 必须让用户先跑主程序，
+// 否则会读到迁移中途的表结构。
+func (d *DB) checkQueryOnlySchema() error {
+	var version int
+	if err := d.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return classifyQueryOnlyOpenError(d.Paths.DB, err)
+	}
+	supported := len(migrations)
+	switch {
+	case version == 0:
+		// 0 字节文件读出来也是 0：两种情况都等价于「主程序还没初始化过」。
+		return fmt.Errorf("%w（%s）：请先运行 karing-tui 主程序完成初始化", ErrNotInitialized, d.Paths.DB)
+	case version < supported:
+		return fmt.Errorf("%w（数据库 v%d、程序支持 v%d）：请先运行 karing-tui 主程序完成迁移，再执行只读命令",
+			ErrSchemaTooOld, version, supported)
+	case version > supported:
+		return fmt.Errorf("%w（数据库 v%d、程序支持 v%d）：请升级 karing-tui 后再执行只读命令",
+			ErrSchemaTooNew, version, supported)
+	}
+	return nil
+}
+
+// classifyQueryOnlyOpenError 把驱动的打开期错误翻译成可操作的错误。
+//
+// 只读连接取不到连接有两类原因，处置完全不同：
+//   - 库不存在（mode=ro 不创建文件）："unable to open database file (14)"；
+//   - 库存在但数据目录不可写，SQLite 无法为 WAL reader 创建 -shm/-wal
+//     sidecar：SQLITE_READONLY_DIRECTORY (1544)。
+//
+// 第二类**不得**归类成 ErrNotInitialized——库本身是好的，问题在目录权限。
+func classifyQueryOnlyOpenError(path string, err error) error {
+	switch {
+	case strings.Contains(err.Error(), "unable to open database file"):
+		return fmt.Errorf("%w（%s 不存在）：请先运行 karing-tui 主程序完成初始化", ErrNotInitialized, path)
+	case strings.Contains(err.Error(), "1544"):
+		return fmt.Errorf("%w（%s）：SQLite 的 WAL reader 需要在同一目录创建 -shm/-wal，请给该目录写权限",
+			ErrDataDirNotWritable, filepath.Dir(path))
+	}
+	return fmt.Errorf("以只读方式打开数据库 %s 失败: %w", path, err)
 }
 
 // VacuumInto 将当前数据库的一致性快照写入 path（SQLite VACUUM INTO，

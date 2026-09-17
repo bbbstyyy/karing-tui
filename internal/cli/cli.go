@@ -790,6 +790,13 @@ func withApp(stderr io.Writer, fn func(*application.App) int) int {
 	}
 	app, err := application.NewReadOnly(paths)
 	if err != nil {
+		// 「库不存在 / schema 版本不匹配 / 数据目录不可写」是只读命令的预期失败
+		// （见 storage.ReadOnlyUnavailable），错误文案本身就是给用户的指引，
+		// 直接输出即可，不要套上「初始化应用失败」这种会误导排查方向的前缀。
+		if storage.ReadOnlyUnavailable(err) {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
 		fmt.Fprintln(stderr, "初始化应用失败:", err)
 		return 1
 	}

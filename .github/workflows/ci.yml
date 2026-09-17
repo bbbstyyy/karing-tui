@@ -79,10 +79,24 @@ jobs:
           tar -xzf "dist/karing-tui-$BUILD_VERSION/karing-tui-$BUILD_VERSION-linux-amd64.tar.gz" -C "$RUNNER_TEMP/karing-release"
           export KARING_HOME="$RUNNER_TEMP/karing-release-home"
           "$RUNNER_TEMP/karing-release/karing" version
+          # C13 起只读命令不再隐式创建/迁移数据库（见 storage.OpenQueryOnly），
+          # 因此先用一次可写路径完成数据目录初始化，再验证只读输出。
+          # 用 backup export 而不是 config check：它不依赖 sing-box 内核，
+          # 从而让下面那条 test -x 仍然真实覆盖「只读命令释放内核」这条路径。
+          "$RUNNER_TEMP/karing-release/karing" backup export "$RUNNER_TEMP/karing-init-backup"
           "$RUNNER_TEMP/karing-release/karing" status --json
           test -x "$KARING_HOME/runtime/bin/sing-box"
           "$RUNNER_TEMP/karing-release/karing" config check
           SINGBOX_BIN="$KARING_HOME/runtime/bin/sing-box" go test -count=1 ./internal/core -run TestIntegrationRealSingBox -v
+      - name: 只读命令在未初始化数据目录上必须失败且不留数据库
+        run: |
+          export KARING_HOME="$RUNNER_TEMP/karing-fresh"
+          if "$RUNNER_TEMP/karing-release/karing" status --json; then
+            echo "未初始化时 status 不应成功（C13：只读命令不得隐式建库）" >&2
+            exit 1
+          fi
+          # 关键：失败路径上不得留下 0 字节 karing.db，否则会掩盖 KARING_HOME 指错路径。
+          test ! -e "$KARING_HOME/karing.db"
       - uses: actions/upload-artifact@v4
         with:
           name: dist

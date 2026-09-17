@@ -75,14 +75,25 @@ func New(paths *platform.Paths) (*App, error) {
 	return newApp(paths, true)
 }
 
-// NewReadOnly 打开应用供只读 CLI 使用，不执行默认配置初始化。
+// NewReadOnly 打开应用供只读 CLI 使用：不执行默认配置初始化，也不迁移 schema。
+// 数据库不存在时不会创建它（见 storage.OpenQueryOnly）。
 // 这样 status/list/route test 等命令不会在读取数据库时产生写入。
 func NewReadOnly(paths *platform.Paths) (*App, error) {
 	return newApp(paths, false)
 }
 
 func newApp(paths *platform.Paths, initializeDefaults bool) (*App, error) {
-	db, err := storage.Open(paths)
+	// 只读入口（CLI 的 status / profile list / route list / diagnose 等 14 处）
+	// 走 query-only 打开策略：不迁移、不 chmod、库不存在时不创建文件（C13）。
+	var (
+		db  *storage.DB
+		err error
+	)
+	if initializeDefaults {
+		db, err = storage.Open(paths)
+	} else {
+		db, err = storage.OpenQueryOnly(paths)
+	}
 	if err != nil {
 		return nil, err
 	}
