@@ -30,25 +30,18 @@ func latencyLabel(n *config.Node) string {
 	return "未测"
 }
 
-func (p *Profiles) table() {
-	var rows [][]string
-	switch p.mode {
-	case profilesSubs:
-		for _, s := range p.subs {
-			updated := "从未更新"
-			if !s.LastUpdated.IsZero() {
-				updated = s.LastUpdated.Format("01-02 15:04")
-			}
-			rows = append(rows, []string{s.Name, enabledLabel(s.Enabled), strconv.Itoa(s.NodeCount), updated})
-		}
-		p.list.SetTable([]components.Column{col("订阅", 18, 0, false), col("状态", 4, 0, false), col("节点", 6, 0, true), col("更新时间", 14, 1, false)}, rows, p.list.Keys)
-	case profilesNodes:
-		for _, n := range p.filtered {
-			rows = append(rows, []string{n.Name, latencyLabel(n), enabledLabel(n.Enabled), n.Protocol, n.Server})
-		}
-		p.list.SetTable([]components.Column{col("节点", 18, 0, false), col("延迟", 8, 0, true), col("状态", 4, 0, false), col("协议", 12, 1, false), col("服务器", 22, 2, false)}, rows, p.list.Keys)
+// Profiles 的列定义提到包级变量：它们在每个渲染周期都会被用到，
+// 不必每次 SetTable 都重建切片。列切片只读，不共享可变状态。
+var (
+	profilesSubColumns = []components.Column{
+		col("订阅", 18, 0, false), col("状态", 4, 0, false),
+		col("节点", 6, 0, true), col("更新时间", 14, 1, false),
 	}
-}
+	profilesNodeColumns = []components.Column{
+		col("节点", 18, 0, false), col("延迟", 8, 0, true), col("状态", 4, 0, false),
+		col("协议", 12, 1, false), col("服务器", 22, 2, false),
+	}
+)
 
 func (g *Groups) table() {
 	var rows [][]string

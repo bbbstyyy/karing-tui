@@ -97,11 +97,12 @@ func (p *Profiles) Update(msg tea.Msg) (Page, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		p.SetSize(msg.Width, msg.Height)
+		// 宽度只影响行文本，重建表格即可，不必重新过滤/排序或查库。
 		switch p.mode {
 		case profilesNodes:
-			p.applyNodeFilter()
+			p.rebuildNodeTable()
 		case profilesSubs:
-			p.reload()
+			p.rebuildSubTable()
 		}
 		return p, nil
 	case ActivateMsg:
@@ -356,23 +357,36 @@ func (p *Profiles) reload() {
 	if p.mode == profilesResults {
 		return
 	}
-	selected := p.list.SelectedKey()
-	p.list.Items = nil
-	p.list.Keys = nil
-	for _, s := range subs {
+	p.rebuildSubTable()
+}
+
+// rebuildSubTable 只基于缓存的 p.subs 重建订阅表格行，不访问数据库。
+func (p *Profiles) rebuildSubTable() {
+	rows := make([][]string, 0, len(p.subs))
+	keys := make([]string, 0, len(p.subs))
+	for _, s := range p.subs {
 		updated := "从未更新"
 		if !s.LastUpdated.IsZero() {
-			updated = s.LastUpdated.Format("2006-01-02 15:04")
+			updated = s.LastUpdated.Format("01-02 15:04")
 		}
-		state := "启用"
-		if !s.Enabled {
-			state = "停用"
-		}
-		p.list.Items = append(p.list.Items,
-			fmt.Sprintf("%s %4d节点 %s %s", components.Pad(s.Name, max(12, p.mainWidth()-38)), s.NodeCount, state, updated))
-		p.list.Keys = append(p.list.Keys, strconv.FormatInt(s.ID, 10))
+		rows = append(rows, []string{s.Name, enabledLabel(s.Enabled), strconv.Itoa(s.NodeCount), updated})
+		keys = append(keys, strconv.FormatInt(s.ID, 10))
 	}
-	p.list.SelectKey(selected)
+	p.list.SetTable(profilesSubColumns, rows, keys)
+}
+
+// rebuildNodeTable 只基于 p.filtered 重建节点表格行，不访问数据库、不排序。
+//
+// 调用点只有「影响显示内容」的变化：节点 reload、窗口尺寸、过滤/排序条件变更、
+// 测速结果回写。光标移动与翻页不重建——它们只改 SimpleList 的视口。
+func (p *Profiles) rebuildNodeTable() {
+	rows := make([][]string, 0, len(p.filtered))
+	keys := make([]string, 0, len(p.filtered))
+	for _, n := range p.filtered {
+		rows = append(rows, []string{n.Name, latencyLabel(n), enabledLabel(n.Enabled), n.Protocol, n.Server})
+		keys = append(keys, strconv.FormatInt(n.ID, 10))
+	}
+	p.list.SetTable(profilesNodeColumns, rows, keys)
 }
 
 func (p *Profiles) reloadNodes() {
@@ -392,9 +406,9 @@ func (p *Profiles) reloadNodes() {
 	p.applyNodeFilter()
 }
 
-// applyNodeFilter 按搜索/协议/订阅过滤并排序，重建列表项。
+// applyNodeFilter 按搜索/协议/订阅过滤并排序，得到 p.filtered 后交给
+// rebuildNodeTable 建行（选中行由 SimpleList.SetItems 按 key 自行保持）。
 func (p *Profiles) applyNodeFilter() {
-	selected := p.list.SelectedKey()
 	subIDByName := map[string]int64{}
 	for _, s := range p.subs {
 		subIDByName[s.Name] = s.ID
@@ -428,27 +442,7 @@ func (p *Profiles) applyNodeFilter() {
 		sortNodesByName(filtered)
 	}
 	p.filtered = filtered
-
-	p.list.Items = nil
-	p.list.Keys = nil
-	for _, n := range filtered {
-		lat := "  -  "
-		if !n.LastTested.IsZero() || n.LatencyMS >= 0 {
-			if n.LatencyMS >= 0 {
-				lat = fmt.Sprintf("%4dms", n.LatencyMS)
-			} else {
-				lat = "失败"
-			}
-		}
-		state := "启用"
-		if !n.Enabled {
-			state = "停用"
-		}
-		p.list.Items = append(p.list.Items,
-			fmt.Sprintf("%s %s %6s %s", components.Pad(n.Name, max(10, p.mainWidth()-33)), components.Pad(n.Protocol, 12), lat, state))
-		p.list.Keys = append(p.list.Keys, strconv.FormatInt(n.ID, 10))
-	}
-	p.list.SelectKey(selected)
+	p.rebuildNodeTable()
 }
 
 func (p *Profiles) resetNodeView() {
@@ -1029,7 +1023,9 @@ func (p *Profiles) onConfirm(msg components.ConfirmMsg) (Page, tea.Cmd) {
 // --- 渲染 ---
 
 func (p *Profiles) View() string {
-	p.table()
+	// 表格行由 rebuildSubTable/rebuildNodeTable 在状态变化时准备好，
+	// View 只渲染。这里不能调 table()/SetTable()/SetItems()——那会让每一帧
+	// 都按总行数重建（C4）。
 	p.preview = ""
 	if p.mode == profilesSubs {
 		if sub, ok := p.selectedSub(); ok {

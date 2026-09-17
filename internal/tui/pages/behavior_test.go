@@ -426,6 +426,46 @@ func TestDNSViewDoesNotTouchDatabase(t *testing.T) {
 	}
 }
 
+// C4：Profiles 的表格行必须在状态变化时准备好，渲染路径只做渲染。
+//
+// 手法：只改数据、不重建——View 的输出必须保持不变。若 View 里仍有
+// table()/SetTable()/SetItems()，行就会被重新建模，"ghost" 会立刻出现。
+func TestProfilesViewRendersPreparedRows(t *testing.T) {
+	app := pageFixture(t)
+	for _, name := range []string{"alpha", "beta"} {
+		if err := app.Proxy.SaveManual(&config.Node{Name: name, Protocol: "http", Server: "example.invalid", Port: 80}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := NewProfiles(app)
+	p.SetSize(100, 24)
+	p.mode = profilesNodes
+	p.reloadNodes()
+	before := p.View()
+	if !strings.Contains(before, "alpha") {
+		t.Fatal("reloadNodes 没有准备好表格行")
+	}
+
+	// 就地改名而非增删：不改变头部计数与当前预览，只有重建行才会体现出来。
+	p.filtered[1].Name = "ghost"
+	if got := p.View(); got != before {
+		t.Fatal("View 在渲染路径里重建了表格行")
+	}
+	rows := len(p.list.Rows)
+
+	// 光标移动只改视口，不得触发重建。
+	p.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if len(p.list.Rows) != rows {
+		t.Fatal("光标移动触发了行重建")
+	}
+
+	// 显式重建后才反映新数据。
+	p.rebuildNodeTable()
+	if !strings.Contains(p.View(), "ghost") {
+		t.Fatal("rebuildNodeTable 没有生效")
+	}
+}
+
 func TestNodeSearchIsIncrementalAndEscapeRestoresFilterAndPosition(t *testing.T) {
 	app := pageFixture(t)
 	p := NewProfiles(app)
