@@ -174,43 +174,218 @@ func (b *BinaryManager) ValidateVersion(ctx context.Context, bin string) error {
 	if err != nil {
 		return err
 	}
-	if compareVersions(got, minimumSupportedVersion) < 0 {
+	cmp, err := compareVersions(got, minimumSupportedVersion)
+	if err != nil {
+		return fmt.Errorf("sing-box 版本校验失败: %w", err)
+	}
+	if cmp < 0 {
 		return fmt.Errorf("sing-box 版本过低: %s，需要至少 %s", got, minimumSupportedVersion)
 	}
 	return nil
 }
 
-func compareVersions(a, b string) int {
-	pa := strings.Split(strings.TrimPrefix(a, "v"), ".")
-	pb := strings.Split(strings.TrimPrefix(b, "v"), ".")
-	for i := 0; i < 3; i++ {
-		na, nb := 0, 0
-		if i < len(pa) {
-			na, _ = strconv.Atoi(pa[i])
+// semVersion 是按 SemVer 2.0.0 解析后的版本号。
+type semVersion struct {
+	major, minor, patch uint64
+	prerelease          []string // 按 "." 切分的预发布标识符；nil 表示正式版
+}
+
+// parseSemVersion 按 SemVer 2.0.0 解析版本号，接受可选的前导 "v"。
+// build metadata（"+" 之后）不参与比较，解析时丢弃。
+// 与旧的宽松三段数值比较不同：预发布后缀参与比较（1.14.0-beta.1 < 1.14.0），
+// 省略 patch 的输入（如 "1.15"）按非法处理——宽松输入应在 ParseVersion
+// 输入层先规范化。
+func parseSemVersion(s string) (semVersion, error) {
+	s = strings.TrimPrefix(s, "v")
+	core, pre, hasPre := s, "", false
+	if i := strings.IndexByte(s, '+'); i >= 0 { // build metadata 不参与比较
+		s = s[:i]
+		core = s
+	}
+	if i := strings.IndexByte(s, '-'); i >= 0 {
+		core, pre, hasPre = s[:i], s[i+1:], true
+	}
+	parts := strings.Split(core, ".")
+	if len(parts) != 3 {
+		return semVersion{}, fmt.Errorf("版本号必须是 major.minor.patch 三段")
+	}
+	var nums [3]uint64
+	for i, p := range parts {
+		n, err := parseSemNum(p)
+		if err != nil {
+			return semVersion{}, fmt.Errorf("版本号第 %d 段 %q 非法: %w", i+1, p, err)
 		}
-		if i < len(pb) {
-			nb, _ = strconv.Atoi(pb[i])
+		nums[i] = n
+	}
+	v := semVersion{major: nums[0], minor: nums[1], patch: nums[2]}
+	if hasPre {
+		if pre == "" {
+			return semVersion{}, fmt.Errorf("预发布段为空")
 		}
-		if na < nb {
-			return -1
+		v.prerelease = strings.Split(pre, ".")
+		for _, id := range v.prerelease {
+			if id == "" {
+				return semVersion{}, fmt.Errorf("预发布标识符为空")
+			}
+			if isSemNum(id) {
+				if len(id) > 1 && id[0] == '0' { // 严格 SemVer：数值标识符不得有前导零
+					return semVersion{}, fmt.Errorf("预发布数值标识符 %q 有前导零", id)
+				}
+			} else if !isSemIdent(id) {
+				return semVersion{}, fmt.Errorf("预发布标识符 %q 含非法字符", id)
+			}
 		}
-		if na > nb {
+	}
+	return v, nil
+}
+
+func parseSemNum(s string) (uint64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("空数字段")
+	}
+	if len(s) > 1 && s[0] == '0' { // 严格 SemVer：核心版本号不得有前导零
+		return 0, fmt.Errorf("前导零")
+	}
+	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("不是十进制数字: %w", err)
+	}
+	return n, nil
+}
+
+func isSemNum(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isSemIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// compareSemVersion 按 SemVer 2.0.0 precedence 比较两个已解析版本：
+// 核心版本号按数值比较；正式版 > 预发布；预发布标识符中数值按数值比较、
+// 数值段 < 非数值段、其余按字典序；标识符更少的一方更小。
+func compareSemVersion(a, b semVersion) int {
+	if a.major != b.major {
+		return cmpUint(a.major, b.major)
+	}
+	if a.minor != b.minor {
+		return cmpUint(a.minor, b.minor)
+	}
+	if a.patch != b.patch {
+		return cmpUint(a.patch, b.patch)
+	}
+	switch {
+	case len(a.prerelease) == 0 && len(b.prerelease) == 0:
+		return 0
+	case len(a.prerelease) == 0: // 正式版 > 预发布
+		return 1
+	case len(b.prerelease) == 0:
+		return -1
+	}
+	for i := 0; i < len(a.prerelease) && i < len(b.prerelease); i++ {
+		x, y := a.prerelease[i], b.prerelease[i]
+		xn, yn := isSemNum(x), isSemNum(y)
+		switch {
+		case xn && yn:
+			// 已排除前导零，规范十进制串：先比长度再比字典序即数值比较。
+			if len(x) != len(y) {
+				if len(x) < len(y) {
+					return -1
+				}
+				return 1
+			}
+			if c := strings.Compare(x, y); c != 0 {
+				return c
+			}
+		case xn != yn: // 数值段 < 非数值段
+			if xn {
+				return -1
+			}
 			return 1
+		default:
+			if c := strings.Compare(x, y); c != 0 {
+				return c
+			}
 		}
+	}
+	if len(a.prerelease) < len(b.prerelease) {
+		return -1
+	}
+	if len(a.prerelease) > len(b.prerelease) {
+		return 1
 	}
 	return 0
 }
 
+func cmpUint(a, b uint64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
+}
+
+// compareVersions 按 SemVer 2.0.0 precedence 比较两个版本号，接受可选的
+// 前导 "v"；任一输入无法解析时返回错误，不再静默按 0 处理。
+// build metadata（如 1.14.0+build.1）不参与比较。
+func compareVersions(a, b string) (int, error) {
+	va, err := parseSemVersion(a)
+	if err != nil {
+		return 0, fmt.Errorf("解析版本 %q 失败: %w", a, err)
+	}
+	vb, err := parseSemVersion(b)
+	if err != nil {
+		return 0, fmt.Errorf("解析版本 %q 失败: %w", b, err)
+	}
+	return compareSemVersion(va, vb), nil
+}
+
 // ParseVersion 从 `sing-box version` 输出中解析版本号。
+// sing-box 可能输出省略 patch 的版本号（如 "1.15"），这里在输入层统一
+// 规范化为 "1.15.0"，避免下游严格 SemVer 解析报错（C18）。
 func ParseVersion(output string) (string, error) {
 	for _, line := range strings.Split(output, "\n") {
 		fields := strings.Fields(strings.TrimSpace(line))
 		// 形如: sing-box version 1.14.0
 		if len(fields) >= 3 && fields[0] == "sing-box" && fields[1] == "version" {
-			return strings.TrimPrefix(fields[2], "v"), nil
+			return normalizeVersionInput(strings.TrimPrefix(fields[2], "v")), nil
 		}
 	}
 	return "", fmt.Errorf("无法从输出中解析版本: %q", firstLine(output))
+}
+
+// normalizeVersionInput 把省略 patch 的版本号（"1.15"）补全为 "1.15.0"，
+// 仅对两段纯数字的 core 生效（含 "-pre"/"+build" 后缀时只补 core）；
+// 其余输入原样返回，交由 parseSemVersion 严格校验。
+func normalizeVersionInput(s string) string {
+	core := s
+	if i := strings.IndexAny(s, "-+"); i >= 0 {
+		core = s[:i]
+	}
+	parts := strings.Split(core, ".")
+	if len(parts) == 2 && isSemNum(parts[0]) && isSemNum(parts[1]) {
+		return core + ".0" + s[len(core):]
+	}
+	return s
 }
 
 func firstLine(s string) string {

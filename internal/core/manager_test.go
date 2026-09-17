@@ -57,6 +57,14 @@ func TestParseVersion(t *testing.T) {
 	if _, err := ParseVersion(" garbage "); err == nil {
 		t.Error("无法解析的输出应返回错误")
 	}
+
+	// C18：省略 patch 的输出在输入层规范化为三段
+	if v, err := ParseVersion("sing-box version 1.15\n"); err != nil || v != "1.15.0" {
+		t.Errorf("ParseVersion = %q, %v; 期望规范化为 1.15.0", v, err)
+	}
+	if v, err := ParseVersion("sing-box version 1.14.0-beta.1\n"); err != nil || v != "1.14.0-beta.1" {
+		t.Errorf("ParseVersion = %q, %v; 期望 1.14.0-beta.1", v, err)
+	}
 }
 
 func TestCompareVersions(t *testing.T) {
@@ -67,9 +75,36 @@ func TestCompareVersions(t *testing.T) {
 		{"1.13.9", "1.14.0", -1},
 		{"1.14.0", "1.14.0", 0},
 		{"1.15.0", "1.14.0", 1},
+		// SemVer 2.0.0 precedence（CHECKLIST-v4 C18 用例表）
+		{"1.14.0", "1.14.0-beta.1", 1},
+		{"1.14.0-beta.1", "1.14.0", -1},
+		{"1.14.0-alpha", "1.14.0-beta", -1},
+		{"1.14.0-beta.2", "1.14.0-beta.10", -1},
+		{"1.14.0", "1.14.0+build.1", 0},
+		{"1.14.0+build.1", "1.14.0", 0},
+		{"1.15.0", "1.14.9", 1},
+		{"v1.14.0", "1.14.0", 0},
+		// 补充边界：rc > beta；非数值段 > 数值段；标识符前缀相等时少者小
+		{"1.14.0-rc.1", "1.14.0-beta.2", 1},
+		{"1.14.0-alpha.beta", "1.14.0-alpha.1", 1},
+		{"1.14.0-alpha", "1.14.0-alpha.1", -1},
 	} {
-		if got := compareVersions(tc.a, tc.b); got != tc.want {
+		got, err := compareVersions(tc.a, tc.b)
+		if err != nil {
+			t.Errorf("compareVersions(%q,%q) error: %v", tc.a, tc.b, err)
+			continue
+		}
+		if got != tc.want {
 			t.Errorf("compareVersions(%q,%q)=%d, want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestCompareVersionsErrors(t *testing.T) {
+	// 严格 SemVer：非法输入必须报错，不再静默按 0 处理
+	for _, bad := range []string{"1.15", "1.14.0.1", "abc", "1.14.0-", "1.14.0-beta..1", "01.14.0", "1.14.0-beta.01", ""} {
+		if _, err := compareVersions(bad, "1.14.0"); err == nil {
+			t.Errorf("compareVersions(%q, ...) 应返回解析错误", bad)
 		}
 	}
 }
