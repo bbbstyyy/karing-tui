@@ -28,12 +28,41 @@ func benchApp(b *testing.B) *application.App {
 	return app
 }
 
+// benchPerm 返回 [0,n) 的确定性洗牌结果。
+//
+// 刻意不用 math/rand：夹具必须跨机器、跨 Go 版本可复现，否则 benchstat 的对比会被
+// 夹具本身的抖动污染。
+func benchPerm(n int) []int {
+	perm := make([]int, n)
+	for i := range perm {
+		perm[i] = i
+	}
+	state := uint64(0x9E3779B97F4A7C15)
+	for i := n - 1; i > 0; i-- {
+		state = state*6364136223846793005 + 1442695040888963407
+		j := int((state >> 33) % uint64(i+1))
+		perm[i], perm[j] = perm[j], perm[i]
+	}
+	return perm
+}
+
 // benchNodes 生成固定规模的节点数据。刻意不用大 fixture：规模由参数决定，
 // 曲线随 N 的走势比绝对值更能说明复杂度（见 CHECKLIST-v4 §5「基准稳定性」）。
-func benchNodes(n int) []*config.Node {
+//
+// scrambled=true 时名称按确定性洗牌排列。这不是为了"更随机"，而是为了让 C7 的
+// 成本可测：旧实现的排序是插入排序，在**已按名称排好**的输入上退化为 O(N) 最好
+// 情况（每个元素只比一次），而真实订阅返回的节点名不会恰好有序。
+func benchNodes(n int, scrambled bool) []*config.Node {
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+	if scrambled {
+		order = benchPerm(n)
+	}
 	nodes := make([]*config.Node, 0, n)
 	tested := time.Date(2026, 9, 17, 0, 0, 0, 0, time.UTC)
-	for i := range n {
+	for i, k := range order {
 		latency := int64(-1)
 		if i%5 != 0 {
 			latency = int64((i * 37) % 500)
@@ -41,7 +70,7 @@ func benchNodes(n int) []*config.Node {
 		nodes = append(nodes, &config.Node{
 			ID:             int64(i + 1),
 			SubscriptionID: 1,
-			Name:           fmt.Sprintf("node-%05d", i),
+			Name:           fmt.Sprintf("node-%05d", k),
 			Protocol:       []string{"vmess", "vless", "trojan"}[i%3],
 			Server:         fmt.Sprintf("10.%d.%d.%d", (i/65536)%256, (i/256)%256, i%256),
 			Port:           10000 + i%5000,
@@ -53,13 +82,14 @@ func benchNodes(n int) []*config.Node {
 	return nodes
 }
 
-func benchProfilesNodes(b *testing.B, nodes int) *Profiles {
+func benchProfilesNodes(b *testing.B, nodes int, scrambled bool) *Profiles {
 	b.Helper()
 	p := NewProfiles(benchApp(b))
 	p.SetSize(140, 40)
 	p.mode = profilesNodes
-	p.nodes = benchNodes(nodes)
+	p.nodes = benchNodes(nodes, scrambled)
 	p.search = "node"
+	p.resortNodes() // 装载路径的预排序（C7）：放在计时之外，基准只量按键成本
 	p.applyNodeFilter()
 	if len(p.filtered) == 0 {
 		b.Fatal("过滤后无节点，基准失去意义")
@@ -69,15 +99,49 @@ func benchProfilesNodes(b *testing.B, nodes int) *Profiles {
 
 // BenchmarkProfilesFilter 度量节点过滤 + 建列表项的成本。
 //
-// 当前实现每次过滤都会重新排序并重建全部 Items（O(N log N) + O(N)），
-// C7（预排序、过滤保持 O(N)）与 C8（lowercase 预计算）应让 ns/op 与 allocs/op 同时下降。
+// 夹具名称保持名称序，以便与 C-BENCH0 的基线（docs/bench-baseline.txt）逐项对比；
+// 非有序输入下的按键成本见 BenchmarkProfilesFilterScrambled。
 func BenchmarkProfilesFilter(b *testing.B) {
 	for _, nodes := range []int{100, 1000, 5000, 10000} {
 		b.Run(fmt.Sprintf("N%d", nodes), func(b *testing.B) {
-			p := benchProfilesNodes(b, nodes)
+			p := benchProfilesNodes(b, nodes, false)
 			b.ReportAllocs()
 			for b.Loop() {
 				p.applyNodeFilter()
+			}
+		})
+	}
+}
+
+// BenchmarkProfilesFilterScrambled 度量「搜索按键」在**名称无序**节点上的成本。
+//
+// 真实订阅返回的节点名不会是名称序，而旧实现的插入排序在无序输入上是 O(N²)
+// 最坏情况，并且每个按键都重跑一次。C7 之后按键路径只剩 O(N) 过滤 + 建行，
+// ns/op 应随 N 近似线性。
+func BenchmarkProfilesFilterScrambled(b *testing.B) {
+	for _, nodes := range []int{100, 1000, 5000, 10000} {
+		b.Run(fmt.Sprintf("N%d", nodes), func(b *testing.B) {
+			p := benchProfilesNodes(b, nodes, true)
+			b.ReportAllocs()
+			for b.Loop() {
+				p.applyNodeFilter()
+			}
+		})
+	}
+}
+
+// BenchmarkProfilesResortScrambled 度量「重排一次」本身的成本（装载、切换排序键、
+// 测速回写触发，C7 把这三处收敛到唯一入口 resortNodes）。
+//
+// 该成本不再落在按键路径上，但它决定了每次 reload 的固定开销：C7 之前它是
+// 插入排序（无序输入 O(N²)），之后换成稳定排序 O(N log N)。
+func BenchmarkProfilesResortScrambled(b *testing.B) {
+	for _, nodes := range []int{100, 1000, 5000, 10000} {
+		b.Run(fmt.Sprintf("N%d", nodes), func(b *testing.B) {
+			p := benchProfilesNodes(b, nodes, true)
+			b.ReportAllocs()
+			for b.Loop() {
+				p.resortNodes()
 			}
 		})
 	}
@@ -88,7 +152,7 @@ func BenchmarkProfilesFilter(b *testing.B) {
 // C4 把建行移出 View、C12 收敛 viewport 之后，理想复杂度是 O(可见行)，
 // allocs/op 应不随总行数线性增长。
 func BenchmarkProfilesView5000(b *testing.B) {
-	p := benchProfilesNodes(b, 5000)
+	p := benchProfilesNodes(b, 5000, false)
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = p.View()

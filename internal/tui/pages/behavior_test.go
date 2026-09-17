@@ -548,7 +548,109 @@ func TestNodeSearchIsIncrementalAndEscapeRestoresFilterAndPosition(t *testing.T)
 	}
 }
 
+// nodeNamesOf 把节点切片拼成便于断言的顺序串。
+func nodeNamesOf(nodes []*config.Node) string {
+	names := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		names = append(names, n.Name)
+	}
+	return strings.Join(names, ",")
+}
+
+// TestProfilesFilterUsesPreSortedOrderAndDoesNotResort 钉住 C7 的核心不变量：
+// 搜索路径只做 O(N) 过滤，展示顺序完全来自装载时排好一次的 p.sortedNodes。
+//
+// 直接断言「顺序和排序键一致」是无效的——把已排好的列表再排一遍还是原样。所以
+// 先把预排序结果**人为置成逆序**，再走真实按键路径：只要过滤环节（或按键路径上的
+// 任何环节）仍然自行排序，逆序就会立刻被"纠正"回名称序。赋值 sortBy 同理无效，
+// 排序谓词本身没变。
+func TestProfilesFilterUsesPreSortedOrderAndDoesNotResort(t *testing.T) {
+	app := pageFixture(t)
+	p := NewProfiles(app)
+	p.SetSize(80, 21)
+	p.mode = profilesNodes
+	p.nodes = []*config.Node{ // 装载顺序刻意不是名称序
+		{ID: 3, Name: "charlie", Server: "s3.example.invalid", Protocol: "vmess", Enabled: true, LatencyMS: -1},
+		{ID: 1, Name: "alpha", Server: "s1.example.invalid", Protocol: "vmess", Enabled: true, LatencyMS: -1},
+		{ID: 2, Name: "bravo", Server: "s2.example.invalid", Protocol: "trojan", Enabled: true, LatencyMS: -1},
+	}
+	p.resortNodes()
+	p.applyNodeFilter()
+	if got := nodeNamesOf(p.filtered); got != "alpha,bravo,charlie" {
+		t.Fatalf("装载后未按名称排序: %s", got)
+	}
+
+	slices.Reverse(p.sortedNodes)
+	reversed := nodeNamesOf(p.sortedNodes)
+
+	// 真实按键路径：进入搜索态并逐字输入。
+	p.Update(chars("/"))
+	p.Update(chars("a"))
+	if got := nodeNamesOf(p.sortedNodes); got != reversed {
+		t.Fatalf("搜索路径重排了预排序结果: %s", got)
+	}
+	if got := nodeNamesOf(p.filtered); got != "charlie,bravo,alpha" {
+		t.Fatalf("过滤结果被重新排序: %s", got)
+	}
+	// 反向核对：上面的断言不能因为「过滤压根没跑」而假通过。
+	// （Esc 退出再重新进入搜索态：搜索框内容会被重设为 p.search，凑不成 "ch"。）
+	p.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	p.Update(chars("/"))
+	p.Update(chars("c"))
+	p.Update(chars("h"))
+	if got := nodeNamesOf(p.filtered); got != "charlie" {
+		t.Fatalf("搜索没有生效，前一条断言失去意义: %s", got)
+	}
+}
+
+// TestProfilesSortByLatencyReordersOnlyOnExplicitTriggers 覆盖 C7 改法第 4 条：
+// 延迟会被测速改写，所以「测速回写 + 重新装载」必须计入重排触发点；切换排序键同理。
+func TestProfilesSortByLatencyReordersOnlyOnExplicitTriggers(t *testing.T) {
+	app := pageFixture(t)
+	nodes := []*config.Node{
+		{Name: "charlie", Protocol: "http", Server: "c.example.invalid", Port: 80},
+		{Name: "alpha", Protocol: "http", Server: "a.example.invalid", Port: 80},
+		{Name: "bravo", Protocol: "http", Server: "b.example.invalid", Port: 80},
+	}
+	for _, n := range nodes {
+		if err := app.Proxy.SaveManual(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := NewProfiles(app)
+	p.SetSize(80, 21)
+	p.mode = profilesNodes
+	p.sortBy = "latency"
+	p.reloadNodes()
+	// 都未测速：按 latencyLess 的规则退化为名称升序。
+	if got := nodeNamesOf(p.filtered); got != "alpha,bravo,charlie" {
+		t.Fatalf("未测速节点未按名称排序: %s", got)
+	}
+
+	// 测速回写（落库）后由 reloadNodes 重新装载 → 顺序必须反映新延迟。
+	if err := app.DB.UpdateNodeLatency(nodes[1].ID, 300, time.Now()); err != nil { // alpha 变慢
+		t.Fatal(err)
+	}
+	if err := app.DB.UpdateNodeLatency(nodes[2].ID, 20, time.Now()); err != nil { // bravo 变快
+		t.Fatal(err)
+	}
+	p.reloadNodes()
+	if got := nodeNamesOf(p.filtered); got != "bravo,alpha,charlie" {
+		t.Fatalf("测速回写后未按延迟重排: %s", got)
+	}
+
+	// 切换排序键（真实按键）→ 立即重排回名称序。
+	p.Update(chars("o"))
+	if p.sortBy != "name" {
+		t.Fatalf("排序键未切换: %q", p.sortBy)
+	}
+	if got := nodeNamesOf(p.filtered); got != "alpha,bravo,charlie" {
+		t.Fatalf("切换排序键后未重排: %s", got)
+	}
+}
+
 func TestDNSOptionsReturnToTheSameSubviewAndObject(t *testing.T) {
+
 	app := pageFixture(t)
 	if _, err := app.DNS.AddRule("domain", "options.example", "local"); err != nil {
 		t.Fatal(err)
