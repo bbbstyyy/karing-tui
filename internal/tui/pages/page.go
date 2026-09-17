@@ -200,6 +200,27 @@ func (b *base) TaskStatus() (bool, string) {
 	return false, b.taskResult
 }
 
+// TransientDeadline 返回本页仍在展示、且尚未到期的瞬时文案的结束时刻。
+//
+// 瞬时文案有三类，都只在 8 秒内可见：操作反馈（feedback）、成功任务结果、
+// 以及 Root 自己的通知（由 Root 单独处理）。旧实现靠 Root 每 200ms 一次的
+// 全局 tick 顺带重绘，窗口到期时那句文案自然消失；去掉全局 tick 后，Root
+// 需要知道「还有多久才有东西要过期」，才能只在必要时唤醒一次。
+//
+// 返回零值表示本页当前没有需要收尾的窗口。已过期的窗口不再上报，
+// 否则 Root 的续期逻辑会退化成忙循环。
+func (b *base) TransientDeadline() time.Time {
+	var deadline time.Time
+	if b.feedbackText != "" {
+		deadline = b.feedbackUntil
+	}
+	// 失败结果是 sticky：它不随时间消失，因此不参与收尾排期。
+	if !b.taskActive && !b.taskFailed && b.taskUntil.After(deadline) {
+		deadline = b.taskUntil
+	}
+	return deadline
+}
+
 func (b *base) formView(f *components.Form, err error) string {
 	f.Width, f.Height = b.width, b.height
 	if err != nil {

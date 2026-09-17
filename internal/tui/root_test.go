@@ -122,6 +122,64 @@ func TestRootKeepsFooterAndOverlaysInsideTerminal(t *testing.T) {
 	}
 }
 
+// C1：空闲态不得有任何周期性唤醒。
+//
+// 旧实现里 Root 每 200ms 自我续期一个 frame tick，无论状态是否变化都会
+// 走一遍 Update → View。这里直接断言「没有任务、也没有待过期文案时，
+// 唤醒排期为空」，并断言一次收尾重绘之后不会像 frame tick 那样自我续期。
+func TestRootHasNoIdleWakeup(t *testing.T) {
+	m, _ := rootFixture(t)
+	if m.taskRunning() {
+		t.Fatal("空闲态被判定为有任务在跑")
+	}
+	if d, ok := m.deadline(); ok {
+		t.Fatalf("空闲态仍报告待过期窗口 %v", d)
+	}
+	if cmd, spinner, refreshing := m.wakeup(); cmd != nil || spinner || refreshing {
+		t.Fatal("空闲态仍排定了唤醒")
+	}
+
+	// 收尾重绘到达后必须自终止：没有新消息就再也没有下一次唤醒。
+	next, _ := m.Update(transientMsg{})
+	m = next.(RootModel)
+	if cmd, spinner, refreshing := m.wakeup(); cmd != nil || spinner || refreshing {
+		t.Fatal("收尾重绘自我续期，退化成周期性唤醒")
+	}
+}
+
+// C1：任务进行中仍然需要 200ms 节拍来驱动进度计数与 spinner。
+func TestRootKeepsSpinnerWhileTaskRuns(t *testing.T) {
+	m, _ := rootFixture(t)
+	m.pages[0] = taskStatusPage{active: true}
+	if cmd, spinner, _ := m.wakeup(); cmd == nil || !spinner {
+		t.Fatal("任务进行中缺少进度节拍")
+	}
+	// 在途的节拍不得叠加第二条，否则节拍会翻倍。
+	m.spinner = true
+	if cmd, _, _ := m.wakeup(); cmd != nil {
+		t.Fatal("进度节拍被重复排定")
+	}
+	m.spinner = false
+	m.pages[0] = taskStatusPage{active: false}
+	if cmd, spinner, _ := m.wakeup(); cmd != nil || spinner {
+		t.Fatal("任务结束后进度节拍没有停止")
+	}
+}
+
+// taskStatusPage 是一个只报告任务状态的极简页面，用于隔离 Root 的唤醒逻辑。
+type taskStatusPage struct{ active bool }
+
+func (p taskStatusPage) Title() string { return "task" }
+func (p taskStatusPage) Init() tea.Cmd { return nil }
+func (p taskStatusPage) Update(tea.Msg) (pages.Page, tea.Cmd) {
+	return p, nil
+}
+func (p taskStatusPage) View() string  { return "" }
+func (p taskStatusPage) Editing() bool { return false }
+func (p taskStatusPage) TaskStatus() (bool, string) {
+	return p.active, "进行中"
+}
+
 type messagePage struct{ received []tea.Msg }
 
 func (*messagePage) Title() string { return "test" }
