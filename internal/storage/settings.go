@@ -21,7 +21,19 @@ func (d *DB) GetSetting(key string) (string, error) {
 
 // SetSetting 写入（upsert）一个设置项。
 func (d *DB) SetSetting(key, value string) error {
-	_, err := d.db.Exec(
+	return setSetting(d.db, key, value)
+}
+
+// SetSettingTx 是 SetSetting 的事务内版本（V7-3/V7-4）。
+// 一次业务操作涉及多个设置项时必须走它，且共用一个 *sql.Tx，
+// 否则中途失败会留下「一半新值一半旧值」的混合配置。
+func (d *DB) SetSettingTx(tx *sql.Tx, key, value string) error {
+	return setSetting(tx, key, value)
+}
+
+// setSetting 是 *sql.DB 与 *sql.Tx 共用的 upsert 实现（C14：同一套 SQL 只写一份）。
+func setSetting(q querier, key, value string) error {
+	_, err := q.Exec(
 		`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
 		key, value, time.Now(),

@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"strconv"
 	"strings"
@@ -66,22 +68,32 @@ func (d *DB) LoadSettings() (config.Settings, error) {
 }
 
 // SaveSettings 将应用设置写回键值表。
+//
+// 全部键在**一个事务**里提交（V7-4）：中途失败留下「一半新值一半旧值」的混合配置时，
+// 设置页会自相矛盾（例如 mixed_port 改了、clash_api_port 没改，两个端口直接撞车），
+// 而且当时不会有任何报错。
+//
+// 写入顺序用固定 slice 而不是 map：map 的遍历顺序随机会让「中途失败停在哪个键」
+// 不可复现，失败现场每次都不一样，报障无法复述。顺序本身不影响语义——全部同一事务。
+// 值也用同一个 slice 承载，避免出现「值表里加了一个键、顺序表里忘了加」的静默遗漏。
 func (d *DB) SaveSettings(s config.Settings) error {
-	pairs := map[string]string{
-		keyMixedPort:      strconv.Itoa(s.MixedPort),
-		keyAllowLAN:       strconv.FormatBool(s.AllowLAN),
-		keyDownloadProxy:  strings.TrimSpace(s.DownloadProxy),
-		keyLogLevel:       s.LogLevel,
-		keyClashAPIPort:   strconv.Itoa(s.ClashAPIPort),
-		keyClashAPISecret: s.ClashAPISecret,
-		keyAutoUpdateMin:  strconv.Itoa(s.AutoUpdateMinutes),
-		keyPrivateDirect:  strconv.FormatBool(s.PrivateDirect),
-		keyResolveIPRules: strconv.FormatBool(s.ResolveIPRules),
+	pairs := []struct{ key, value string }{
+		{keyMixedPort, strconv.Itoa(s.MixedPort)},
+		{keyAllowLAN, strconv.FormatBool(s.AllowLAN)},
+		{keyDownloadProxy, strings.TrimSpace(s.DownloadProxy)},
+		{keyLogLevel, s.LogLevel},
+		{keyClashAPIPort, strconv.Itoa(s.ClashAPIPort)},
+		{keyClashAPISecret, s.ClashAPISecret},
+		{keyAutoUpdateMin, strconv.Itoa(s.AutoUpdateMinutes)},
+		{keyPrivateDirect, strconv.FormatBool(s.PrivateDirect)},
+		{keyResolveIPRules, strconv.FormatBool(s.ResolveIPRules)},
 	}
-	for k, v := range pairs {
-		if err := d.SetSetting(k, v); err != nil {
-			return fmt.Errorf("保存设置 %s 失败: %w", k, err)
+	return d.WithTx(context.Background(), func(tx *sql.Tx) error {
+		for _, p := range pairs {
+			if err := d.SetSettingTx(tx, p.key, p.value); err != nil {
+				return fmt.Errorf("保存设置 %s 失败: %w", p.key, err)
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }

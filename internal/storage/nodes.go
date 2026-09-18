@@ -141,14 +141,34 @@ func (d *DB) DeleteFailedNodesBySubscription(subscriptionID int64) (int64, error
 	return n, nil
 }
 
-// ReplaceSubscriptionNodes 原子替换订阅节点并更新订阅状态。
-// 节点写入或状态更新任一步失败都会回滚，保留原节点池。
+// ReplaceSubscriptionNodes 原子替换订阅节点并更新订阅状态（不含流量元数据）。
+func (d *DB) ReplaceSubscriptionNodes(subscriptionID int64, nodes []*config.Node, lastUpdated time.Time) error {
+	return d.ReplaceSubscriptionNodesWithMeta(subscriptionID, nodes, lastUpdated, SubscriptionRefreshMeta{})
+}
+
+// SubscriptionRefreshMeta 是订阅刷新时可一并写入的流量元数据（V7-10）。
+// HasTraffic 为 false 表示本次响应没有 subscription-userinfo，此时**不动**这三列，
+// 而不是把它们清空——缺字段保留旧值是既有语义。
+type SubscriptionRefreshMeta struct {
+	HasTraffic bool
+	Upload     int64
+	Download   int64
+	Total      int64
+	ExpireAt   time.Time
+}
+
+// ReplaceSubscriptionNodesWithMeta 是带流量元数据的订阅刷新入口。
+//
+// 为什么 traffic 必须和节点替换在同一个事务里（V7-10）：上游续费/改额度后，
+// 旧实现把 UpdateSubscriptionTraffic 当成独立写并在调用方用 `_ =` 吞错，
+// 于是「节点已换成新池、流量却还是旧值」也会报成功。放进同一事务后，
+// traffic 写失败会让整次刷新回滚，调用方能如实报错。
 //
 // 入参约束（V7-1）：nodes 中不得出现两个携带同一非零 ID 的节点。下方用于保留
 // 组引用的 usedIDs 只能保证「同一个旧 ID 不会被 UPDATE 两次」，无法说明这种输入
 // 是对的；让第二个节点静默落成新行会把上层身份算法的异常变成一次无痕的插入。
 // 因此这里 fail-closed，且检查放在 BEGIN 之前——拒绝时不产生任何破坏性动作。
-func (d *DB) ReplaceSubscriptionNodes(subscriptionID int64, nodes []*config.Node, lastUpdated time.Time) error {
+func (d *DB) ReplaceSubscriptionNodesWithMeta(subscriptionID int64, nodes []*config.Node, lastUpdated time.Time, meta SubscriptionRefreshMeta) error {
 	if err := validateReplacedNodeIDs(nodes); err != nil {
 		return err
 	}
@@ -229,6 +249,13 @@ func (d *DB) ReplaceSubscriptionNodes(subscriptionID int64, nodes []*config.Node
 		}
 		n.SubscriptionID = subscriptionID
 		n.CreatedAt, n.UpdatedAt = now, now
+	}
+	// 流量元数据与节点替换同一事务：写失败必须让整次刷新回滚（V7-10）。
+	if meta.HasTraffic {
+		if _, err := tx.Exec(`UPDATE subscriptions SET traffic_upload=?, traffic_download=?, traffic_total=?, expire_at=? WHERE id=?`,
+			meta.Upload, meta.Download, meta.Total, nullTime(meta.ExpireAt), subscriptionID); err != nil {
+			return fmt.Errorf("更新订阅 %d 流量信息失败: %w", subscriptionID, err)
+		}
 	}
 	if _, err := tx.Exec(`UPDATE subscriptions SET last_updated=?, node_count=? WHERE id=?`,
 		lastUpdated, len(nodes), subscriptionID); err != nil {

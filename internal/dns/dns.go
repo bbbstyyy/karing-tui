@@ -3,6 +3,8 @@
 package dns
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"github.com/bbbstyyy/karing-tui/internal/validation"
 	"net"
@@ -55,34 +57,49 @@ func NewManager(db *storage.DB, logf func(string, ...any)) *Manager {
 
 // EnsureDefaultDNS 首次使用时初始化默认 DNS：国内 UDP、国外 DoH，
 // 以及"国内域名走国内 DNS"的默认规则。
+//
+// 四步写必须在同一个事务里（V7-3）：任一步失败留下「只有 local、没有 remote」
+// 之类的残片时，下次启动会因 len(servers) > 0 而直接返回，残片被永久固化。
+// 「是否已初始化」的判定也在事务内读——WithTx 开的是 IMMEDIATE 事务，
+// 两个进程同时首启时只有先拿到写锁的那个能看到「还没有服务器」。
 func (m *Manager) EnsureDefaultDNS() error {
-	servers, err := m.DB.ListDNSServers()
+	created := false
+	err := m.DB.WithTx(context.Background(), func(tx *sql.Tx) error {
+		servers, err := m.DB.ListDNSServersTx(tx)
+		if err != nil {
+			return err
+		}
+		if len(servers) > 0 {
+			return nil
+		}
+		local := &config.DNSServer{Tag: "local", Type: "udp", Address: "223.5.5.5", Enabled: true, Position: 0}
+		if err := m.DB.CreateDNSServerTx(tx, local); err != nil {
+			return err
+		}
+		remote := &config.DNSServer{
+			Tag: "remote", Type: "https", Address: "8.8.8.8",
+			AddressResolver: "local", Detour: storage.DefaultGroupAuto, Enabled: true, Position: 1,
+		}
+		if err := m.DB.CreateDNSServerTx(tx, remote); err != nil {
+			return err
+		}
+		rule := &config.DNSRule{Type: "rule_set", Value: "geosite:cn", Server: "local", Enabled: true, Position: 0}
+		if err := m.DB.CreateDNSRuleTx(tx, rule); err != nil {
+			return err
+		}
+		// 默认 final 指向 remote
+		if err := m.DB.SetSettingTx(tx, keyFinal, "remote"); err != nil {
+			return err
+		}
+		created = true
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	if len(servers) > 0 {
-		return nil
+	if created {
+		m.Logf("已初始化默认 DNS 配置")
 	}
-	local := &config.DNSServer{Tag: "local", Type: "udp", Address: "223.5.5.5", Enabled: true, Position: 0}
-	if err := m.DB.CreateDNSServer(local); err != nil {
-		return err
-	}
-	remote := &config.DNSServer{
-		Tag: "remote", Type: "https", Address: "8.8.8.8",
-		AddressResolver: "local", Detour: storage.DefaultGroupAuto, Enabled: true, Position: 1,
-	}
-	if err := m.DB.CreateDNSServer(remote); err != nil {
-		return err
-	}
-	rule := &config.DNSRule{Type: "rule_set", Value: "geosite:cn", Server: "local", Enabled: true, Position: 0}
-	if err := m.DB.CreateDNSRule(rule); err != nil {
-		return err
-	}
-	// 默认 final 指向 remote
-	if err := m.DB.SetSetting(keyFinal, "remote"); err != nil {
-		return err
-	}
-	m.Logf("已初始化默认 DNS 配置")
 	return nil
 }
 
@@ -433,33 +450,38 @@ func (m *Manager) SetRuleEnabled(id int64, enabled bool) error {
 }
 
 // MoveRule 移动 DNS 规则位置（delta: -1 上移 / +1 下移）。
+//
+// 重新编号必须整体原子（V7-3）：中间失败会留下重复 position，而 ListDNSRules
+// 按 (position, id) 排序，重复值会让界面顺序与用户操作不一致且无法自愈。
 func (m *Manager) MoveRule(id int64, delta int) error {
-	rules, err := m.DB.ListDNSRules()
-	if err != nil {
-		return err
-	}
-	idx := -1
-	for i, r := range rules {
-		if r.ID == id {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
-		return storage.ErrNotFound
-	}
-	next := idx + delta
-	if next < 0 || next >= len(rules) {
-		return nil
-	}
-	rules[idx], rules[next] = rules[next], rules[idx]
-	for i, r := range rules {
-		r.Position = i
-		if err := m.DB.UpdateDNSRule(r); err != nil {
+	return m.DB.WithTx(context.Background(), func(tx *sql.Tx) error {
+		rules, err := m.DB.ListDNSRulesTx(tx)
+		if err != nil {
 			return err
 		}
-	}
-	return nil
+		idx := -1
+		for i, r := range rules {
+			if r.ID == id {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return storage.ErrNotFound
+		}
+		next := idx + delta
+		if next < 0 || next >= len(rules) {
+			return nil
+		}
+		rules[idx], rules[next] = rules[next], rules[idx]
+		for i, r := range rules {
+			r.Position = i
+			if err := m.DB.UpdateDNSRuleTx(tx, r); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (m *Manager) validateRule(r *config.DNSRule) error {
@@ -565,16 +587,24 @@ func (m *Manager) SaveOptions(strategy string, fakeIPEnabled bool, fakeIPRange, 
 			return validation.New("final", "final %q 不是已启用的 DNS 服务器", final)
 		}
 	}
-	pairs := map[string]string{
-		keyStrategy:    strategy,
-		keyFakeIPOn:    fmt.Sprintf("%v", fakeIPEnabled),
-		keyFakeIPRange: strings.TrimSpace(fakeIPRange),
-		keyFinal:       strings.TrimSpace(final),
+	// 固定顺序的 slice，**不要**改成 map（V7-3）：map 的遍历顺序随机会让
+	// 「写入中断点在哪」不可复现，也会让回滚类测试失去确定性。
+	// 4 个选项必须同一事务提交，否则用户会拿到「策略新、FakeIP 旧」的混合配置。
+	pairs := []struct{ key, value string }{
+		{keyStrategy, strategy},
+		{keyFakeIPOn, strconv.FormatBool(fakeIPEnabled)},
+		{keyFakeIPRange, strings.TrimSpace(fakeIPRange)},
+		{keyFinal, strings.TrimSpace(final)},
 	}
-	for k, v := range pairs {
-		if err := m.DB.SetSetting(k, v); err != nil {
-			return err
+	if err := m.DB.WithTx(context.Background(), func(tx *sql.Tx) error {
+		for _, p := range pairs {
+			if err := m.DB.SetSettingTx(tx, p.key, p.value); err != nil {
+				return err
+			}
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	m.Logf("DNS 全局选项已保存")
 	return nil

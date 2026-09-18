@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bbbstyyy/karing-tui/internal/config"
 	"github.com/bbbstyyy/karing-tui/internal/platform"
@@ -151,5 +153,149 @@ func TestWithTxOnQueryOnlyRejectedByQueryOnlyPragma(t *testing.T) {
 	// 连接仍可用：只读查询正常，无残留锁。
 	if err := qdb.db.QueryRow("PRAGMA user_version").Scan(new(int)); err != nil {
 		t.Fatalf("回滚后连接不可用: %v", err)
+	}
+}
+
+// TestSaveSettingsRollsBackOnMidwayFailure V7-4：应用设置的 9 个键必须同一事务提交。
+// 中途失败时 LoadSettings() 必须逐字段等于调用前的 A——否则用户会拿到
+// 「mixed_port 变了、clash_api_port 没变」这类混合配置，两个端口可能直接撞车。
+func TestSaveSettingsRollsBackOnMidwayFailure(t *testing.T) {
+	db := newTestDB(t)
+
+	a := config.DefaultSettings()
+	a.MixedPort, a.LogLevel, a.AutoUpdateMinutes = 1111, "debug", 7
+	a.DownloadProxy, a.ClashAPIPort, a.ClashAPISecret = "http://127.0.0.1:1111", 1111, "secret-a"
+	a.PrivateDirect, a.ResolveIPRules = false, true
+	if err := db.SaveSettings(a); err != nil {
+		t.Fatalf("预设 A: %v", err)
+	}
+	want, err := db.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 拦一个中间键。upsert 可能走 INSERT 也可能走 DO UPDATE 分支，两条都建。
+	const blocked = "clash_api_secret"
+	if _, err := db.db.Exec(`CREATE TRIGGER inject_secret_ins BEFORE INSERT ON settings
+		WHEN NEW.key='` + blocked + `' BEGIN SELECT RAISE(ABORT, 'injected'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`CREATE TRIGGER inject_secret_upd BEFORE UPDATE ON settings
+		WHEN NEW.key='` + blocked + `' BEGIN SELECT RAISE(ABORT, 'injected'); END;`); err != nil {
+		t.Fatal(err)
+	}
+
+	b := config.DefaultSettings()
+	b.MixedPort, b.LogLevel, b.AutoUpdateMinutes = 2222, "warn", 9
+	b.DownloadProxy, b.ClashAPIPort, b.ClashAPISecret = "http://127.0.0.1:2222", 2222, "secret-b"
+	b.PrivateDirect, b.ResolveIPRules = true, false
+	if err := db.SaveSettings(b); err == nil {
+		t.Fatal("注入失败后 SaveSettings 应返回错误")
+	}
+
+	got, err := db.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("中途失败必须整体回滚\n want=%+v\n got =%+v", want, got)
+	}
+}
+
+// TestSaveSettingsRoundTripsEveryField 反向核对：每个字段都取「与默认值不同」的值，
+// 于是任何一个字段没被持久化都会在读回时暴露成默认值。没有这条，
+// 上面那条回滚测试可能因为「字段根本没写」而假通过。
+func TestSaveSettingsRoundTripsEveryField(t *testing.T) {
+	db := newTestDB(t)
+	want := config.Settings{
+		MixedPort:         1234,                      // 默认 2080
+		AllowLAN:          true,                      // 默认 false
+		DownloadProxy:     " http://127.0.0.1:3067 ", // SaveSettings 会 trim
+		LogLevel:          "trace",                   // 默认 info
+		ClashAPIPort:      8080,                      // 默认 9090
+		ClashAPISecret:    "s3cret",                  // 默认空
+		PrivateDirect:     false,                     // 默认 true
+		ResolveIPRules:    true,                      // 默认 false
+		AutoUpdateMinutes: 42,                        // 默认 0
+	}
+	if err := db.SaveSettings(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want.DownloadProxy = strings.TrimSpace(want.DownloadProxy)
+	if got != want {
+		t.Errorf("设置未逐字段往返\n want=%+v\n got =%+v", want, got)
+	}
+}
+
+// TestReplaceSubscriptionNodesRollsBackWhenTrafficUpdateFails V7-10：
+// 流量元数据写失败时，整次订阅刷新（节点替换 + 订阅状态 + 组引用清理）必须一起回滚。
+// 旧实现把 traffic 当成独立写并在调用方吞错，于是「节点已换、流量未更新」也报成功。
+func TestReplaceSubscriptionNodesRollsBackWhenTrafficUpdateFails(t *testing.T) {
+	db := newTestDB(t)
+	s := &config.Subscription{Name: "traffic", URL: "https://example.com"}
+	if err := db.CreateSubscription(s); err != nil {
+		t.Fatal(err)
+	}
+	old := &config.Node{Name: "old", Protocol: "trojan", Server: "example.com", Port: 443, Enabled: true,
+		Metadata: map[string]any{"password": "p"}, SubscriptionID: s.ID}
+	if err := db.CreateNode(old); err != nil {
+		t.Fatal(err)
+	}
+	// 组引用：回滚不彻底时这条引用会先被 ReplaceSubscriptionNodes 清掉。
+	g := &config.ProxyGroup{Name: "显式组", Type: "select",
+		Members: []config.ProxyGroupMember{{Type: "node", ID: old.ID}}, Selected: fmt.Sprintf("node:%d", old.ID)}
+	if err := db.CreateProxyGroup(g); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetProxyGroupSelected(g.ID, g.Selected); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.GetSubscription(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.db.Exec(`CREATE TRIGGER inject_traffic BEFORE UPDATE ON subscriptions
+		WHEN NEW.traffic_total <> OLD.traffic_total BEGIN SELECT RAISE(ABORT, 'injected'); END;`); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh := &config.Node{ID: old.ID, Name: "new", Protocol: "trojan", Server: "example.com", Port: 443,
+		Enabled: true, Metadata: map[string]any{"password": "p"}, SubscriptionID: s.ID}
+	meta := SubscriptionRefreshMeta{HasTraffic: true, Upload: 1, Download: 2, Total: 999}
+	if err := db.ReplaceSubscriptionNodesWithMeta(s.ID, []*config.Node{fresh}, time.Now(), meta); err == nil {
+		t.Fatal("traffic 写入失败时替换必须报错")
+	}
+
+	nodes, err := db.ListNodes(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].ID != old.ID || nodes[0].Name != "old" {
+		t.Errorf("回滚后旧节点应原样保留，实得 %+v", nodes)
+	}
+	after, err := db.GetSubscription(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.NodeCount != before.NodeCount {
+		t.Errorf("node_count 不应变化: %d -> %d", before.NodeCount, after.NodeCount)
+	}
+	if !after.LastUpdated.Equal(before.LastUpdated) {
+		t.Errorf("last_updated 不应变化: %v -> %v", before.LastUpdated, after.LastUpdated)
+	}
+	if after.TrafficTotal != before.TrafficTotal {
+		t.Errorf("traffic 不应被写入: %d -> %d", before.TrafficTotal, after.TrafficTotal)
+	}
+	got, err := db.GetProxyGroup(g.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Members) != 1 || got.Members[0].ID != old.ID || got.Selected != g.Selected {
+		t.Errorf("回滚后组引用应原样保留，实得 %+v", got)
 	}
 }

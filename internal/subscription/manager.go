@@ -144,6 +144,9 @@ func (m *Manager) Delete(id int64) error {
 // Update 下载并解析订阅，替换其节点池；返回更新后的订阅。
 // 旧节点中「连接语义指纹」相同的节点会被继承 ID、禁用状态与测速结果
 // （见 nodeFingerprint）；展示名称与端点都不参与身份匹配。
+//
+// 节点替换、订阅状态与（若有）流量元数据在同一事务里提交：任一步失败整次刷新回滚，
+// 不会出现「节点已换、流量未更新却报成功」的半状态。
 func (m *Manager) Update(ctx context.Context, id int64) (*config.Subscription, error) {
 	s, err := m.DB.GetSubscription(id)
 	if err != nil {
@@ -212,10 +215,9 @@ func (m *Manager) Update(ctx context.Context, id int64) (*config.Subscription, e
 	if nodes, err = applyNodePolicy(nodes, s.NodeFilter, s.SortBy); err != nil {
 		return nil, err
 	}
-	created := len(nodes)
-	if err := m.DB.ReplaceSubscriptionNodes(s.ID, nodes, time.Now()); err != nil {
-		return nil, err
-	}
+	// 流量元数据与节点替换放进同一个事务（V7-10）：写失败必须让整次刷新回滚，
+	// 而不是「节点已换成新池、流量却还是旧值」还报成功。缺字段时保留旧值。
+	meta := storage.SubscriptionRefreshMeta{}
 	if info, ok := parseUserInfo(headers); ok {
 		u, d, total, exp := s.TrafficUpload, s.TrafficDownload, s.TrafficTotal, s.ExpireAt
 		if info.hasUpload {
@@ -230,7 +232,11 @@ func (m *Manager) Update(ctx context.Context, id int64) (*config.Subscription, e
 		if info.hasExpire {
 			exp = info.expire
 		}
-		_ = m.DB.UpdateSubscriptionTraffic(s.ID, u, d, total, exp)
+		meta = storage.SubscriptionRefreshMeta{HasTraffic: true, Upload: u, Download: d, Total: total, ExpireAt: exp}
+	}
+	created := len(nodes)
+	if err := m.DB.ReplaceSubscriptionNodesWithMeta(s.ID, nodes, time.Now(), meta); err != nil {
+		return nil, err
 	}
 	if s.AutoTest && m.AutoTest != nil {
 		if err := m.AutoTest(ctx, s.ID); err != nil {

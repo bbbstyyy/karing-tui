@@ -109,18 +109,26 @@ func (d *DB) listRuleSets(q querier) ([]*config.RuleSet, error) {
 
 // CreateDNSServer 新建 DNS 服务器条目。
 func (d *DB) CreateDNSServer(s *config.DNSServer) error {
+	return d.createDNSServer(d.db, s)
+}
+
+// CreateDNSServerTx 是 CreateDNSServer 的事务内版本（V7-3）。
+func (d *DB) CreateDNSServerTx(tx *sql.Tx, s *config.DNSServer) error {
+	return d.createDNSServer(tx, s)
+}
+
+func (d *DB) createDNSServer(q querier, s *config.DNSServer) error {
 	if s.Type == "" {
 		s.Type = "udp"
 	}
-	res, err := d.db.Exec(
+	res, err := q.Exec(
 		`INSERT INTO dns_servers (tag, type, address, address_resolver, detour, enabled, position) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		s.Tag, s.Type, s.Address, s.AddressResolver, s.Detour, boolInt(s.Enabled), s.Position,
 	)
 	if err != nil {
 		return fmt.Errorf("创建 DNS 服务器 %q 失败: %w", s.Tag, err)
 	}
-	s.ID, err = res.LastInsertId()
-	if err != nil {
+	if s.ID, err = res.LastInsertId(); err != nil {
 		return fmt.Errorf("获取 DNS 服务器自增 ID 失败: %w", err)
 	}
 	return nil
@@ -128,7 +136,16 @@ func (d *DB) CreateDNSServer(s *config.DNSServer) error {
 
 // UpdateDNSServer 更新 DNS 服务器条目。
 func (d *DB) UpdateDNSServer(s *config.DNSServer) error {
-	_, err := d.db.Exec(
+	return d.updateDNSServer(d.db, s)
+}
+
+// UpdateDNSServerTx 是 UpdateDNSServer 的事务内版本（V7-3）。
+func (d *DB) UpdateDNSServerTx(tx *sql.Tx, s *config.DNSServer) error {
+	return d.updateDNSServer(tx, s)
+}
+
+func (d *DB) updateDNSServer(q querier, s *config.DNSServer) error {
+	_, err := q.Exec(
 		`UPDATE dns_servers SET tag=?, type=?, address=?, address_resolver=?, detour=?, enabled=?, position=? WHERE id=?`,
 		s.Tag, s.Type, s.Address, s.AddressResolver, s.Detour, boolInt(s.Enabled), s.Position, s.ID,
 	)
@@ -174,7 +191,17 @@ func (d *DB) DeleteDNSServer(id int64) error {
 
 // ListDNSServers 返回全部 DNS 服务器条目，按 position、id 排序。
 func (d *DB) ListDNSServers() ([]*config.DNSServer, error) {
-	rows, err := d.db.Query(
+	return d.listDNSServers(d.db)
+}
+
+// ListDNSServersTx 是 ListDNSServers 的事务内版本（V7-3）：
+// 事务内必须读到自己刚写的行，不能经 d.db 另取连接（C14：单连接池会自锁）。
+func (d *DB) ListDNSServersTx(tx *sql.Tx) ([]*config.DNSServer, error) {
+	return d.listDNSServers(tx)
+}
+
+func (d *DB) listDNSServers(q querier) ([]*config.DNSServer, error) {
+	rows, err := q.Query(
 		`SELECT id, tag, type, address, address_resolver, detour, enabled, position FROM dns_servers ORDER BY position, id`,
 	)
 	if err != nil {
@@ -199,7 +226,16 @@ func (d *DB) ListDNSServers() ([]*config.DNSServer, error) {
 
 // CreateDNSRule 新建 DNS 规则。
 func (d *DB) CreateDNSRule(r *config.DNSRule) error {
-	res, err := d.db.Exec(
+	return d.createDNSRule(d.db, r)
+}
+
+// CreateDNSRuleTx 是 CreateDNSRule 的事务内版本（V7-3）。
+func (d *DB) CreateDNSRuleTx(tx *sql.Tx, r *config.DNSRule) error {
+	return d.createDNSRule(tx, r)
+}
+
+func (d *DB) createDNSRule(q querier, r *config.DNSRule) error {
+	res, err := q.Exec(
 		`INSERT INTO dns_rules (rule_type, value, server, enabled, position) VALUES (?, ?, ?, ?, ?)`,
 		r.Type, r.Value, r.Server, boolInt(r.Enabled), r.Position,
 	)
@@ -214,7 +250,16 @@ func (d *DB) CreateDNSRule(r *config.DNSRule) error {
 
 // UpdateDNSRule 更新 DNS 规则。
 func (d *DB) UpdateDNSRule(r *config.DNSRule) error {
-	_, err := d.db.Exec(
+	return d.updateDNSRule(d.db, r)
+}
+
+// UpdateDNSRuleTx 是 UpdateDNSRule 的事务内版本（V7-3）。
+func (d *DB) UpdateDNSRuleTx(tx *sql.Tx, r *config.DNSRule) error {
+	return d.updateDNSRule(tx, r)
+}
+
+func (d *DB) updateDNSRule(q querier, r *config.DNSRule) error {
+	_, err := q.Exec(
 		`UPDATE dns_rules SET rule_type=?, value=?, server=?, enabled=?, position=? WHERE id=?`,
 		r.Type, r.Value, r.Server, boolInt(r.Enabled), r.Position, r.ID,
 	)
@@ -235,7 +280,16 @@ func (d *DB) DeleteDNSRule(id int64) error {
 
 // ListDNSRules 返回全部 DNS 规则，按 position、id 排序。
 func (d *DB) ListDNSRules() ([]*config.DNSRule, error) {
-	rows, err := d.db.Query(
+	return d.listDNSRules(d.db)
+}
+
+// ListDNSRulesTx 是 ListDNSRules 的事务内版本（V7-3）。
+func (d *DB) ListDNSRulesTx(tx *sql.Tx) ([]*config.DNSRule, error) {
+	return d.listDNSRules(tx)
+}
+
+func (d *DB) listDNSRules(q querier) ([]*config.DNSRule, error) {
+	rows, err := q.Query(
 		`SELECT id, rule_type, value, server, enabled, position FROM dns_rules ORDER BY position, id`,
 	)
 	if err != nil {

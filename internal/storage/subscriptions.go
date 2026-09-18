@@ -65,6 +65,13 @@ func (d *DB) UpdateSubscriptionState(id int64, lastUpdated time.Time, nodeCount 
 	return nil
 }
 
+// UpdateSubscriptionTraffic 单独更新订阅流量元数据。
+//
+// Deprecated（V7-10）：订阅刷新路径不要用它。它是一次独立写，与节点替换不在同一
+// 事务里，调用方很容易写成 `_ = d.UpdateSubscriptionTraffic(...)` 而把失败吞掉，
+// 于是「节点已换成新池、流量却还是旧值」也会报成功。刷新请改用
+// ReplaceSubscriptionNodesWithMeta，让 traffic 与节点替换同事务提交。
+// 保留本方法只为兼容外部直接调用。
 func (d *DB) UpdateSubscriptionTraffic(id int64, upload, download, total int64, expireAt time.Time) error {
 	_, err := d.db.Exec(`UPDATE subscriptions SET traffic_upload=?, traffic_download=?, traffic_total=?, expire_at=?, updated_at=? WHERE id=?`, upload, download, total, nullTime(expireAt), time.Now(), id)
 	return err
