@@ -200,7 +200,8 @@ jobs:
           printf 'proxies:\n  - name: ci-node\n    type: trojan\n    server: 127.0.0.1\n    port: 443\n    password: ci-password\n' > "$RUNNER_TEMP/karing-ci-node.yaml"
           "$RUNNER_TEMP/karing-release/karing" import clash "$RUNNER_TEMP/karing-ci-node.yaml"
           "$RUNNER_TEMP/karing-release/karing" config check
-          SINGBOX_BIN="$KARING_HOME/runtime/bin/sing-box" go test -count=1 ./internal/core -run TestIntegrationRealSingBox -v
+          SINGBOX_BIN="$KARING_HOME/runtime/bin/sing-box" go test -count=1 ./internal/core \
+            -run 'TestIntegrationRealSingBox|TestRealSingBoxDNSResolverCycle' -v
           # 独立节点测速的临时配置只有**真启动**才能验证合法：实测 sing-box check 对
           # detour=direct（detour to an empty direct outbound）、悬空 domain_resolver
           # （dependency not found）、悬空 detour（outbound detour not found）一律返回 0，

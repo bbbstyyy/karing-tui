@@ -1,0 +1,54 @@
+package config
+
+import (
+	"fmt"
+	"strings"
+)
+
+// ValidateDNSResolverGraph 检查 DNS 服务器之间的 domain_resolver（AddressResolver）
+// 引用是否成环。
+//
+// 为什么必须显式检（真实内核实测，2026-09-19，本机内核 revision cf69a007）：
+//
+//	sing-box check  <cfg>  → rc=0      （只校验解码，看不出环）
+//	sing-box run    <cfg>  → FATAL start service: circular server dependency: a -> b -> a
+//
+// 即环只在 run 阶段暴露，与 V6 轮「detour=direct / 悬空 domain_resolver / 悬空 detour
+// 全都 check rc=0、只有 run 报 FATAL」同源。用户可以在界面里把 A 的 resolver 设成 B、
+// 把 B 的设成 A——单条各自都合法（validateServer 只查「引用存在且启用」），
+// 组合起来成环，直到启动内核才炸，而且那时报的是一条与用户操作无关的内核错误。
+//
+// 入参语义：**传入的每个元素都视为会进配置**（不看 Enabled）。
+// 调用方负责只传「将要被输出/将会生效」的那批服务器——两个调用点需要过滤的集合
+// 不同（生成器传全部待输出项，界面层传启用项 + 候选），把过滤放在调用方更清楚。
+//
+// 只报「环」这一件事：引用不存在的 tag 由生成器的悬空引用校验负责，
+// 两件事分开报错，用户才知道该改哪里。
+func ValidateDNSResolverGraph(servers []DNSServer) error {
+	byTag := make(map[string]DNSServer, len(servers))
+	for _, s := range servers {
+		byTag[s.Tag] = s
+	}
+	for _, start := range servers {
+		path := make([]string, 0, len(servers)+1)
+		onPath := make(map[string]bool, len(servers))
+		for cur := start; ; {
+			if onPath[cur.Tag] {
+				return fmt.Errorf("DNS 服务器 %q 的 domain_resolver 引用成环: %s",
+					start.Tag, strings.Join(append(path, cur.Tag), " -> "))
+			}
+			onPath[cur.Tag] = true
+			path = append(path, cur.Tag)
+			if cur.AddressResolver == "" {
+				break
+			}
+			next, ok := byTag[cur.AddressResolver]
+			if !ok {
+				// 指向集合外的 tag：交给悬空引用校验，不算环。
+				break
+			}
+			cur = next
+		}
+	}
+	return nil
+}

@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/bbbstyyy/karing-tui/internal/config"
@@ -176,5 +177,60 @@ func TestRuleRejectsDisabledServer(t *testing.T) {
 	}
 	if _, err := m.AddRule("domain", "example.com", s.Tag); err == nil {
 		t.Fatal("DNS 规则不应引用已停用的服务器")
+	}
+}
+
+// V7-8：domain_resolver 成环必须在**写库之前**被拒绝。
+//
+// 判决性背景（本机内核实测，revision cf69a007）：环只在 run 阶段暴露，
+// `sing-box check` 返回 0；因此不能靠生成配置时的静态校验兜底——
+// 用户存进去的就是一份启动不了的配置，而且报错与他刚才的操作毫无关系。
+func TestUpdateServerRejectsResolverCycleBeforeWrite(t *testing.T) {
+	m := newTestManager(t)
+	a := &config.DNSServer{Tag: "a", Type: "udp", Address: "1.1.1.1", Enabled: true}
+	if err := m.DB.CreateDNSServer(a); err != nil {
+		t.Fatal(err)
+	}
+	b := &config.DNSServer{Tag: "b", Type: "udp", Address: "8.8.8.8", Enabled: true}
+	if err := m.DB.CreateDNSServer(b); err != nil {
+		t.Fatal(err)
+	}
+
+	// 先建一条合法链：b 依赖 a。
+	b.AddressResolver = "a"
+	if err := m.UpdateServer(b); err != nil {
+		t.Fatalf("正向链不得被拒绝: %v", err)
+	}
+
+	// 再把 a 指向 b 就成了环。单条 update 本身完全「合法」，
+	// 只有组合起来才成环——这正是界面挡不住的那种操作。
+	a.AddressResolver = "b"
+	err := m.UpdateServer(a)
+	if err == nil {
+		t.Fatal("补成环必须被拒绝")
+	}
+	if !strings.Contains(err.Error(), "环") {
+		t.Errorf("错误文案应指出「环」，实得 %v", err)
+	}
+	servers, listErr := m.DB.ListDNSServers()
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	for _, s := range servers {
+		if s.Tag == "a" && s.AddressResolver != "" {
+			t.Fatalf("拒绝时不得写库，a.AddressResolver 实为 %q", s.AddressResolver)
+		}
+	}
+}
+
+// 反向核对：新增路径的环校验不得误伤正常新增（新增单个服务器本来也造不出环，
+// 因为还没有别的东西引用它；这里钉的是「加了校验之后照样能加」）。
+func TestAddServerStillAcceptsNormalServers(t *testing.T) {
+	m := newTestManager(t)
+	if _, err := m.AddServer("boot", "udp", "1.1.1.1", "", ""); err != nil {
+		t.Fatalf("AddServer(boot): %v", err)
+	}
+	if _, err := m.AddServer("doh", "https", "dns.example", "boot", ""); err != nil {
+		t.Fatalf("AddServer(doh): %v", err)
 	}
 }

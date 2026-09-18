@@ -130,11 +130,49 @@ func (m *Manager) AddServer(tag, typ, address, addressResolver, detour string) (
 		}
 	}
 	s.Position = max + 1
+	if err := m.validateResolverGraph(s, 0); err != nil {
+		return nil, err
+	}
 	if err := m.DB.CreateDNSServer(s); err != nil {
 		return nil, err
 	}
 	m.Logf("添加 DNS 服务器 %q (%s)", s.Tag, s.Type)
 	return s, nil
+}
+
+// validateResolverGraph 用「候选服务器替换/加入现有集合后」的视图判环（V7-8）。
+//
+// 必须在**写库之前**调用：写进去之后每一条单独看都合法（validateServer 只查
+// 「引用存在且启用」），只有启动内核才会炸——而真实内核实测表明那时报的是
+// "circular server dependency"（check 阶段返回 0，看不出问题）。
+//
+// 只把**启用**的服务器纳入图：禁用的不进生成配置，也不该拦住用户保存。
+// selfID 为 0 表示新增；否则是「用 candidate 替换 ID=selfID 的那一条」。
+func (m *Manager) validateResolverGraph(candidate *config.DNSServer, selfID int64) error {
+	servers, err := m.DB.ListDNSServers()
+	if err != nil {
+		return err
+	}
+	graph := make([]config.DNSServer, 0, len(servers)+1)
+	replaced := false
+	for _, s := range servers {
+		if !s.Enabled {
+			continue
+		}
+		if selfID != 0 && s.ID == selfID {
+			replaced = true
+			// 候选把自己停用了：它不再进配置，也就不参与判环。
+			if candidate.Enabled {
+				graph = append(graph, *candidate)
+			}
+			continue
+		}
+		graph = append(graph, *s)
+	}
+	if !replaced && candidate.Enabled {
+		graph = append(graph, *candidate)
+	}
+	return config.ValidateDNSResolverGraph(graph)
 }
 
 // UpdateServer 更新 DNS 服务器。
@@ -177,6 +215,10 @@ func (m *Manager) UpdateServer(s *config.DNSServer) error {
 				return fmt.Errorf("DNS 服务器 %q 的 AddressResolver 正在引用 %q，请先修改引用", other.Tag, old.Tag)
 			}
 		}
+	}
+	// 写库前判环（V7-8）：单条 update 都可能把「A→B」补成环，必须拦住。
+	if err := m.validateResolverGraph(s, s.ID); err != nil {
+		return err
 	}
 	if old.Tag != s.Tag {
 		if err := m.DB.UpdateDNSServerRenamed(s, old.Tag); err != nil {

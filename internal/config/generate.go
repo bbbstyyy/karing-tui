@@ -837,6 +837,13 @@ func (g *generator) buildDNS(route *sbRoute) (*sbDNS, error) {
 	if cfg == nil || len(cfg.Servers) == 0 {
 		return nil, nil
 	}
+	// 正式输出前先判环（V7-8）。真实内核实测：sing-box 只在 **run** 阶段拒绝环
+	// （check 返回 0），所以「生成成功」并不代表用户拿到的配置能启动；
+	// 必须在生成阶段就 fail-closed。这里传的是**将要被输出**的整批服务器，
+	// 函数不过滤 Enabled——生成器输出的是 cfg.Servers 的全部元素。
+	if err := ValidateDNSResolverGraph(cfg.Servers); err != nil {
+		return nil, err
+	}
 	dns := &sbDNS{Strategy: cfg.Strategy}
 
 	tags := map[string]bool{}
