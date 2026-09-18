@@ -141,7 +141,9 @@ func (p *PreparedRestore) Apply(paths *platform.Paths) error {
 	backup := paths.DB + ".pre-restore"
 	hadCurrent := false
 	if _, err := os.Stat(paths.DB); err == nil {
-		if err := copyFile(backup, paths.DB); err != nil {
+		// 必须走原子安全 copy（V7-2）：`.pre-restore` 若与当前库同 inode，
+		// 旧的 O_TRUNC 写法会在这一步把当前库截断成 0 字节。
+		if err := atomicCopyFile(backup, paths.DB, 0o600); err != nil {
 			return fmt.Errorf("备份当前数据库失败: %w", err)
 		}
 		hadCurrent = true
@@ -174,7 +176,7 @@ func (p *PreparedRestore) Apply(paths *platform.Paths) error {
 	}
 	if hadCurrent {
 		rollback := filepath.Join(p.dir, "rollback.db")
-		if copyErr := copyFile(rollback, backup); copyErr != nil {
+		if copyErr := atomicCopyFile(rollback, backup, 0o600); copyErr != nil {
 			return fmt.Errorf("恢复失败: %v；回滚失败: %w，原数据库保存在 %s", err, copyErr, backup)
 		}
 		if renameErr := os.Rename(rollback, paths.DB); renameErr != nil {

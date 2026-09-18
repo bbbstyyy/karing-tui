@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -226,22 +227,55 @@ func RestoreArchive(paths *platform.Paths, archive string) error {
 	return prepared.Apply(paths)
 }
 
-func copyFile(dest, src string) error {
+// atomicCopyFile 以「同目录临时文件 + 原子替换」把 src 复制到 dest。
+// 它是 writeBackupAtomically 的同族原语，区别只在于内容来自另一个文件而不是回调。
+//
+// 为什么不能 O_CREATE|O_WRONLY|O_TRUNC 直接写 dest（V7-2 修的正是这个）：
+//
+//   - dest 与 src 可能是**同一 inode**（dest 是 src 的 hardlink）。此时 O_TRUNC
+//     会在打开目标的一瞬间把共享的 inode 截断成 0 字节——「备份当前数据库」这一步
+//     先把当前数据库毁了，恢复还没开始就已经没得回滚；
+//   - dest 若是指向别处的 symlink，O_TRUNC 会跟随它把数据写进无关文件。
+//
+// 三条硬约束：
+//   - 永远不直接 O_TRUNC 最终目标；
+//   - temp 必须与 dest 同目录（rename 需要同文件系统）；
+//   - rename 之前的任何失败都不得改变现有 dest：失败即删 temp 并返回。
+//
+// rename 本身不跟随 symlink：它替换的是 dest 这个目录项，所以目标原来是 symlink
+// 时只会把 symlink 换成普通文件，target 内容保持不变；目标是 hardlink 时也只是
+// 摘掉一条链接，原 inode 仍被 src 引用着。
+//
+// 临时文件前缀取中性的 ".atomic-copy-"（而不是绑死某个用途的 ".pre-restore-"）：
+// 本函数同时服务恢复前的 pre-restore 备份与失败回滚两个调用点。
+func atomicCopyFile(dest, src string, mode fs.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+
+	tmp, err := os.CreateTemp(filepath.Dir(dest), ".atomic-copy-*")
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // 成功后已被 rename 走，此处失败无害
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
 		return err
 	}
-	if err := out.Sync(); err != nil {
+	// 注意顺序：Sync 必须在 fd 仍打开时执行，写不出 Close → Sync 这种顺序。
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
 		return err
 	}
-	return out.Close()
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return replaceFile(tmpPath, dest)
 }
