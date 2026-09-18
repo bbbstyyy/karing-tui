@@ -133,7 +133,9 @@ func latencyResults(app *application.App, ids []int64, report func(itemResult)) 
 	defer cancel()
 	var mu sync.Mutex
 	byID := map[int64]itemResult{}
-	_, err := app.Proxy.TestLatencyProgress(ctx, ids, "", 3000, func(result proxy.NodeTestResult) {
+	// timeoutMS 传 0：由 proxy 层取 config.DefaultLatencyTimeoutMS，
+	// 与运行代理组测速保持同一默认值。
+	_, err := app.Proxy.TestLatencyProgress(ctx, ids, "", 0, func(result proxy.NodeTestResult) {
 		row := itemResult{ID: result.ID, Name: result.Name, State: "成功", Detail: fmt.Sprintf("%d ms", result.LatencyMS)}
 		if result.Err != nil {
 			row.State, row.Detail = "失败", redact.Text(result.Err.Error())
@@ -161,5 +163,12 @@ func latencyResults(app *application.App, ids []int64, report func(itemResult)) 
 	if err == nil {
 		err = resultError(results)
 	}
-	return actionDoneMsg{Action: "test-latency", Results: results, Data: resultSummary(results), Err: err}
+	return actionDoneMsg{Action: "test-latency", Results: results, Data: resultSummary(results) + latencyScopeHint, Err: err}
 }
+
+// latencyScopeHint 标注独立节点测速的 DNS 口径。
+//
+// 运行中代理组测速（Dashboard）用的是**已应用**的配置，独立节点测速读的是
+// **已保存**的 DNS —— 核心停止时也必须能测速，只能这样。用户改了 DNS 却还没
+// Ctrl+A 应用时，两条路径短暂不一致属于预期行为，写在结果里免得被当成节点故障。
+const latencyScopeHint = " · 使用已保存 DNS"

@@ -981,24 +981,15 @@ func parseTLSDNSAddress(addr, typ string) (host string, port int, path string) {
 
 // pickDNSResolver 选出用于解析域名的 DNS 服务器 tag：优先 local，其次纯 IP 的 udp/tcp，
 // 避免选中地址本身是域名（需先被解析）的服务器造成循环。
+//
+// 候选排序复用 dnsCandidateOrder（probe.go）：独立测速的 bootstrap 选择用的是
+// 同一套优先级，只是还要额外过 probe-safe 检查。两处各写一份排序，迟早会分叉。
 func pickDNSResolver(servers []DNSServer) string {
-	for i := range servers {
-		if servers[i].Type == "local" {
-			return servers[i].Tag
-		}
+	order := dnsCandidateOrder(servers)
+	if len(order) == 0 {
+		return ""
 	}
-	for i := range servers {
-		if servers[i].Type == "udp" || servers[i].Type == "tcp" {
-			host, _ := splitHostPort(servers[i].Address)
-			if net.ParseIP(host) != nil {
-				return servers[i].Tag
-			}
-		}
-	}
-	if len(servers) > 0 {
-		return servers[0].Tag
-	}
-	return ""
+	return servers[order[0]].Tag
 }
 
 // splitValues 拆分逗号分隔的多值并去除空白项。

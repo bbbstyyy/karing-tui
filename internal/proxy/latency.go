@@ -21,8 +21,12 @@ const DefaultTestURL = config.DefaultTestURL
 const defaultConcurrency = 8
 
 // testNodes 用一次性 sing-box 实例批量测速。
-// 做法：把全部节点生成为出站写入临时配置，开启 clash_api，
-// 逐个调用 /proxies/{tag}/delay 让 sing-box 经对应出站发探测请求。
+// 配置生成交给 config.GenerateLatencyProbe：它复用正式配置的 DNS 语义，
+// 把「节点服务器域名 → IP」的解析来源（dns + route.default_domain_resolver）
+// 显式带进临时核心。此前这里手工拼「只有出站 + clash_api」的配置，节点服务器
+// 是域名时就落在与运行核心完全不同的解析环境里，表现为批量假失败。
+//
+// 本函数只负责：临时文件、启动 adhoc、等 API、并发调 delay、汇总结果。
 func (m *Manager) testNodes(ctx context.Context, nodes []*config.Node, testURL string, timeoutMS int, report func(NodeTestResult)) (map[int64]int64, error) {
 	results := map[int64]int64{}
 	if len(nodes) == 0 {
@@ -32,7 +36,7 @@ func (m *Manager) testNodes(ctx context.Context, nodes []*config.Node, testURL s
 		testURL = DefaultTestURL
 	}
 	if timeoutMS <= 0 {
-		timeoutMS = 3000
+		timeoutMS = config.DefaultLatencyTimeoutMS
 	}
 
 	apiPort, err := core.FreePort()
@@ -40,49 +44,38 @@ func (m *Manager) testNodes(ctx context.Context, nodes []*config.Node, testURL s
 		return nil, fmt.Errorf("分配测速 API 端口失败: %w", err)
 	}
 
-	// 构建临时配置：仅出站 + clash_api
-	var (
-		outbounds []any
-		tasks     []delayTask
-		skips     []string
-	)
-	for _, n := range nodes {
-		tag := fmt.Sprintf("t%d", n.ID)
-		ob, err := config.NodeToOutbound(n, tag)
-		if err != nil {
-			skips = append(skips, err.Error())
-			results[n.ID] = -1
-			if report != nil {
-				report(NodeTestResult{ID: n.ID, Name: n.Name, LatencyMS: -1, Err: err})
-			}
-			continue
-		}
-		outbounds = append(outbounds, ob)
-		tasks = append(tasks, delayTask{id: n.ID, tag: tag, name: n.Name})
-	}
-	if len(outbounds) == 0 {
-		return nil, fmt.Errorf("没有可测速的节点（%d 个被跳过），首条: %s", len(skips), firstStr(skips))
-	}
-	cfg := map[string]any{
-		"log": map[string]any{"level": "warn"},
-		"experimental": map[string]any{
-			"clash_api": map[string]any{
-				"external_controller": fmt.Sprintf("127.0.0.1:%d", apiPort),
-			},
-		},
-		"outbounds": outbounds,
-	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	dnsCfg, err := m.loadProbeDNS()
 	if err != nil {
-		return nil, fmt.Errorf("序列化测速配置失败: %w", err)
+		return nil, err
 	}
+	plan, err := config.GenerateLatencyProbe(config.LatencyProbe{Nodes: nodes, DNS: dnsCfg, APIPort: apiPort})
+	if err != nil {
+		return nil, err
+	}
+	// 不可生成的节点先逐个回报：用户需要看到「哪个节点、为什么」，而不是一个总数。
+	skips := make([]string, 0, len(plan.Skipped))
+	for _, skip := range plan.Skipped {
+		skips = append(skips, skip.Err.Error())
+		results[skip.ID] = -1
+		if report != nil {
+			report(NodeTestResult{ID: skip.ID, Name: skip.Name, LatencyMS: -1, Err: skip.Err})
+		}
+	}
+	if len(plan.Targets) == 0 {
+		return nil, fmt.Errorf("没有可测速的节点（%d 个被跳过），首条: %s", len(plan.Skipped), firstStr(skips))
+	}
+	tasks := make([]delayTask, 0, len(plan.Targets))
+	for _, t := range plan.Targets {
+		tasks = append(tasks, delayTask{id: t.ID, tag: t.Tag, name: t.Name})
+	}
+
 	file, err := os.CreateTemp(m.Paths.Runtime, "latency-*.json")
 	if err != nil {
 		return nil, fmt.Errorf("创建测速配置失败: %w", err)
 	}
 	cfgPath := file.Name()
 	defer os.Remove(cfgPath)
-	if _, err := file.Write(data); err != nil {
+	if _, err := file.Write(plan.Data); err != nil {
 		_ = file.Close()
 		return nil, fmt.Errorf("写入测速配置失败: %w", err)
 	}
@@ -138,6 +131,23 @@ func (m *Manager) testNodes(ctx context.Context, nodes []*config.Node, testURL s
 	}
 	wg.Wait()
 	return results, nil
+}
+
+// loadProbeDNS 取「当前已保存的 DNS 配置」作为独立测速核心的解析环境。
+//
+// 与代理组测速的区别是刻意的：运行中的核心用**已应用**的配置，而独立测速在核心
+// 停止时也必须能工作，因此只能读已保存配置。用户改了 DNS 但还没应用时，两条路径
+// 短暂不一致属于预期行为。本次修复的 bug 不是「Applied vs Saved」，而是
+// 「Applied/Saved DNS vs 完全没有 DNS」。
+func (m *Manager) loadProbeDNS() (*config.DNSConfig, error) {
+	if m.LoadDNS == nil {
+		return nil, nil
+	}
+	cfg, err := m.LoadDNS()
+	if err != nil {
+		return nil, fmt.Errorf("加载测速 DNS 配置失败: %w", err)
+	}
+	return &cfg, nil
 }
 
 // delayTask 一个节点的测速任务。

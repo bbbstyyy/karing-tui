@@ -392,7 +392,7 @@ func (d *Dashboard) testGroups(names []string) tea.Cmd {
 		var results []itemResult
 		for _, name := range names {
 			result := itemResult{Name: name, State: "成功", Detail: "运行节点延迟已刷新"}
-			if _, err := client.GroupDelay(ctx, name, "", 5000); err != nil {
+			if _, err := client.GroupDelay(ctx, name, "", config.DefaultLatencyTimeoutMS); err != nil {
 				result.State, result.Detail = "失败", err.Error()
 			}
 			results = append(results, result)

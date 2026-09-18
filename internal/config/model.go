@@ -80,6 +80,13 @@ const ManualSubscriptionID int64 = 0
 // DefaultTestURL 默认延迟测试地址（204 无内容，测纯连接耗时）。
 const DefaultTestURL = "http://www.gstatic.com/generate_204"
 
+// DefaultLatencyTimeoutMS 单节点/单代理组延迟探测的默认超时（毫秒）。
+//
+// 两条测速路径必须共用同一个默认值：代理组测速走运行中核心的 clash API，
+// 独立节点测速走一次性核心的 /proxies/{tag}/delay。超时不一致时，跨境或首次
+// 解析较慢的节点会在一处成功、在另一处超时，用户看到的是「同一节点两个结论」。
+const DefaultLatencyTimeoutMS = 5000
+
 // ProxyGroup 代理组；成员可为节点、嵌套代理组或特殊值 all（全部启用节点）。
 type ProxyGroup struct {
 	ID        int64

@@ -22,6 +22,15 @@ type Manager struct {
 	Paths *platform.Paths
 	Bin   *core.BinaryManager
 	Logf  func(format string, args ...any)
+
+	// LoadDNS 提供「当前已保存的 DNS 配置」，供独立节点测速的临时核心使用。
+	//
+	// 用函数注入而不是持有 *dns.Manager：proxy 只能依赖 config，直接依赖 dns 会形成
+	// proxy ↔ dns 的包循环。应用初始化时注入 a.DNS.LoadConfig。
+	//
+	// 为 nil 时不生成 dns 段（与「没有 DNS 服务器」的主核心一致），不会静默回退
+	// 系统解析器以外的行为——探针的 DNS 语义只在 config.GenerateLatencyProbe 里。
+	LoadDNS func() (config.DNSConfig, error)
 }
 
 // NewManager 创建节点管理器。logf 可为 nil。
@@ -191,7 +200,7 @@ func (m *Manager) SetEnabled(id int64, enabled bool) error {
 }
 
 // TestLatency 批量测速并写回数据库；返回 节点ID→延迟毫秒（失败为 -1）。
-// url 为空用默认测速地址；timeoutMS 为单节点超时（为 0 用 3000）。
+// url 为空用默认测速地址；timeoutMS 为单节点超时（为 0 用 config.DefaultLatencyTimeoutMS）。
 func (m *Manager) TestLatency(ctx context.Context, ids []int64, url string, timeoutMS int) (map[int64]int64, error) {
 	return m.TestLatencyProgress(ctx, ids, url, timeoutMS, nil)
 }

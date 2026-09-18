@@ -139,6 +139,9 @@ func newApp(paths *platform.Paths, initializeDefaults bool) (*App, error) {
 	a.Core = core.NewManager(paths, a.Bin)
 	a.Subs = subscription.NewManager(db, func() string { return a.GetSettings().DownloadProxy }, a.logf)
 	a.Proxy = proxy.NewManager(db, paths, a.Bin, a.logf)
+	// 独立节点测速会起一次性核心，它的节点服务器域名解析必须与运行核心同源，
+	// 否则同一节点在「运行代理组测速」与「代理组测速」两条路径上结论不同。
+	a.Proxy.LoadDNS = a.DNS.LoadConfig
 	a.Subs.AutoTest = func(ctx context.Context, subID int64) error {
 		nodes, err := a.DB.ListNodes(subID)
 		if err != nil {
