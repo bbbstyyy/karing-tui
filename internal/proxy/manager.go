@@ -28,8 +28,9 @@ type Manager struct {
 	// 用函数注入而不是持有 *dns.Manager：proxy 只能依赖 config，直接依赖 dns 会形成
 	// proxy ↔ dns 的包循环。应用初始化时注入 a.DNS.LoadConfig。
 	//
-	// 为 nil 时不生成 dns 段（与「没有 DNS 服务器」的主核心一致），不会静默回退
-	// 系统解析器以外的行为——探针的 DNS 语义只在 config.GenerateLatencyProbe 里。
+	// 为 nil 时测速会直接报错（见 loadProbeDNS）：漏注入必须立刻暴露，而不是让独立
+	// 测速静默退回「没有 DNS」的行为。返回空 DNSConfig 表示用户确实没配 DNS，
+	// 那种情况与主核心一致，允许放行。
 	LoadDNS func() (config.DNSConfig, error)
 }
 

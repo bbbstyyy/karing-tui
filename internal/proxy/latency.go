@@ -139,9 +139,15 @@ func (m *Manager) testNodes(ctx context.Context, nodes []*config.Node, testURL s
 // 停止时也必须能工作，因此只能读已保存配置。用户改了 DNS 但还没应用时，两条路径
 // 短暂不一致属于预期行为。本次修复的 bug 不是「Applied vs Saved」，而是
 // 「Applied/Saved DNS vs 完全没有 DNS」。
+//
+// LoadDNS 未注入属于**装配错误**（生产路径由 application.NewApp 注入 a.DNS.LoadConfig），
+// 因此 fail-closed：静默按「没有 DNS」处理会悄悄退回本次要修的行为——临时核心不带
+// dns / default_domain_resolver，域名型节点又变成批量假失败，而且没有任何报错。
+// 注意「没有配置 DNS 服务器」（LoadDNS 正常返回空 DNSConfig）是另一回事，那种情况
+// 与主核心语义一致，仍然允许。
 func (m *Manager) loadProbeDNS() (*config.DNSConfig, error) {
 	if m.LoadDNS == nil {
-		return nil, nil
+		return nil, fmt.Errorf("测速 DNS loader 未初始化：proxy.Manager.LoadDNS 必须由调用方注入（见 application.NewApp）")
 	}
 	cfg, err := m.LoadDNS()
 	if err != nil {

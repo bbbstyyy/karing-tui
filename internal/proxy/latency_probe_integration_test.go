@@ -91,6 +91,82 @@ func TestLatencyProbeResolvesNodeDomain(t *testing.T) {
 	})
 }
 
+// TestLatencyProbeConfigsStartRealSingBox 是配置合法性门禁：三种「看起来能用、实际会被
+// 内核拒绝」的 DNS 配置都必须能生成可启动的探针配置。
+//
+// 为什么必须用真实内核「启动」而不是 `sing-box check`：实测 check 只校验解码，
+// 下列三类的退出码都是 0，只有 run 才会暴露
+//
+//	detour=direct            → FATAL detour to an empty direct outbound makes no sense
+//	悬空 domain_resolver     → FATAL dependency[ghost] not found for server[x]
+//	graph 上的悬空 detour    → FATAL outbound detour not found: Auto
+func TestLatencyProbeConfigsStartRealSingBox(t *testing.T) {
+	m := newProbeTestManager(t)
+	dnsSrv := startTestDNS(t, "node.test")
+	proxy := startFakeProxy(t)
+	node := &config.Node{ID: 1, Name: "http-proxy", Protocol: "http", Server: "node.test", Port: proxy.port, Enabled: true}
+
+	t.Run("直连写法 detour=direct 不得让临时核心启动失败", func(t *testing.T) {
+		probeWithDNS(t, m, node, config.DNSConfig{
+			Strategy: "prefer_ipv4",
+			Servers:  []config.DNSServer{{Tag: "x", Type: "udp", Address: dnsSrv.addr, Detour: "direct", Enabled: true}},
+		}, dnsSrv, proxy)
+	})
+
+	t.Run("字面 IP 服务器带悬空 AddressResolver 不得让临时核心启动失败", func(t *testing.T) {
+		probeWithDNS(t, m, node, config.DNSConfig{
+			Servers: []config.DNSServer{{Tag: "x", Type: "udp", Address: dnsSrv.addr, AddressResolver: "ghost", Enabled: true}},
+		}, dnsSrv, proxy)
+	})
+
+	t.Run("与自举无关的 AddressResolver 环不得拦住测速", func(t *testing.T) {
+		probeWithDNS(t, m, node, config.DNSConfig{
+			Servers: []config.DNSServer{
+				{Tag: "local", Type: "udp", Address: dnsSrv.addr, Enabled: true},
+				{Tag: "ra", Type: "udp", Address: "1.1.1.1", AddressResolver: "rb", Enabled: true},
+				{Tag: "rb", Type: "udp", Address: "1.1.1.2", AddressResolver: "ra", Enabled: true},
+			},
+		}, dnsSrv, proxy)
+	})
+
+	t.Run("只有代理型 DNS 时必须明确报错且不起内核", func(t *testing.T) {
+		dnsSrv.reset()
+		proxy.reset()
+		m.LoadDNS = func() (config.DNSConfig, error) {
+			return config.DNSConfig{Servers: []config.DNSServer{
+				{Tag: "remote", Type: "https", Address: "dns.example.test", Detour: "Auto", Enabled: true},
+			}}, nil
+		}
+		_, err := probeOnce(t, m, node)
+		if err == nil {
+			t.Fatal("只有代理型 DNS 时应返回配置错误")
+		}
+		if !strings.Contains(err.Error(), "bootstrap") {
+			t.Errorf("错误应说明缺少可用 bootstrap DNS: %v", err)
+		}
+	})
+}
+
+// probeWithDNS 跑一次测速并断言「解析 + 建连」都发生：
+// 临时核心必须真的能启动（配置合法），且节点域名解析走的是探针自带的 DNS。
+func probeWithDNS(t *testing.T, m *Manager, node *config.Node, dnsCfg config.DNSConfig, dnsSrv *testDNSServer, proxy *fakeProxy) {
+	t.Helper()
+	dnsSrv.reset()
+	proxy.reset()
+	m.LoadDNS = func() (config.DNSConfig, error) { return dnsCfg, nil }
+
+	latency, err := probeOnce(t, m, node)
+	if err != nil {
+		t.Fatalf("testNodes 失败（临时核心很可能未能启动）: %v", err)
+	}
+	if !dnsSrv.sawQuery("node.test") {
+		t.Errorf("探针未解析节点域名，查询记录: %v", dnsSrv.queries())
+	}
+	if proxy.conns() == 0 {
+		t.Errorf("未建立连接：探测没有进入连接阶段（延迟 %d）", latency)
+	}
+}
+
 // probeOnce 跑一次单节点测速并返回延迟（失败为 -1），失败原因打到测试日志便于排错。
 func probeOnce(t *testing.T, m *Manager, node *config.Node, testURL ...string) (int64, error) {
 	t.Helper()

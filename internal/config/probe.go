@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 )
 
@@ -123,87 +124,128 @@ func GenerateLatencyProbe(p LatencyProbe) (*LatencyProbePlan, error) {
 //
 // 没有 DNS 服务器时返回空而不是报错：此时主核心也不生成 dns 段、同样走系统解析器，
 // 两边语义一致，属于用户配置现状而不是探针的缺陷。
+//
+// 候选逐个评估、失败就换下一个，不做「全局预检」：配置里存在与自举无关的问题
+// （某条用不到的服务器写错地址、或两条代理型 DNS 互相引用成环）时，本探针依然
+// 应该能测速，否则又会造出「界面 1 正常、界面 3 特有失败」的分叉。
 func buildProbeDNS(cfg *DNSConfig) (*sbDNS, string, error) {
 	if cfg == nil || len(cfg.Servers) == 0 {
 		return nil, "", nil
 	}
-	if err := validateProbeDNSShape(cfg.Servers); err != nil {
-		return nil, "", err
-	}
-	if tag, ok := findDNSResolverCycle(cfg.Servers); ok {
-		return nil, "", fmt.Errorf("DNS 服务器 AddressResolver 存在环: %s；环形引用会让地址解析自身打转，请先修复", tag)
-	}
-
 	byTag := make(map[string]*DNSServer, len(cfg.Servers))
 	for i := range cfg.Servers {
 		byTag[cfg.Servers[i].Tag] = &cfg.Servers[i]
 	}
 
+	var rejected []string
 	for _, idx := range dnsCandidateOrder(cfg.Servers) {
-		chain, ok := probeResolverChain(&cfg.Servers[idx], byTag)
-		if !ok {
+		s := &cfg.Servers[idx]
+		chain, reason := probeResolverChain(s, byTag)
+		if reason != "" {
+			rejected = append(rejected, fmt.Sprintf("%s（%s）", s.Tag, reason))
 			continue
 		}
-		dns := &sbDNS{Strategy: cfg.Strategy, Final: cfg.Servers[idx].Tag}
-		for _, s := range chain {
-			dns.Servers = append(dns.Servers, dnsServerOutbound(s))
+		dns := &sbDNS{Strategy: cfg.Strategy, Final: s.Tag}
+		for _, c := range chain {
+			dns.Servers = append(dns.Servers, probeDNSServer(c))
 		}
-		return dns, cfg.Servers[idx].Tag, nil
+		return dns, s.Tag, nil
 	}
 
-	// 走到这里说明有 DNS 服务器，但没有一个能被独立测速核心使用（典型情况：
-	// 服务器地址本身是域名、且唯一的解析来源是走代理组的 DNS）。
-	// 此时绝不能静默回退系统解析器——那会让「DNS 切换」在测速上失去判决意义：
-	// 想知道某个 DNS 能不能解析某节点域名，恰恰要靠这条路径。
-	return nil, "", fmt.Errorf("当前 DNS 配置没有可用于独立节点测速的 bootstrap DNS。" +
-		"独立测速核心不包含代理组，无法使用 detour 指向代理组的 DNS，" +
-		"也无法用它解析自身地址。请配置 local 或可直连（地址为 IP、detour 为 direct）的 DNS，" +
-		"或改用运行中代理组测速。")
+	// 所有候选都不可用。绝不静默回退系统解析器——那会让「DNS 切换」在测速上失去
+	// 判决意义：想知道某个 DNS 能不能解析某节点域名，恰恰要靠这条路径。
+	// 逐条给出原因，否则用户只能在「测速全失败」和「配置哪里错」之间猜。
+	return nil, "", fmt.Errorf("当前 DNS 配置没有可用于独立节点测速的 bootstrap DNS：%s。"+
+		"独立测速核心不包含代理组，无法使用 detour 指向代理组的 DNS；"+
+		"请配置 local，或地址为字面 IP 的 udp/tcp DNS 后重试。", strings.Join(rejected, "；"))
+}
+
+// probeDNSServer 输出探针用的 DNS server 条目。
+//
+// 与主配置只有一处差别：地址不是域名时去掉 domain_resolver。该字段只用于解析
+// 「服务器地址本身是域名」的情况，但 sing-box 启动时仍会校验它引用的 tag 是否存在
+// （实测：字面 IP + 悬空 domain_resolver → FATAL dependency[ghost] not found for
+// server[x]），留着等于为一个用不到的依赖把临时核心拦在启动之外。
+func probeDNSServer(s *DNSServer) map[string]any {
+	srv := *s
+	if !probeNeedsDomainResolver(&srv) {
+		srv.AddressResolver = ""
+	}
+	return dnsServerOutbound(&srv)
+}
+
+// probeNeedsDomainResolver 判断这条 DNS 服务器的地址是否真的要靠 AddressResolver 解析。
+// 只有「非 local 且地址是域名」才需要；字面 IP 与 local 都能自举。
+func probeNeedsDomainResolver(s *DNSServer) bool {
+	if s.Type == "local" {
+		return false
+	}
+	host := probeServerHost(s)
+	return host != "" && net.ParseIP(host) == nil
 }
 
 // probeResolverChain 收集以 s 为默认解析器时、临时配置里必须一并存在的 DNS 服务器。
 //
 // 返回顺序为「依赖先、使用者后」：AddressResolver 链上的服务器先进入配置，
-// 引用它的条目紧随其后。第二个返回值为 false 表示 s 不能被独立测速核心使用。
-func probeResolverChain(s *DNSServer, byTag map[string]*DNSServer) ([]*DNSServer, bool) {
+// 引用它的条目紧随其后。第二个返回值非空表示 s 不可用，内容是面向用户的原因。
+//
+// 环检测只覆盖**这条候选链**：链外存在环不影响本探针能否自举，不该让节点测速整体失败。
+func probeResolverChain(s *DNSServer, byTag map[string]*DNSServer) ([]*DNSServer, string) {
 	var out []*DNSServer
-	seen := map[string]bool{}
-	var walk func(*DNSServer) bool
-	walk = func(cur *DNSServer) bool {
+	added := map[string]bool{}
+	var path []string
+	var walk func(*DNSServer) string
+	walk = func(cur *DNSServer) string {
+		if slices.Contains(path, cur.Tag) {
+			return fmt.Sprintf("AddressResolver 成环: %s -> %s", strings.Join(path, " -> "), cur.Tag)
+		}
 		if !probeDetourUsable(cur.Detour) {
-			return false
+			return fmt.Sprintf("detour %q 在测速配置里没有对应出站", cur.Detour)
 		}
-		// 地址是域名又没有 AddressResolver 时，唯一的解析来源就是
-		// default_domain_resolver，也就是它自己——自引用，必须换别的候选。
-		if probeServerHost(cur) != "" && !probeAddressIsLiteralIP(cur) && cur.AddressResolver == "" {
-			return false
+		if cur.Type != "local" && probeServerHost(cur) == "" {
+			return "缺少服务器地址"
 		}
-		if seen[cur.Tag] {
-			return true
+		if added[cur.Tag] {
+			return ""
 		}
-		seen[cur.Tag] = true
-		if cur.AddressResolver != "" {
+		if probeNeedsDomainResolver(cur) {
+			if cur.AddressResolver == "" {
+				// 唯一的解析来源就是 default_domain_resolver，也就是它自己。
+				return "服务器地址是域名但没有 AddressResolver，只能靠 default_domain_resolver 解析自身"
+			}
 			next, ok := byTag[cur.AddressResolver]
-			if !ok || !walk(next) {
-				return false
+			if !ok {
+				return fmt.Sprintf("AddressResolver %q 不是已启用的 DNS 服务器", cur.AddressResolver)
+			}
+			path = append(path, cur.Tag)
+			reason := walk(next)
+			path = path[:len(path)-1]
+			if reason != "" {
+				return reason
 			}
 		}
+		added[cur.Tag] = true
 		out = append(out, cur)
-		return true
+		return ""
 	}
-	if !walk(s) {
-		return nil, false
+	if reason := walk(s); reason != "" {
+		return nil, reason
 	}
-	return out, true
+	return out, ""
 }
 
 // probeDetourUsable 判断 detour 能否在测速配置里落地：临时配置只有节点出站与 direct，
-// 指向代理组的 detour（如 Auto）会因为出站不存在而让 sing-box 直接启动失败。
+// 指向代理组的 detour（如 Auto）会因为出站不存在而让 sing-box 启动失败
+// （实测 FATAL: outbound detour not found: Auto）。
 //
-// 不在这里「顺手」把用户的 detour 清空：那等于把运行时的 DNS 走向偷偷改成直连，
+// 「直连」的等价写法（direct/DIRECT）在 dnsServerOutbound 里已归一为缺省——显式写
+// detour 指向内置的空 direct 出站会被内核拒绝（实测 FATAL: detour to an empty direct
+// outbound makes no sense），所以这里只需判断归一之后是否还有值。
+//
+// 归一之外不做任何改写：把用户的代理型 detour 清空等于偷改运行时 DNS 走向，
 // 测速结论就与真实运行无关了。选不中时换下一个候选，全都不行就在上层报错。
 func probeDetourUsable(detour string) bool {
-	return detour == "" || strings.EqualFold(detour, "direct")
+	return normalizeDNSDetour(detour) == ""
 }
 
 // probeAddressIsLiteralIP 判断服务器地址是否为字面 IP（自举无需任何解析）。
@@ -242,74 +284,4 @@ func dnsCandidateOrder(servers []DNSServer) []int {
 		}
 	}
 	return append(append(local, literalIP...), rest...)
-}
-
-// validateProbeDNSShape 复刻主生成器 buildDNS 的结构校验：地址缺失、Tag 重复、
-// AddressResolver 悬空都属于配置损坏，直接报错而不静默跳过——静默跳过会让探针
-// 悄悄少一个解析来源，又变成「同一节点两处结论不同」。
-func validateProbeDNSShape(servers []DNSServer) error {
-	tags := map[string]bool{}
-	for _, s := range servers {
-		if s.Type != "local" && strings.TrimSpace(s.Address) == "" {
-			return fmt.Errorf("DNS 服务器 %q 缺少地址", s.Tag)
-		}
-		if tags[s.Tag] {
-			return fmt.Errorf("DNS 服务器 Tag 重复: %q", s.Tag)
-		}
-		tags[s.Tag] = true
-	}
-	for _, s := range servers {
-		if s.AddressResolver != "" && !tags[s.AddressResolver] {
-			return fmt.Errorf("DNS 服务器 %q 的 AddressResolver %q 不是已启用的 DNS 服务器", s.Tag, s.AddressResolver)
-		}
-	}
-	return nil
-}
-
-// findDNSResolverCycle 检测 AddressResolver 环，返回环上第一个 tag 的路径描述。
-//
-// 主生成器不做这一步（sing-box 会在解析服务器地址时打转，最终表现为连不上），
-// 但在探针里这类配置的症状是「测速全体失败」，极难与节点故障区分，因此在这里
-// 就变成一句能读懂的配置错误。
-func findDNSResolverCycle(servers []DNSServer) (string, bool) {
-	byTag := make(map[string]string, len(servers))
-	for _, s := range servers {
-		byTag[s.Tag] = s.AddressResolver
-	}
-	const (
-		visiting = 1
-		done     = 2
-	)
-	state := map[string]int{}
-	var walk func(tag string, path []string) (string, bool)
-	walk = func(tag string, path []string) (string, bool) {
-		switch state[tag] {
-		case done:
-			return "", false
-		case visiting:
-			cycle := append(path, tag)
-			for i, t := range cycle {
-				if t == tag {
-					cycle = cycle[i:]
-					break
-				}
-			}
-			return strings.Join(cycle, " -> "), true
-		}
-		state[tag] = visiting
-		if next := byTag[tag]; next != "" {
-			// path 显式复制：append 可能复用底层数组，跨层共享会让环路径串味。
-			if desc, ok := walk(next, append(append([]string{}, path...), tag)); ok {
-				return desc, true
-			}
-		}
-		state[tag] = done
-		return "", false
-	}
-	for _, s := range servers {
-		if desc, ok := walk(s.Tag, nil); ok {
-			return desc, true
-		}
-	}
-	return "", false
 }

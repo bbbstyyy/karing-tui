@@ -167,19 +167,84 @@ func TestProbeIncludesAddressResolverChain(t *testing.T) {
 	}
 }
 
-// T5 AddressResolver 环必须 fail-closed，不能死循环也不能静默忽略。
+// T5 候选链内成环必须 fail-closed（不死循环、不静默忽略），且原因写进错误里。
+// 注意夹具用的是**域名地址**：只有地址是域名时才会真的沿 AddressResolver 追下去，
+// 字面 IP 的环与本探针无关（见下一条用例）。
 func TestProbeRejectsAddressResolverCycle(t *testing.T) {
 	dns := &DNSConfig{Final: "a", Servers: []DNSServer{
-		{Tag: "a", Type: "udp", Address: "1.1.1.1", AddressResolver: "b", Enabled: true},
-		{Tag: "b", Type: "udp", Address: "1.1.1.2", AddressResolver: "a", Enabled: true},
+		{Tag: "a", Type: "https", Address: "dns-a.example.test", AddressResolver: "b", Enabled: true},
+		{Tag: "b", Type: "https", Address: "dns-b.example.test", AddressResolver: "a", Enabled: true},
 	}}
 	_, err := GenerateLatencyProbe(probeDNS(dns, trojanNode(5, "node.example.test")))
 	if err == nil {
-		t.Fatal("AddressResolver 环应返回明确错误")
+		t.Fatal("候选链成环应返回明确错误")
 	}
-	if !strings.Contains(err.Error(), "环") {
-		t.Errorf("错误文案应指出环引用: %v", err)
+	if !strings.Contains(err.Error(), "成环") {
+		t.Errorf("错误文案应指出成环: %v", err)
 	}
+}
+
+// 链外的环、以及与本探针无关的写错配置，不得让节点测速整体失败——
+// 否则又会造出「界面 1 正常、界面 3 特有失败」的分叉。
+func TestProbeIgnoresIrrelevantDNSProblems(t *testing.T) {
+	t.Run("字面 IP 互相引用成环", func(t *testing.T) {
+		// 两个候选地址都是字面 IP，根本不需要 AddressResolver，环是死代码。
+		dns := &DNSConfig{Servers: []DNSServer{
+			{Tag: "local", Type: "udp", Address: "223.5.5.5", Enabled: true},
+			{Tag: "a", Type: "udp", Address: "1.1.1.1", AddressResolver: "b", Enabled: true},
+			{Tag: "b", Type: "udp", Address: "1.1.1.2", AddressResolver: "a", Enabled: true},
+		}}
+		m, _ := mustProbe(t, probeDNS(dns, trojanNode(50, "node.example.test")))
+		if got := probeRoute(t, m)["default_domain_resolver"]; got != "local" {
+			t.Errorf("default_domain_resolver = %v, 期望 local", got)
+		}
+	})
+
+	t.Run("代理型 DNS 互相引用成环", func(t *testing.T) {
+		// 上游评审举的例子：两条 detour=Auto 的 DNS 互指成环，探针本就该跳过它们。
+		dns := &DNSConfig{Servers: []DNSServer{
+			{Tag: "local", Type: "udp", Address: "223.5.5.5", Enabled: true},
+			{Tag: "ra", Type: "https", Address: "dns-a.example.test", AddressResolver: "rb", Detour: "Auto", Enabled: true},
+			{Tag: "rb", Type: "https", Address: "dns-b.example.test", AddressResolver: "ra", Detour: "Auto", Enabled: true},
+		}}
+		m, _ := mustProbe(t, probeDNS(dns, trojanNode(51, "node.example.test")))
+		if got := probeRoute(t, m)["default_domain_resolver"]; got != "local" {
+			t.Errorf("default_domain_resolver = %v, 期望 local", got)
+		}
+		if tags := probeDNSTags(t, m); !reflect.DeepEqual(tags, []string{"local"}) {
+			t.Errorf("测速 dns.servers = %v, 期望 [local]", tags)
+		}
+	})
+
+	t.Run("字面 IP 服务器引用不存在的 resolver", func(t *testing.T) {
+		// 字面 IP 不需要 domain_resolver；主配置会因悬空引用报错，但探针不该被它拖住。
+		// 关键是不能把这个字段原样输出：sing-box 启动时会校验依赖是否存在。
+		dns := &DNSConfig{Servers: []DNSServer{
+			{Tag: "x", Type: "udp", Address: "1.1.1.1", AddressResolver: "ghost", Enabled: true},
+		}}
+		m, _ := mustProbe(t, probeDNS(dns, trojanNode(52, "node.example.test")))
+		if got := probeRoute(t, m)["default_domain_resolver"]; got != "x" {
+			t.Errorf("default_domain_resolver = %v, 期望 x", got)
+		}
+		if _, ok := probeDNSServers(t, m)[0].(map[string]any)["domain_resolver"]; ok {
+			t.Errorf("字面 IP 的服务器不应输出 domain_resolver: %v", probeDNSServers(t, m)[0])
+		}
+	})
+
+	t.Run("字面 IP 服务器引用代理型 resolver", func(t *testing.T) {
+		// 该候选自身完全自举；被它引用的代理型 DNS 不该把它拉黑。
+		dns := &DNSConfig{Servers: []DNSServer{
+			{Tag: "x", Type: "udp", Address: "1.1.1.1", AddressResolver: "proxied", Enabled: true},
+			{Tag: "proxied", Type: "https", Address: "dns.example.test", Detour: "Auto", Enabled: true},
+		}}
+		m, _ := mustProbe(t, probeDNS(dns, trojanNode(53, "node.example.test")))
+		if got := probeRoute(t, m)["default_domain_resolver"]; got != "x" {
+			t.Errorf("default_domain_resolver = %v, 期望 x（字面 IP 的本条即可自举）", got)
+		}
+		if tags := probeDNSTags(t, m); !reflect.DeepEqual(tags, []string{"x"}) {
+			t.Errorf("测速 dns.servers = %v, 期望 [x]", tags)
+		}
+	})
 }
 
 // T6 没有可自举的 DNS 时必须报错，不得偷偷回退系统解析器。
@@ -296,17 +361,58 @@ func TestProbeWithoutDNSServersOmitsSection(t *testing.T) {
 	}
 }
 
-// TestProbeAllowsDirectDetour detour 指向内置 direct 时可用：临时配置里就有这个出站。
-func TestProbeAllowsDirectDetour(t *testing.T) {
-	dns := &DNSConfig{Servers: []DNSServer{
-		{Tag: "remote", Type: "https", Address: "8.8.8.8", Detour: "direct", Enabled: true},
-	}}
-	m, _ := mustProbe(t, probeDNS(dns, trojanNode(31, "node.example.test")))
-	if got := probeRoute(t, m)["default_domain_resolver"]; got != "remote" {
-		t.Errorf("default_domain_resolver = %v, 期望 remote（detour=direct 可用）", got)
+// TestProbeNormalizesExplicitDirectDetour detour 的「直连」等价写法必须归一为缺省，
+// 绝不能把 "direct" 原样写进探针配置。
+//
+// 实测（本机内核）：DNS server 上显式写 detour=direct + 存在 {"type":"direct","tag":"direct"}
+// 出站时，内核**启动失败**：
+//
+//	FATAL start service: start dns/udp[x]: detour to an empty direct outbound makes no sense
+//
+// 而且这个错误在 `check` 阶段不报（check 只校验解码），只有真正启动才暴露，
+// 所以「能启动」这件事必须靠真实内核测试盯住（见 latency_probe_integration_test.go）。
+func TestProbeNormalizesExplicitDirectDetour(t *testing.T) {
+	for _, spelling := range []string{"direct", "DIRECT", " direct "} {
+		t.Run(spelling, func(t *testing.T) {
+			dns := &DNSConfig{Servers: []DNSServer{
+				{Tag: "x", Type: "udp", Address: "1.1.1.1", Detour: spelling, Enabled: true},
+			}}
+			m, _ := mustProbe(t, probeDNS(dns, trojanNode(31, "node.example.test")))
+
+			if got := probeRoute(t, m)["default_domain_resolver"]; got != "x" {
+				t.Errorf("default_domain_resolver = %v, 期望 x（直连写法不应让候选失效）", got)
+			}
+			if _, ok := probeDNSServers(t, m)[0].(map[string]any)["detour"]; ok {
+				t.Errorf("探针不应输出 detour 字段（含直连写法）: %v", probeDNSServers(t, m)[0])
+			}
+		})
 	}
-	if got := probeDNSServers(t, m)[0].(map[string]any)["detour"]; got != "direct" {
-		t.Errorf("detour 应原样保留: %v", got)
+}
+
+// 正式配置同样不能再输出 detour=direct：内核会因此拒绝启动，而这一路径由用户在
+// DNS 页面选 DIRECT 或旧数据留下该值都可能走到。
+func TestMainConfigNormalizesExplicitDirectDetour(t *testing.T) {
+	dns := &DNSConfig{Servers: []DNSServer{
+		{Tag: "local", Type: "udp", Address: "223.5.5.5", Detour: "DIRECT", Enabled: true},
+		{Tag: "remote", Type: "https", Address: "8.8.8.8", AddressResolver: "local", Enabled: true},
+	}}
+	nodes := []*Node{trojanNode(70, "1.1.1.1")}
+	groups := []*ProxyGroup{{ID: 10, Name: "Auto", Type: "select", Members: []ProxyGroupMember{{Type: "all"}}}}
+	m := mustGenerate(t, Snapshot{Settings: DefaultSettings(), Nodes: nodes, ProxyGroups: groups, DNS: dns})
+
+	servers := m["dns"].(map[string]any)["servers"].([]any)
+	if _, ok := servers[0].(map[string]any)["detour"]; ok {
+		t.Errorf("正式配置不得输出 detour=DIRECT: %v", servers[0])
+	}
+	// 代理组 detour 照旧原样保留，归一只管「直连」这一种写法。
+	proxied := &DNSConfig{Servers: []DNSServer{
+		{Tag: "local", Type: "udp", Address: "223.5.5.5", Enabled: true},
+		{Tag: "remote", Type: "https", Address: "8.8.8.8", AddressResolver: "local", Detour: "Auto", Enabled: true},
+	}}
+	m2 := mustGenerate(t, Snapshot{Settings: DefaultSettings(), Nodes: nodes, ProxyGroups: groups, DNS: proxied})
+	servers2 := m2["dns"].(map[string]any)["servers"].([]any)
+	if got := servers2[1].(map[string]any)["detour"]; got != "Auto" {
+		t.Errorf("代理组 detour 应原样保留, 实际 %v", got)
 	}
 }
 

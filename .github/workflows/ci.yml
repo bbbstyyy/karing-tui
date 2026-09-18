@@ -201,6 +201,11 @@ jobs:
           "$RUNNER_TEMP/karing-release/karing" import clash "$RUNNER_TEMP/karing-ci-node.yaml"
           "$RUNNER_TEMP/karing-release/karing" config check
           SINGBOX_BIN="$KARING_HOME/runtime/bin/sing-box" go test -count=1 ./internal/core -run TestIntegrationRealSingBox -v
+          # 独立节点测速的临时配置只有**真启动**才能验证合法：实测 sing-box check 对
+          # detour=direct（detour to an empty direct outbound）、悬空 domain_resolver
+          # （dependency not found）、悬空 detour（outbound detour not found）一律返回 0，
+          # 这些错误只在 run 阶段暴露。这一步跑的用例同时覆盖「域名型节点能否解析」。
+          SINGBOX_BIN="$KARING_HOME/runtime/bin/sing-box" go test -count=1 ./internal/proxy -run TestLatencyProbe -v
       - name: 只读命令在未初始化数据目录上必须失败且不留数据库
         run: |
           export KARING_HOME="$RUNNER_TEMP/karing-fresh"

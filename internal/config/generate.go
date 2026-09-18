@@ -854,7 +854,10 @@ func (g *generator) buildDNS(route *sbRoute) (*sbDNS, error) {
 		if s.AddressResolver != "" && !tags[s.AddressResolver] {
 			return nil, fmt.Errorf("DNS 服务器 %q 的 AddressResolver %q 不是已启用的 DNS 服务器", s.Tag, s.AddressResolver)
 		}
-		if s.Detour != "" && !g.usedTags[s.Detour] {
+		// 用归一后的 detour 做引用校验：直连写法（direct/DIRECT）等价于不写 detour，
+		// 而 usedTags 里只有小写 "direct"。不归一的话 "DIRECT" 会被误判成
+		// 「不是已生成的出站」，让整份配置生成失败。
+		if detour := normalizeDNSDetour(s.Detour); detour != "" && !g.usedTags[detour] {
 			return nil, fmt.Errorf("DNS 服务器 %q 的 Detour %q 不是已生成的出站", s.Tag, s.Detour)
 		}
 	}
@@ -934,10 +937,28 @@ func dnsServerOutbound(s *DNSServer) map[string]any {
 	if s.AddressResolver != "" {
 		srv["domain_resolver"] = s.AddressResolver
 	}
-	if s.Detour != "" {
-		srv["detour"] = s.Detour
+	if detour := normalizeDNSDetour(s.Detour); detour != "" {
+		srv["detour"] = detour
 	}
 	return srv
+}
+
+// normalizeDNSDetour 把 DNS 服务器 detour 的「直连」等价写法归一为「不写 detour」。
+//
+// sing-box 的语义是：不写 detour 就已经使用直连 dialer；而显式指向内置的空 direct
+// 出站会被拒绝启动——实测 FATAL: start dns/udp[x]: detour to an empty direct outbound
+// makes no sense（不是 check 阶段，是 run 阶段，所以只有真正启动才会暴露）。
+//
+// 本仓库生成的 direct 出站恒为无设置的 {"type":"direct","tag":"direct"}，且 "direct"
+// 由 generator.init() 占位、节点与代理组都不可能占用该 tag，因此 ""/"direct"/"DIRECT"
+// 表达的是同一件事，统一成缺省形式既不改语义，也不会让一个等价写法把内核挡在启动之外。
+//
+// 只归一这一种写法：其他值（代理组 tag）一律原样保留，改它们就是偷改运行语义。
+func normalizeDNSDetour(detour string) string {
+	if strings.EqualFold(strings.TrimSpace(detour), "direct") {
+		return ""
+	}
+	return detour
 }
 
 // splitHostPort 拆分 "host:port"；无端口时端口返回 0。裸 IPv6（多个冒号）整体视为主机。
