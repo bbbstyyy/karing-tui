@@ -33,8 +33,14 @@ const releaseAPIBaseURL = "https://api.github.com/repos/SagerNet/sing-box/releas
 
 // BinaryManager 负责 sing-box 二进制的发现、下载与版本管理。
 type BinaryManager struct {
-	paths      *platform.Paths
-	proxy      string // 下载代理，如 http://127.0.0.1:7890；空为直连
+	paths *platform.Paths
+
+	// proxyMu 保护 proxy（V7-9）。设置页保存下载代理（SetProxy）与后台下载读取
+	// 代理（Download）会并发，裸读写同一个 string 字段是确定的 data race。
+	// 与 versionMu 分开：两者保护不同数据，合并只会无谓地把版本查询串行化。
+	proxyMu sync.RWMutex
+	proxy   string // 下载代理，如 http://127.0.0.1:7890；空为直连
+
 	embeddedMu sync.Mutex
 
 	versionMu    sync.Mutex
@@ -58,8 +64,22 @@ func NewBinaryManager(paths *platform.Paths, downloadProxy string) *BinaryManage
 }
 
 // SetProxy 更新用户配置的下载代理地址。
+//
+// 必须加写锁（V7-9）：设置页保存时会与正在进行的后台下载并发。
 func (b *BinaryManager) SetProxy(downloadProxy string) {
+	b.proxyMu.Lock()
+	defer b.proxyMu.Unlock()
 	b.proxy = strings.TrimSpace(downloadProxy)
+}
+
+// proxySnapshot 返回当前下载代理的快照。
+//
+// Download 必须**只读一次**并在本次下载全程使用：多次读取可能先后拿到两个不同的
+// 值，让同一次下载的一部分请求走旧代理、一部分走新代理——那种失败比崩溃更难查。
+func (b *BinaryManager) proxySnapshot() string {
+	b.proxyMu.RLock()
+	defer b.proxyMu.RUnlock()
+	return b.proxy
 }
 
 // ManagedPath 返回受管二进制的路径。
@@ -418,7 +438,7 @@ func (b *BinaryManager) Download(ctx context.Context, version string) error {
 	downloadURL := fmt.Sprintf("%s/v%s/%s", downloadBaseURL, version, archiveName)
 
 	// 始终显式设置 Transport，避免 net/http 的 DefaultTransport 读取环境代理。
-	transport, err := newHTTPTransport(b.proxy)
+	transport, err := newHTTPTransport(b.proxySnapshot())
 	if err != nil {
 		return err
 	}

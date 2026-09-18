@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/bbbstyyy/karing-tui/internal/validation"
 	"strings"
@@ -32,6 +33,13 @@ type Manager struct {
 	// 测速静默退回「没有 DNS」的行为。返回空 DNSConfig 表示用户确实没配 DNS，
 	// 那种情况与主核心一致，允许放行。
 	LoadDNS func() (config.DNSConfig, error)
+
+	// AllocatePort / StartAdhoc 是「测速 API 端口 + 临时核心」的可注入缝（V7-6）。
+	// 零值取包级实现（core.FreePort / core.StartAdhoc），生产路径不设置它们。
+	// 存在的理由：端口从分配到被内核真正 bind 之间有 TOCTOU 窗口，
+	// 需要能构造「第一次被抢占、第二次成功」来验证重试确实生效。
+	AllocatePort func() (int, error)
+	StartAdhoc   func(ctx context.Context, bin, configPath, cacheDir string) (*core.Adhoc, error)
 }
 
 // NewManager 创建节点管理器。logf 可为 nil。
@@ -215,6 +223,11 @@ type NodeTestResult struct {
 
 // TestLatencyProgress reports each attempted node while the batch is running.
 // The callback can run concurrently and must not mutate a TUI model.
+//
+// 顺序是硬约束（V7-7）：**先写库，再返回错误**。反过来会让「错误非 nil 就早退」的
+// 调用方（以及本函数的未来维护者）跳过持久化——全部节点被 skip 时 last_tested
+// 永远为空，AutoClean 的判据 `last_tested IS NOT NULL AND latency_ms < 0` 永不成立，
+// 用户看到「每个节点都失败、清理却 0 个」。批量错误与持久化错误同时存在时两者都保留。
 func (m *Manager) TestLatencyProgress(ctx context.Context, ids []int64, url string, timeoutMS int, report func(NodeTestResult)) (map[int64]int64, error) {
 	nodes := make([]*config.Node, 0, len(ids))
 	seen := map[int64]bool{}
@@ -232,15 +245,24 @@ func (m *Manager) TestLatencyProgress(ctx context.Context, ids []int64, url stri
 		}
 		nodes = append(nodes, n)
 	}
-	results, err := m.testNodes(ctx, nodes, url, timeoutMS, report)
-	if err != nil {
-		return nil, err
-	}
+	results, batchErr := m.testNodes(ctx, nodes, url, timeoutMS, report)
+
 	now := time.Now()
+	var persistErr error
 	for id, ms := range results {
 		if err := m.DB.UpdateNodeLatency(id, ms, now); err != nil {
-			return results, err
+			persistErr = err
+			break
 		}
+	}
+	switch {
+	case batchErr != nil && persistErr != nil:
+		// 两个都要保留：只报一个会让另一类问题彻底隐形。
+		return results, errors.Join(batchErr, persistErr)
+	case batchErr != nil:
+		return results, batchErr
+	case persistErr != nil:
+		return results, persistErr
 	}
 	m.Logf("节点测速完成: %d 个", len(results))
 	return results, nil

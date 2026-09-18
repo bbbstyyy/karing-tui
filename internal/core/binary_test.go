@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -106,5 +107,53 @@ func TestVersionCacheInvalidatesOnBinaryChange(t *testing.T) {
 	}
 	if n := readCounter(t, counter); n != 2 {
 		t.Fatalf("二进制更新后 version 子进程执行了 %d 次，期望 2", n)
+	}
+}
+
+// V7-9：设置页保存下载代理（SetProxy）与后台下载读代理（proxySnapshot）并发时
+// 不得有 data race。
+//
+// 判决性：旧实现里 SetProxy 裸写、Download 裸读同一个 string 字段。用并发探针
+// 在旧代码上实测过一次 DATA RACE（Write at binary.go:62 SetProxy vs 读点），
+// 这里以常驻形式钉住修复后不再复现。
+func TestBinaryManagerProxyConcurrentAccess(t *testing.T) {
+	bin := NewBinaryManager(&platform.Paths{}, "")
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			bin.SetProxy("http://127.0.0.1:7890")
+		}
+	}()
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = bin.proxySnapshot()
+			}
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// 反向核对：快照读到的确实是写入值（不是恒空）。
+	bin.SetProxy("  http://127.0.0.1:1080  ")
+	if got := bin.proxySnapshot(); got != "http://127.0.0.1:1080" {
+		t.Fatalf("SetProxy 应去掉首尾空白，实得 %q", got)
 	}
 }
