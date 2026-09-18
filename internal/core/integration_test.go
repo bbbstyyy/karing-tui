@@ -208,20 +208,58 @@ func TestRealSingBoxDNSResolverCycle(t *testing.T) {
 	})
 
 	// 生成侧必须拦在更早的地方：同一台机器上 Generate 不得产出成环的配置。
+	// 夹具用**域名地址**（V8-1）：只有域名才会真的产生 domain_resolver 依赖，
+	// 字面 IP 上的 resolver 不构成边，那样这条用例就什么都没验到。
 	t.Run("生成侧必须在写出配置前拒绝环", func(t *testing.T) {
 		snap := config.Snapshot{
 			Settings: config.DefaultSettings(),
 			DNS: &config.DNSConfig{
 				Strategy: "prefer_ipv4",
 				Servers: []config.DNSServer{
-					{Tag: "a", Type: "udp", Address: "1.1.1.1", AddressResolver: "b", Enabled: true},
-					{Tag: "b", Type: "udp", Address: "8.8.8.8", AddressResolver: "a", Enabled: true},
+					{Tag: "a", Type: "https", Address: "dns-a.example.test", AddressResolver: "b", Enabled: true},
+					{Tag: "b", Type: "https", Address: "dns-b.example.test", AddressResolver: "a", Enabled: true},
 				},
 				Final: "a",
 			},
 		}
 		if _, err := config.Generate(snap); err == nil {
 			t.Fatal("成环的 DNS 配置不得被生成为可启动配置")
+		}
+	})
+
+	// V8-1 的端到端判决：**老库形态**（remote 是字面 IP 却残留 AddressResolver=local）
+	// 生成的配置必须能被真实内核正常启动。修复前这份配置里会多一个用不到的
+	// domain_resolver，而且 local 会因为这条假依赖无法被停用/删除。
+	t.Run("老库形态的默认 DNS 生成的配置必须能真启动", func(t *testing.T) {
+		settings := config.DefaultSettings()
+		settings.MixedPort = freePort(t)
+		settings.ClashAPIPort = 0
+		snap := config.Snapshot{
+			Settings: settings,
+			DNS: &config.DNSConfig{
+				Strategy: "prefer_ipv4",
+				Servers: []config.DNSServer{
+					{Tag: "local", Type: "udp", Address: "223.5.5.5", Enabled: true},
+					// 修复前的默认值形态：字面 IP 上挂着 resolver。
+					{Tag: "remote", Type: "https", Address: "8.8.8.8", AddressResolver: "local", Enabled: true},
+				},
+				Rules: []config.DNSRule{{Type: "rule_set", Value: "geosite:cn", Server: "local", Enabled: true}},
+				Final: "remote",
+			},
+		}
+		out, err := config.Generate(snap)
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		cfgPath := writeCfg(t, "default-dns-legacy.json", string(out))
+		inst, err := StartAdhoc(ctx, paths.CoreBin, cfgPath, paths.Cache)
+		if err != nil {
+			t.Fatalf("StartAdhoc: %v", err)
+		}
+		defer inst.Stop()
+		time.Sleep(500 * time.Millisecond)
+		if inst.Exited() {
+			t.Fatalf("老库形态的配置不应启动失败，内核日志:\n%s", strings.Join(inst.Output.Tail(20), "\n"))
 		}
 	})
 }

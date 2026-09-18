@@ -76,9 +76,13 @@ func (m *Manager) EnsureDefaultDNS() error {
 		if err := m.DB.CreateDNSServerTx(tx, local); err != nil {
 			return err
 		}
+		// 默认 remote 是字面 IP（8.8.8.8），不存在「域名 → DNS → IP」这一步，
+		// 因此**不写 AddressResolver**（V8-1）。旧默认值 `AddressResolver: "local"`
+		// 是一条假依赖：既多输出一个用不到的 domain_resolver，
+		// 又让 local 永远无法被停用或删除。
 		remote := &config.DNSServer{
 			Tag: "remote", Type: "https", Address: "8.8.8.8",
-			AddressResolver: "local", Detour: storage.DefaultGroupAuto, Enabled: true, Position: 1,
+			Detour: storage.DefaultGroupAuto, Enabled: true, Position: 1,
 		}
 		if err := m.DB.CreateDNSServerTx(tx, remote); err != nil {
 			return err
@@ -105,6 +109,23 @@ func (m *Manager) EnsureDefaultDNS() error {
 
 // --- DNS 服务器 ---
 
+// normalizeServerResolver 在保存前收口 resolver 语义（V8-1）：地址不是域名时，
+// AddressResolver 没有用途（内核也不会输出它），直接清空。
+//
+// 只在**数据入口**（AddServer / UpdateServer）做这件事，而不是在生成/展示时到处兜底：
+//   - 用户输入 `https + 8.8.8.8 + 解析DNS=local` 保存后库里就是空的，以后不会再产生
+//     新的假依赖；而 `https + dns.google + 解析DNS=local` 原样保留。
+//   - 老库里已经存在的残留值由 LoadConfig / ListServers 的副本规范化兜住，
+//     不改数据（只读启动路径不允许写库）。
+func normalizeServerResolver(s *config.DNSServer) {
+	if s == nil {
+		return
+	}
+	if !config.DNSServerNeedsDomainResolver(s) {
+		s.AddressResolver = ""
+	}
+}
+
 // AddServer 新增 DNS 服务器。
 func (m *Manager) AddServer(tag, typ, address, addressResolver, detour string) (*config.DNSServer, error) {
 	s := &config.DNSServer{
@@ -115,6 +136,9 @@ func (m *Manager) AddServer(tag, typ, address, addressResolver, detour string) (
 		Detour:          strings.TrimSpace(detour),
 		Enabled:         true,
 	}
+	// 规范化必须先于校验：否则字面 IP 上的无用 resolver 会先触发
+	// 「AddressResolver 已停用 / 不是已存在的 Tag」这类针对假依赖的报错。
+	normalizeServerResolver(s)
 	if err := m.validateServer(s, 0); err != nil {
 		return nil, err
 	}
@@ -186,6 +210,9 @@ func (m *Manager) UpdateServer(s *config.DNSServer) error {
 	s.Address = strings.TrimSpace(s.Address)
 	s.AddressResolver = strings.TrimSpace(s.AddressResolver)
 	s.Detour = strings.TrimSpace(s.Detour)
+	// 同 AddServer：先规范化再校验（V8-1）。把地址从域名改成字面 IP 时，
+	// 旧的 resolver 会在这里被清掉，不会作为假依赖留在库里。
+	normalizeServerResolver(s)
 	if err := m.validateServer(s, s.ID); err != nil {
 		return err
 	}
@@ -211,7 +238,12 @@ func (m *Manager) UpdateServer(s *config.DNSServer) error {
 			return err
 		}
 		for _, other := range servers {
-			if other.ID != old.ID && other.AddressResolver == old.Tag {
+			// 只有**真的会用**这个 resolver 的服务器才算依赖（V8-1）：
+			// 地址是字面 IP 的那些人不会输出 domain_resolver，
+			// 它们身上残留的值不该把别的服务器锁死。
+			if other.ID != old.ID &&
+				config.DNSServerNeedsDomainResolver(other) &&
+				other.AddressResolver == old.Tag {
 				return fmt.Errorf("DNS 服务器 %q 的 AddressResolver 正在引用 %q，请先修改引用", other.Tag, old.Tag)
 			}
 		}
@@ -258,7 +290,10 @@ func (m *Manager) DeleteServer(id int64) error {
 		return err
 	}
 	for _, other := range servers {
-		if other.ID != s.ID && other.AddressResolver == s.Tag {
+		// 同 UpdateServer：字面 IP 上的残留 resolver 不构成真实依赖（V8-1）。
+		if other.ID != s.ID &&
+			config.DNSServerNeedsDomainResolver(other) &&
+			other.AddressResolver == s.Tag {
 			return fmt.Errorf("DNS 服务器 %q 的 AddressResolver 正在引用 %q，请先修改引用", other.Tag, s.Tag)
 		}
 	}
@@ -297,7 +332,10 @@ func (m *Manager) SetServerEnabled(id int64, enabled bool) error {
 			return err
 		}
 		for _, other := range servers {
-			if other.ID != s.ID && other.AddressResolver == s.Tag {
+			// 同 UpdateServer：字面 IP 上的残留 resolver 不构成真实依赖（V8-1）。
+			if other.ID != s.ID &&
+				config.DNSServerNeedsDomainResolver(other) &&
+				other.AddressResolver == s.Tag {
 				return fmt.Errorf("DNS 服务器 %q 的 AddressResolver 正在引用 %q，请先修改引用", other.Tag, s.Tag)
 			}
 		}
@@ -580,9 +618,15 @@ func (m *Manager) LoadConfig() (config.DNSConfig, error) {
 		return cfg, err
 	}
 	for _, s := range servers {
-		if s.Enabled {
-			cfg.Servers = append(cfg.Servers, *s)
+		if !s.Enabled {
+			continue
 		}
+		// 复制后再规范化（V8-1）：老库里字面 IP 上的残留 AddressResolver 不得进入
+		// 生成 / 测速的输入；同时**不写库**——OpenQueryOnly 与备份恢复路径也会走到
+		// 这里，只读路径不允许偷偷改数据。落库留给用户下次真正编辑保存。
+		server := *s
+		normalizeServerResolver(&server)
+		cfg.Servers = append(cfg.Servers, server)
 	}
 	rules, err := m.DB.ListDNSRules()
 	if err != nil {
@@ -653,8 +697,21 @@ func (m *Manager) SaveOptions(strategy string, fakeIPEnabled bool, fakeIPRange, 
 }
 
 // ListServers / ListRules 供 TUI 展示全部条目（含停用）。
-func (m *Manager) ListServers() ([]*config.DNSServer, error) { return m.DB.ListDNSServers() }
-func (m *Manager) ListRules() ([]*config.DNSRule, error)     { return m.DB.ListDNSRules() }
+//
+// ListServers 返回**规范化后的副本**（V8-1）：老库里字面 IP 上的残留 AddressResolver
+// 不该在界面上显示成一条真依赖。只改返回值、不写库。
+func (m *Manager) ListServers() ([]*config.DNSServer, error) {
+	servers, err := m.DB.ListDNSServers()
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range servers {
+		normalizeServerResolver(s)
+	}
+	return servers, nil
+}
+
+func (m *Manager) ListRules() ([]*config.DNSRule, error) { return m.DB.ListDNSRules() }
 
 func (m *Manager) getServer(id int64) (*config.DNSServer, error) {
 	list, err := m.DB.ListDNSServers()

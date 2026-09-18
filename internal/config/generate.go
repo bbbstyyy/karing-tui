@@ -858,7 +858,13 @@ func (g *generator) buildDNS(route *sbRoute) (*sbDNS, error) {
 		dns.Servers = append(dns.Servers, dnsServerOutbound(&s))
 	}
 	for _, s := range cfg.Servers {
-		if s.AddressResolver != "" && !tags[s.AddressResolver] {
+		// 只校验**真正会被用到**的引用（V8-1）：字面 IP 上的残留 AddressResolver
+		// 不会出现在输出里，也就不该影响生成。原则：用不到的引用 = 不存在的引用。
+		//
+		// 注意这里不能用 continue 提前跳过——同一循环下面还有 detour 引用校验，
+		// 那个与「地址是不是域名」无关，必须对每一条都跑。
+		if DNSServerNeedsDomainResolver(&s) &&
+			s.AddressResolver != "" && !tags[s.AddressResolver] {
 			return nil, fmt.Errorf("DNS 服务器 %q 的 AddressResolver %q 不是已启用的 DNS 服务器", s.Tag, s.AddressResolver)
 		}
 		// 用归一后的 detour 做引用校验：直连写法（direct/DIRECT）等价于不写 detour，
@@ -941,7 +947,9 @@ func dnsServerOutbound(s *DNSServer) map[string]any {
 		}
 		srv["tls"] = map[string]any{"enabled": true, "server_name": host}
 	}
-	if s.AddressResolver != "" {
+	// 只有地址是域名时才输出 domain_resolver（V8-1）。字面 IP 不存在「域名 → DNS → IP」
+	// 这一步，输出它既多一个用不到的字段，又会让被引用的服务器无法被停用/删除。
+	if DNSServerNeedsDomainResolver(s) && s.AddressResolver != "" {
 		srv["domain_resolver"] = s.AddressResolver
 	}
 	if detour := normalizeDNSDetour(s.Detour); detour != "" {

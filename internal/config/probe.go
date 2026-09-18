@@ -162,26 +162,17 @@ func buildProbeDNS(cfg *DNSConfig) (*sbDNS, string, error) {
 
 // probeDNSServer 输出探针用的 DNS server 条目。
 //
-// 与主配置只有一处差别：地址不是域名时去掉 domain_resolver。该字段只用于解析
-// 「服务器地址本身是域名」的情况，但 sing-box 启动时仍会校验它引用的 tag 是否存在
+// 与主配置的差别（V8-1 之后只剩「配置面」的差别，语义判据已统一走
+// DNSServerNeedsDomainResolver）：地址不是域名时去掉 domain_resolver。该字段只用于
+// 解析「服务器地址本身是域名」的情况，但 sing-box 启动时仍会校验它引用的 tag 是否存在
 // （实测：字面 IP + 悬空 domain_resolver → FATAL dependency[ghost] not found for
 // server[x]），留着等于为一个用不到的依赖把临时核心拦在启动之外。
 func probeDNSServer(s *DNSServer) map[string]any {
 	srv := *s
-	if !probeNeedsDomainResolver(&srv) {
+	if !DNSServerNeedsDomainResolver(&srv) {
 		srv.AddressResolver = ""
 	}
 	return dnsServerOutbound(&srv)
-}
-
-// probeNeedsDomainResolver 判断这条 DNS 服务器的地址是否真的要靠 AddressResolver 解析。
-// 只有「非 local 且地址是域名」才需要；字面 IP 与 local 都能自举。
-func probeNeedsDomainResolver(s *DNSServer) bool {
-	if s.Type == "local" {
-		return false
-	}
-	host := probeServerHost(s)
-	return host != "" && net.ParseIP(host) == nil
 }
 
 // probeResolverChain 收集以 s 为默认解析器时、临时配置里必须一并存在的 DNS 服务器。
@@ -202,13 +193,13 @@ func probeResolverChain(s *DNSServer, byTag map[string]*DNSServer) ([]*DNSServer
 		if !probeDetourUsable(cur.Detour) {
 			return fmt.Sprintf("detour %q 在测速配置里没有对应出站", cur.Detour)
 		}
-		if cur.Type != "local" && probeServerHost(cur) == "" {
+		if cur.Type != "local" && dnsServerHost(cur) == "" {
 			return "缺少服务器地址"
 		}
 		if added[cur.Tag] {
 			return ""
 		}
-		if probeNeedsDomainResolver(cur) {
+		if DNSServerNeedsDomainResolver(cur) {
 			if cur.AddressResolver == "" {
 				// 唯一的解析来源就是 default_domain_resolver，也就是它自己。
 				return "服务器地址是域名但没有 AddressResolver，只能靠 default_domain_resolver 解析自身"
@@ -250,22 +241,8 @@ func probeDetourUsable(detour string) bool {
 
 // probeAddressIsLiteralIP 判断服务器地址是否为字面 IP（自举无需任何解析）。
 func probeAddressIsLiteralIP(s *DNSServer) bool {
-	host := probeServerHost(s)
+	host := dnsServerHost(s)
 	return host != "" && net.ParseIP(host) != nil
-}
-
-// probeServerHost 取服务器主机名部分：local 类型没有地址，返回空串。
-func probeServerHost(s *DNSServer) string {
-	switch s.Type {
-	case "local":
-		return ""
-	case "udp", "tcp":
-		host, _ := splitHostPort(s.Address)
-		return host
-	default:
-		host, _, _ := parseTLSDNSAddress(s.Address, s.Type)
-		return host
-	}
 }
 
 // dnsCandidateOrder 按「最可能自举」的顺序排列服务器下标：

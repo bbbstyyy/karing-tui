@@ -69,10 +69,26 @@ func TestEnsureDefaultDNSRoutesRemoteThroughAutoGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var remote *config.DNSServer
 	for _, s := range servers {
-		if s.Tag == "remote" && s.Detour != storage.DefaultGroupAuto {
-			t.Fatalf("默认远程 DNS 应经 Auto 组，得到 detour=%q", s.Detour)
+		if s.Tag == "remote" {
+			remote = s
 		}
+	}
+	if remote == nil {
+		t.Fatal("默认 DNS 缺少 remote")
+	}
+	if remote.Detour != storage.DefaultGroupAuto {
+		t.Fatalf("默认远程 DNS 应经 Auto 组，得到 detour=%q", remote.Detour)
+	}
+	// V8-1：8.8.8.8 是字面 IP，不存在「先解析域名再连」这一步，
+	// 因此默认 remote 不得带 AddressResolver——那条依赖是假的，
+	// 还会让 local 无法被停用/删除。
+	if remote.AddressResolver != "" {
+		t.Fatalf("默认 remote 不应带 resolver，得到 %q", remote.AddressResolver)
+	}
+	if remote.Type != "https" || remote.Address != "8.8.8.8" {
+		t.Fatalf("默认 remote 类型/地址不应改变: %+v", remote)
 	}
 }
 
@@ -91,7 +107,9 @@ func TestSaveOptionsRejectsInvalidFakeIPRange(t *testing.T) {
 
 func TestServerCannotUseItselfAsAddressResolver(t *testing.T) {
 	m := newTestManager(t)
-	if _, err := m.AddServer("loop", "udp", "1.1.1.1", "loop", ""); err == nil {
+	// 夹具必须是**域名地址**（V8-1）：字面 IP 上的 resolver 会在保存前被规范化清空，
+	// 那样就根本走不到自引用校验，测试会变成「什么都验不到」。
+	if _, err := m.AddServer("loop", "https", "dns.example.com", "loop", ""); err == nil {
 		t.Fatal("DNS 服务器不应允许将自身作为 address_resolver")
 	}
 }
@@ -187,11 +205,13 @@ func TestRuleRejectsDisabledServer(t *testing.T) {
 // 用户存进去的就是一份启动不了的配置，而且报错与他刚才的操作毫无关系。
 func TestUpdateServerRejectsResolverCycleBeforeWrite(t *testing.T) {
 	m := newTestManager(t)
-	a := &config.DNSServer{Tag: "a", Type: "udp", Address: "1.1.1.1", Enabled: true}
+	// 夹具用**域名地址**（V8-1）：只有域名才会真的产生 domain_resolver 依赖，
+	// 字面 IP 上的 resolver 会被规范化清空，就成不了环了。
+	a := &config.DNSServer{Tag: "a", Type: "https", Address: "dns-a.example.test", Enabled: true}
 	if err := m.DB.CreateDNSServer(a); err != nil {
 		t.Fatal(err)
 	}
-	b := &config.DNSServer{Tag: "b", Type: "udp", Address: "8.8.8.8", Enabled: true}
+	b := &config.DNSServer{Tag: "b", Type: "https", Address: "dns-b.example.test", Enabled: true}
 	if err := m.DB.CreateDNSServer(b); err != nil {
 		t.Fatal(err)
 	}

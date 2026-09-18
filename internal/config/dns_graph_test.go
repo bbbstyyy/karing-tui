@@ -9,8 +9,23 @@ import (
 // TestRealSingBoxDNSResolverCycle：check rc=0、run 报
 // "circular server dependency"，所以这条校验必须在这里做，不能指望静态检查。
 
+// dnsServer 造一条**地址为域名**的 DNS 服务器。
+//
+// 夹具必须是域名（V8-1）：只有域名地址才会真的产生 domain_resolver 依赖，
+// 字面 IP 上的 resolver 不构成边、测不出环。用域名才能钉住「环确实被拒」。
 func dnsServer(tag, resolver string) DNSServer {
-	return DNSServer{Tag: tag, Type: "udp", Address: "1.1.1.1", AddressResolver: resolver, Enabled: true}
+	return DNSServer{Tag: tag, Type: "https", Address: tag + ".example.test", AddressResolver: resolver, Enabled: true}
+}
+
+// 字面 IP 上残留的 resolver 不产生边（V8-1）：两条互指的残留值不是环。
+// 没有这条，用户手工填过一次就再也存不进去任何东西。
+func TestDNSResolverGraphIgnoresUnusedResolver(t *testing.T) {
+	literal := func(tag, resolver string) DNSServer {
+		return DNSServer{Tag: tag, Type: "udp", Address: "1.1.1.1", AddressResolver: resolver, Enabled: true}
+	}
+	if err := ValidateDNSResolverGraph([]DNSServer{literal("a", "b"), literal("b", "a")}); err != nil {
+		t.Fatalf("字面 IP 上的残留 resolver 不构成依赖，不应报环: %v", err)
+	}
 }
 
 func TestDNSResolverGraphRejectsIndirectCycle(t *testing.T) {

@@ -978,8 +978,11 @@ func TestDNSNewFormat(t *testing.T) {
 	if remote["type"] != "https" || remote["server"] != "8.8.8.8" {
 		t.Errorf("remote 服务器不符: %v", remote)
 	}
-	if remote["domain_resolver"] != "local" {
-		t.Errorf("remote 缺少 domain_resolver: %v", remote)
+	if got, ok := remote["domain_resolver"]; ok {
+		// V8-1：8.8.8.8 是字面 IP，不存在「域名 → DNS → IP」这一步，不得输出该字段。
+		// 夹具（testFullSnapshot）保留着修复前的时代遗留值 AddressResolver=local，
+		// 正好用来验证「老快照也不再产出这个用不到的字段」。
+		t.Errorf("字面 IP 的 remote 不应输出 domain_resolver，实得 %v", got)
 	}
 	tls := remote["tls"].(map[string]any)
 	if tls["enabled"] != true || tls["server_name"] != "8.8.8.8" {

@@ -39,7 +39,10 @@ func ValidateDNSResolverGraph(servers []DNSServer) error {
 			}
 			onPath[cur.Tag] = true
 			path = append(path, cur.Tag)
-			if cur.AddressResolver == "" {
+			// 只在**真的会被用到**时才沿引用走链（V8-1）：地址是字面 IP 的服务器
+			// 根本不输出 domain_resolver，它上面残留的值不该产生一条边——
+			// 否则「两条只要字面 IP 的服务器互相留了个残留引用」会被误判成环。
+			if cur.AddressResolver == "" || !DNSServerNeedsDomainResolver(&cur) {
 				break
 			}
 			next, ok := byTag[cur.AddressResolver]
