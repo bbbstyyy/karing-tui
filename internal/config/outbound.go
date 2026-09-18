@@ -9,6 +9,10 @@ import (
 // NodeToOutbound 将统一节点转换为 sing-box outbound。
 // 返回 map 结构；encoding/json 对 map 按键排序输出，同一节点多次生成结果一致（幂等）。
 // tag 为出站标签，须在配置内唯一，由调用方决定。
+//
+// 本函数除配置生成外还被订阅的「节点身份指纹」复用（subscription.nodeFingerprint）。
+// 因此**连接语义字段不能遗漏在 outbound 转换之外**：漏掉的字段会同时逃过身份匹配，
+// 表现为两个语义不同的节点被判为同一个身份。新增协议字段时请一并更新此处。
 func NodeToOutbound(n *Node, tag string) (map[string]any, error) {
 	if tag == "" {
 		return nil, fmt.Errorf("出站标签为空")

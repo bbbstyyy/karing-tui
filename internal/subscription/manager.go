@@ -142,7 +142,8 @@ func (m *Manager) Delete(id int64) error {
 }
 
 // Update 下载并解析订阅，替换其节点池；返回更新后的订阅。
-// 旧节点中 name+protocol+server+port 匹配的禁用状态与测速结果会被保留。
+// 旧节点中「连接语义指纹」相同的节点会被继承 ID、禁用状态与测速结果
+// （见 nodeFingerprint）；展示名称与端点都不参与身份匹配。
 func (m *Manager) Update(ctx context.Context, id int64) (*config.Subscription, error) {
 	s, err := m.DB.GetSubscription(id)
 	if err != nil {
@@ -165,27 +166,47 @@ func (m *Manager) Update(ctx context.Context, id int64) (*config.Subscription, e
 		n.SubscriptionID = s.ID
 		n.Enabled = true
 	}
-	// 保留匹配旧节点的禁用状态与测速结果
+	// 保留匹配旧节点的禁用状态与测速结果。
+	//
+	// 身份按「连接语义指纹」分桶：同 endpoint 不同凭据的节点落在不同桶里，
+	// 不会互相错绑。只有指纹完全相同的重复节点才需要桶内再分配，
+	// 分配规则是「先同展示名、再取最小未使用 ID」，保证确定性且每个旧 ID 只消费一次。
 	old, err := m.DB.ListNodes(s.ID)
 	if err != nil {
 		return nil, err
 	}
-	state := map[string]*config.Node{}
+	buckets := map[string][]*config.Node{}
 	for _, o := range old {
-		state[nodeKey(o)] = o
+		fp, err := nodeFingerprint(o)
+		if err != nil {
+			// 不降级成旧的 endpoint 键：算不出指纹说明节点本身不合法，
+			// 此时沿用低精度身份正是本函数要修的故障。宁可让刷新失败。
+			return nil, err
+		}
+		buckets[fp] = append(buckets[fp], o)
+	}
+	for fp, bucket := range buckets {
+		// 按 ID 升序稳定排序，使「取最小未使用 ID」是确定性的。
+		sort.SliceStable(bucket, func(i, j int) bool { return bucket[i].ID < bucket[j].ID })
+		buckets[fp] = bucket
 	}
 
-	matched := map[int64]bool{}
 	for _, n := range nodes {
-		if o, ok := state[nodeKey(n)]; ok && !matched[o.ID] {
-			matched[o.ID] = true
-			// 保留节点 ID，使显式代理组成员和 select 选中项在刷新后仍然有效。
-			n.ID = o.ID
-			n.Enabled = o.Enabled
-			if !o.LastTested.IsZero() {
-				n.LatencyMS = o.LatencyMS
-				n.LastTested = o.LastTested
-			}
+		fp, err := nodeFingerprint(n)
+		if err != nil {
+			return nil, err
+		}
+		o, rest := takeBucketNode(buckets[fp], n.Name)
+		if o == nil {
+			continue
+		}
+		buckets[fp] = rest
+		// 保留节点 ID，使显式代理组成员和 select 选中项在刷新后仍然有效。
+		n.ID = o.ID
+		n.Enabled = o.Enabled
+		if !o.LastTested.IsZero() {
+			n.LatencyMS = o.LatencyMS
+			n.LastTested = o.LastTested
 		}
 	}
 	if nodes, err = applyNodePolicy(nodes, s.NodeFilter, s.SortBy); err != nil {
@@ -328,9 +349,5 @@ func parseUserInfo(h http.Header) (userInfo, bool) {
 	return info, info.hasUpload || info.hasDownload || info.hasTotal || info.hasExpire
 }
 
-// nodeKey 节点匹配键：协议|服务器|端口。
-// 展示名称可能在订阅刷新时变化，不能参与身份匹配；这与 Karing 的
-// type;server;serverport 禁用状态键保持一致。
-func nodeKey(n *config.Node) string {
-	return strings.ToLower(strings.TrimSpace(n.Protocol)) + "|" + strings.ToLower(strings.TrimSpace(n.Server)) + "|" + strconv.Itoa(n.Port)
-}
+// 节点身份匹配已迁到 identity.go 的 nodeFingerprint()：旧的
+// protocol|server|port 键无法区分同端点的不同凭据，已于 v7 轮删除。

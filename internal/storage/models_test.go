@@ -118,7 +118,13 @@ func TestReplaceSubscriptionNodesPreservesIDsForGroupMembers(t *testing.T) {
 	}
 }
 
-func TestReplaceSubscriptionNodesDoesNotReuseDuplicateIDs(t *testing.T) {
+// V7-1：携带重复非零 ID 的输入必须被拒绝，而不是让第二个节点静默走 INSERT。
+//
+// 本测试的前身是 TestReplaceSubscriptionNodesDoesNotReuseDuplicateIDs，它断言的
+// 正是「第二个节点落成新行」。那其实是 API 层身份算法出错时唯一的可观测信号，
+// v7 轮起改为 fail-closed（见 ReplaceSubscriptionNodes 的入参约束）；下方 usedIDs
+// 二次防线保留，用于兜住其它调用路径。
+func TestReplaceSubscriptionNodesRejectsDuplicateIDs(t *testing.T) {
 	db := newTestDB(t)
 	s := &config.Subscription{Name: "重复节点", URL: "https://example.com"}
 	if err := db.CreateSubscription(s); err != nil {
@@ -129,26 +135,34 @@ func TestReplaceSubscriptionNodesDoesNotReuseDuplicateIDs(t *testing.T) {
 	if err := db.CreateNode(old); err != nil {
 		t.Fatal(err)
 	}
+	before, err := db.GetSubscription(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	updated := &config.Node{ID: old.ID, Name: old.Name, Protocol: old.Protocol, Server: old.Server, Port: old.Port,
 		Enabled: true, Metadata: map[string]any{"password": "one"}, SubscriptionID: s.ID}
 	duplicate := &config.Node{ID: old.ID, Name: old.Name, Protocol: old.Protocol, Server: old.Server, Port: old.Port,
 		Enabled: true, Metadata: map[string]any{"password": "two"}, SubscriptionID: s.ID}
-	if err := db.ReplaceSubscriptionNodes(s.ID, []*config.Node{updated, duplicate}, time.Now()); err != nil {
-		t.Fatal(err)
+	if err := db.ReplaceSubscriptionNodes(s.ID, []*config.Node{updated, duplicate}, time.Now()); err == nil {
+		t.Fatal("重复非零 ID 必须被拒绝")
 	}
+	// 拒绝必须发生在任何破坏性动作之前：旧节点内容与订阅状态都不能变。
 	nodes, err := db.ListNodes(s.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nodes) != 2 {
-		t.Fatalf("重复节点应保留两行，得到 %d: %+v", len(nodes), nodes)
+	if len(nodes) != 1 || nodes[0].ID != old.ID {
+		t.Fatalf("拒绝后应保留唯一的旧节点，得到 %+v", nodes)
 	}
-	sub, err := db.GetSubscription(s.ID)
+	if got, _ := nodes[0].Metadata["password"].(string); got != "old" {
+		t.Fatalf("拒绝后旧节点内容应原样保留，密码实得 %q", got)
+	}
+	after, err := db.GetSubscription(s.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sub.NodeCount != 2 {
-		t.Fatalf("NodeCount = %d, want 2", sub.NodeCount)
+	if after.NodeCount != before.NodeCount || !after.LastUpdated.Equal(before.LastUpdated) {
+		t.Fatalf("拒绝后订阅状态不应变化: %+v -> %+v", before, after)
 	}
 }
 

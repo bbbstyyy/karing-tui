@@ -143,7 +143,15 @@ func (d *DB) DeleteFailedNodesBySubscription(subscriptionID int64) (int64, error
 
 // ReplaceSubscriptionNodes 原子替换订阅节点并更新订阅状态。
 // 节点写入或状态更新任一步失败都会回滚，保留原节点池。
+//
+// 入参约束（V7-1）：nodes 中不得出现两个携带同一非零 ID 的节点。下方用于保留
+// 组引用的 usedIDs 只能保证「同一个旧 ID 不会被 UPDATE 两次」，无法说明这种输入
+// 是对的；让第二个节点静默落成新行会把上层身份算法的异常变成一次无痕的插入。
+// 因此这里 fail-closed，且检查放在 BEGIN 之前——拒绝时不产生任何破坏性动作。
 func (d *DB) ReplaceSubscriptionNodes(subscriptionID int64, nodes []*config.Node, lastUpdated time.Time) error {
+	if err := validateReplacedNodeIDs(nodes); err != nil {
+		return err
+	}
 	tx, err := d.db.Begin()
 	if err != nil {
 		return fmt.Errorf("开启订阅节点替换事务失败: %w", err)
@@ -228,6 +236,22 @@ func (d *DB) ReplaceSubscriptionNodes(subscriptionID int64, nodes []*config.Node
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交订阅 %d 节点替换失败: %w", subscriptionID, err)
+	}
+	return nil
+}
+
+// validateReplacedNodeIDs 拒绝携带重复非零 ID 的替换输入（V7-1 防御性检查）。
+// ID 为 0 表示「新节点」，可以出现任意次；非零 ID 每个最多一次。
+func validateReplacedNodeIDs(nodes []*config.Node) error {
+	seen := make(map[int64]bool, len(nodes))
+	for _, n := range nodes {
+		if n == nil || n.ID <= 0 {
+			continue
+		}
+		if seen[n.ID] {
+			return fmt.Errorf("订阅节点替换包含重复的非零 ID %d，拒绝写入", n.ID)
+		}
+		seen[n.ID] = true
 	}
 	return nil
 }
