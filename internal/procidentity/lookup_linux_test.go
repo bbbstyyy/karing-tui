@@ -1,10 +1,12 @@
 //go:build linux
 
-package headless
+package procidentity
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -13,7 +15,7 @@ import (
 //
 // 判决性背景：对整行 strings.Fields 后取 [21] 也能在「comm 不含空格」的常见
 // 输入上碰巧得到正确答案，因此只有 comm 含空格 / 含 ')' 时才暴露。这一组用例
-// 覆盖的正是分叉点，并对每一种畸形输入都做了反向核对（见 errNaive*）。
+// 覆盖的正是分叉点，并对每一种畸形输入都做了反向核对（见 naiveShift）。
 func TestParseProcStatFieldsCommBoundary(t *testing.T) {
 	// 真实布局：pid (comm) state ppid pgrp ... starttime(field 22)
 	build := func(comm, starttime string) string {
@@ -108,32 +110,40 @@ func TestStarttimeFromStatFieldsRejectsNonNumeric(t *testing.T) {
 	}
 }
 
-func TestProcessIdentityOnSelf(t *testing.T) {
-	id, err := processIdentity(os.Getpid())
+func TestLookupOnSelf(t *testing.T) {
+	id, err := Lookup(os.Getpid())
 	if err != nil {
-		t.Fatalf("processIdentity: %v", err)
+		t.Fatalf("Lookup: %v", err)
 	}
 	if !strings.Contains(id.Token, ":") {
 		t.Fatalf("Linux token 应为 <boot_id>:<starttime>，实际 %q", id.Token)
 	}
 	// 反向核对：同一进程连读两次必须完全一致（starttime 是稳定量）。
-	again, err := processIdentity(os.Getpid())
+	again, err := Lookup(os.Getpid())
 	if err != nil || again.Token != id.Token {
 		t.Fatalf("同一进程的 token 应稳定: %q vs %q (err=%v)", id.Token, again.Token, err)
 	}
-	if !sameProcess(os.Getpid(), id.Token) {
-		t.Fatal("sameProcess 对自身应为真")
+	if !Matches(id) {
+		t.Fatal("Matches 对自身应为真")
 	}
-	if sameProcess(os.Getpid(), id.Token+":junk") {
+	if Matches(Identity{PID: os.Getpid(), Token: id.Token + ":junk"}) {
 		t.Fatal("token 被改写后不得判为同一进程")
 	}
-	if sameProcess(os.Getpid(), "") {
+	if Matches(Identity{PID: os.Getpid()}) {
 		t.Fatal("空 token 必须 fail-closed（不得退回裸 PID）")
+	}
+	// Current 必须等于对自身 Lookup 的结果。
+	cur, err := Current()
+	if err != nil || cur.Token != id.Token {
+		t.Fatalf("Current 与 Lookup(self) 不一致: %+v vs %+v (err=%v)", cur, id, err)
 	}
 }
 
-func TestProcessIdentityMissingProcessIsGone(t *testing.T) {
-	if _, err := processIdentity(-1); err == nil {
+func TestLookupRejectsInvalidPID(t *testing.T) {
+	if _, err := Lookup(-1); err == nil {
+		t.Error("非法 PID 应报错")
+	}
+	if _, err := GroupID(0); err == nil {
 		t.Error("非法 PID 应报错")
 	}
 }
@@ -163,17 +173,38 @@ func TestReadBootIDIsRequired(t *testing.T) {
 	}
 }
 
-// TestProcessGroupIDOnSelf 反向核对 PGID 解析：当前测试进程的 PGID 应等于
-// 内核报告值，且与我们用 getpgid 得到的值一致。
-func TestProcessGroupIDOnSelf(t *testing.T) {
-	got, err := processGroupID(os.Getpid())
+// TestGroupIDOnSelf 反向核对 PGID 解析：当前测试进程的 PGID 应等于内核报告值。
+func TestGroupIDOnSelf(t *testing.T) {
+	got, err := GroupID(os.Getpid())
 	if err != nil {
-		t.Fatalf("processGroupID: %v", err)
+		t.Fatalf("GroupID: %v", err)
 	}
 	if got <= 0 {
 		t.Fatalf("PGID 应 > 0，实际 %d", got)
 	}
-	if _, err := processGroupID(0); err == nil {
-		t.Error("非法 PID 应报错")
+}
+
+// TestLookupMissingProcessIsGone 钉住「进程不存在」与「读不出来」的分流：
+// 前者必须是 ErrProcessGone，上层据此才敢清理陈旧锁。
+func TestLookupMissingProcessIsGone(t *testing.T) {
+	// 选一个当前不存在的号码：读 /proc/sys/kernel/pid_max 取上界，避免硬编码
+	// 一个可能被占用的数字（号码一旦存在，本用例就不再证明任何事）。
+	b, err := os.ReadFile(procRoot + "/sys/kernel/pid_max")
+	if err != nil {
+		t.Skipf("读取 pid_max 失败，跳过: %v", err)
+	}
+	max, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || max <= 4 {
+		t.Skipf("pid_max 不可用(%q)，跳过", string(b))
+	}
+	pid := max - 1
+	if _, err := os.Stat(procRoot + "/" + strconv.Itoa(pid)); err == nil {
+		t.Skipf("候选 PID %d 已被占用，跳过（避免偶发误判）", pid)
+	}
+	if _, err := Lookup(pid); !errors.Is(err, ErrProcessGone) {
+		t.Fatalf("不存在的 PID 应返回 ErrProcessGone，实际 %v", err)
+	}
+	if _, err := GroupID(pid); !errors.Is(err, ErrProcessGone) {
+		t.Fatalf("不存在的 PID 的 PGID 查询应返回 ErrProcessGone，实际 %v", err)
 	}
 }

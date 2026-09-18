@@ -1,6 +1,6 @@
 //go:build linux
 
-package headless
+package procidentity
 
 import (
 	"errors"
@@ -19,32 +19,34 @@ var (
 // errInvalidProcStat 表示 /proc/<pid>/stat 的内容不符合 proc(5) 的字段布局。
 var errInvalidProcStat = errors.New("无法解析 /proc/<pid>/stat")
 
-// processIdentity 读取 Linux 进程身份：Token = "<boot_id>:<starttime>"。
-func processIdentity(pid int) (ProcessIdentity, error) {
+// Lookup 读取 Linux 进程身份：Token = "<boot_id>:<starttime>"。
+//
+// boot_id 读不到时**报错而不降级**（见 readBootID）：那正好会重新引入跨重启误判。
+func Lookup(pid int) (Identity, error) {
 	if pid <= 0 {
-		return ProcessIdentity{}, fmt.Errorf("非法 PID: %d", pid)
+		return Identity{}, fmt.Errorf("非法 PID: %d", pid)
 	}
 	fields, err := readProcStatFields(pid)
 	if err != nil {
-		return ProcessIdentity{}, err
+		return Identity{}, err
 	}
 	start, err := starttimeFromStatFields(fields)
 	if err != nil {
-		return ProcessIdentity{}, err
+		return Identity{}, err
 	}
 	boot, err := readBootID()
 	if err != nil {
-		return ProcessIdentity{}, err
+		return Identity{}, err
 	}
-	return ProcessIdentity{PID: pid, Token: boot + ":" + start}, nil
+	return Identity{PID: pid, Token: boot + ":" + start}, nil
 }
 
-// processGroupID 读取 PID 所在进程组的 PGID（/proc/<pid>/stat field 5）。
+// GroupID 读取 PID 所在进程组的 PGID（/proc/<pid>/stat field 5）。
 //
 // 刻意不假设「PGID == PID」：core 目前用 setpgid 让 child 成为组长
-// （internal/core/manager.go:142），但那属于 core 的实现细节；记录时按
-// 实际读到的值记，将来 core 改变启动方式也不会记错。
-func processGroupID(pid int) (int, error) {
+// （internal/core/manager.go），但那属于 core 的实现细节；记录时按实际读到的
+// 值记，将来 core 改变启动方式也不会记错。
+func GroupID(pid int) (int, error) {
 	if pid <= 0 {
 		return 0, fmt.Errorf("非法 PID: %d", pid)
 	}
