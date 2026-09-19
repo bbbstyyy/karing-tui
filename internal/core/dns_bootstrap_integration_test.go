@@ -25,11 +25,21 @@ import (
 //
 //	组  default_domain_resolver  节点 server   DNS 收到 node.test   节点被真正连上
 //	1   local（直连）            node.test     是                  是        ← V8-1 之前的状态
-//	2   remote（**直连** detour 为空）node.test 是                  是        ← 排除「fixture / udp 传输不支持」
+//	2   remote（**直连** detour 为空）node.test 是                  是        ← 排除「fixture / UDP DNS 本身不工作」
 //	3   remote（**经 Auto**）     node.test    **否**              **否**     ← 缺陷
-//	4   remote（**经 Auto**）     127.0.0.1    否                  是        ← 排除「经 Auto 的 DNS 本身不可用」
+//	4   remote（**经 Auto**）     127.0.0.1    否*                 是        ← 排除「该形态存在 V9-5 的解析自举环」
 //
-// 组 2 与组 4 把病因精确夹逼到「resolver 经代理组」×「该组的节点服务器是域名」这一个组合上。
+// 组 2 与组 4 把病因夹逼到：**V9-5 那个解析自举环**只出现在「resolver 经代理组」×
+// 「该组的节点服务器是域名」这个组合上。
+//
+// **组 4 的证据强度必须说清（V9-6 评审修正，勿再夸大）**：本文件的假代理
+// （`startBootstrapProbeProxy`）只 `Accept` 后立即 `Close`——不解析 HTTP CONNECT、
+// 不转发 TCP、更不转发 UDP。因此组 4 证明的**只是**「节点服务器是字面 IP 时，不存在
+// V9-5 那个自举环（内核会去拨节点）」，**不能**推出「DNS 经这个代理组能完成一次完整
+// 查询」——那需要 CONNECT 成功 + DNS 服务器真收到查询 + 应答真回来，是 V9-7 要补的
+// 数据面判决（DNS detour 的 transport capability，如 udp DNS 经 http outbound）。
+// 两个命题必须分开：「无自举环」≠「传输可用」。
+//
 // 内核**不会拒绝启动**（无 FATAL），日志里只有反复的
 // `outbound/http[n]: outbound connection to www.gstatic.com:80`，没有任何解析失败的 ERROR
 // —— 比启动报错更难排查。V7-8/V8-1 的「写库前拦环」救不了它：那个环跨了 DNS 与出站两张图，
@@ -37,9 +47,11 @@ import (
 //
 // **现在（V9-6 之后）本用例的职责变了**：组 3 不再交给内核——生成阶段就 fail-closed
 // （`ErrNoBootstrapDNS`），因此改成断言 `config.Generate` 拒绝；组 1/2/4 继续真启动、
-// 真解析、真拨号，作为「合法形态不得被新判据误伤」的非回归护栏。
+// 真拨号，作为「合法形态不得被新判据误伤」的非回归护栏。注意组 4 守的是
+// 「**无自举环**这一维度不得被收紧」，不担保「DNS 经代理组传输可用」（V9-7）。
 //
-// 长期要守的两件事：① 生成器不会再把这个缺陷形态交给内核；② 合法形态仍能真跑起来。
+// 长期要守的两件事：① 生成器不会再把这个缺陷形态交给内核；② 合法形态仍能真跑起来
+// （至少到「节点被拨通」这一层；完整数据面见 V9-7）。
 func TestRealSingBoxDNSBootstrapSafety(t *testing.T) {
 	src := os.Getenv("SINGBOX_BIN")
 	if src == "" {
@@ -77,13 +89,16 @@ func TestRealSingBoxDNSBootstrapSafety(t *testing.T) {
 		dns          []config.DNSServer
 		wantTag      string // 期望被选中的 default_domain_resolver（wantRejected 为真时不看）
 		nodeServer   string
-		wantResolve  bool // 期望测试 DNS 收到 node.test（节点是字面 IP 时无意义，填 false 且不看）
+		wantResolve  bool // 期望测试 DNS 收到 node.test
 		wantDial     bool // 期望节点被真正连上
 		wantRejected bool // 期望在**生成阶段**就 fail-closed（V9-6）
 	}{
 		{"控制组-local直连", withLocal, "local", "node.test", true, true, false},
 		{"只剩remote但直连", directRemote, "remote", "node.test", true, true, false},
 		{"只剩remote经Auto-域名节点", proxyRemote, "", "node.test", false, false, true},
+		// 组 4 只断言「节点被拨通」：假代理不转发（见文件头），所以即便内核完全正常，
+		// DNS 查询也到不了我们的测试 DNS —— 「经代理组的 DNS 能否完成完整查询」
+		// 是 V9-7 的数据面判决项，这里不冒充。
 		{"只剩remote经Auto-IP节点", proxyRemote, "remote", "127.0.0.1", false, true, false},
 	}
 
@@ -293,6 +308,11 @@ func bootstrapDNSReply(q []byte) (string, []byte) {
 // bootstrapProbeProxy 只做一件事：记录「有连接到达」。
 // 它不转发、不实现代理协议 —— 本项要判的是「节点有没有被真正连上」这一步，
 // 到达这一步就说明节点的域名已经被解析出来了。
+//
+// 这个能力边界必须记住（V9-6 评审修正）：因为它不转发，**本文件观察不到
+// 「DNS 查询经代理组完整走一圈」**——那需要 CONNECT + TCP relay + 应答回来，
+// 是 V9-7（DNS detour transport capability）要补的 fixture。组 4 的结论因此
+// 只能到「无自举环、节点可拨通」为止。
 type bootstrapProbeProxy struct {
 	port int
 
