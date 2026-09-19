@@ -63,13 +63,22 @@ func TestZoneIPv6TreatedExactlyLikeLiteralIPv4(t *testing.T) {
 // 必须选前者 —— 域名型那条要先解析自己，选它等于没有 bootstrap。
 //
 // 判决性：旧实现把 zone IPv6 归到「其余」桶，于是排在域名型之后被选中。
+//
+// V9-6 之后 pickDNSResolver 变成了生成器方法（还要过跨图可达性判据），
+// 这里给 DoH 配一条**安全**的 AddressResolver，好让本用例仍然只考「排序」这一件事。
 func TestPickDNSResolverPrefersZoneIPv6OverDomain(t *testing.T) {
 	zone := zoneServer()
 	servers := []DNSServer{
-		{Tag: "doh", Type: "https", Address: "dns.google", Enabled: true},
+		{Tag: "doh", Type: "https", Address: "dns.google", AddressResolver: zone.Tag, Enabled: true},
 		zone,
 	}
-	if got := pickDNSResolver(servers); got != zone.Tag {
+	g := &generator{snap: Snapshot{}}
+	g.init()
+	got, err := g.pickDNSResolver(servers)
+	if err != nil {
+		t.Fatalf("pickDNSResolver: %v", err)
+	}
+	if got != zone.Tag {
 		t.Errorf("pickDNSResolver = %q，期望 %q（字面 IP 优先于需要先解析自己的域名）", got, zone.Tag)
 	}
 }

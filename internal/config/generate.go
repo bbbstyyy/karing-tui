@@ -215,6 +215,13 @@ type generator struct {
 	rsByTag     map[string]*RuleSet    // 规则集索引
 	needRS      map[string]bool        // 被路由/DNS 规则引用的规则集 tag
 	catRefs     map[string]catalog.Ref // 被引用的内置分类：派生 tag → 分类引用
+
+	// 下面三份是 V9-6 的派生事实，只用于判断「某台 DNS 能不能当 bootstrap 解析器」。
+	// 都从**实际生成的出站**得出，而不是另写一套节点/组展开算法——否则迟早与
+	// resolveMembers 的分支（动态 all、嵌套组、禁用过滤）漂移。
+	outboundNeedsDNS map[string]bool     // 出站 tag → 建立连接时是否需要域名解析
+	outboundHost     map[string]string   // 出站 tag → 它写的 server 地址（仅用于把报错文案写具体）
+	groupLeafTags    map[string][]string // 代理组名 → resolveMembers() 后的实际 leaf 出站 tag
 }
 
 func (g *generator) init() {
@@ -225,6 +232,9 @@ func (g *generator) init() {
 	g.rsByTag = map[string]*RuleSet{}
 	g.needRS = map[string]bool{}
 	g.catRefs = map[string]catalog.Ref{}
+	g.outboundNeedsDNS = map[string]bool{}
+	g.outboundHost = map[string]string{}
+	g.groupLeafTags = map[string][]string{}
 	for _, n := range g.snap.Nodes {
 		if n.Enabled {
 			g.enabledByID[n.ID] = n
@@ -280,6 +290,10 @@ func (g *generator) buildOutbounds() ([]any, error) {
 		if err != nil {
 			return nil, err
 		}
+		// V9-6：判据取自**实际出站**而不是 Node.Server —— tor 这类出站没有 server 字段
+		// （NodeToOutbound 里 delete 掉了），它建立连接不需要域名解析。
+		g.outboundNeedsDNS[tag] = outboundServerNeedsDNS(ob)
+		g.outboundHost[tag] = outboundServerHost(ob)
 		out = append(out, ob)
 	}
 
@@ -312,6 +326,10 @@ func (g *generator) buildOutbounds() ([]any, error) {
 			// sing-box check 阶段。这里直接失败，保证引用集合与实际出站集合一致。
 			return nil, ErrEmptyProxyGroup{Group: gp.Name}
 		}
+		// V9-6：把**这一次实际解析出来的** leaf 出站记下来，供 bootstrap 安全性检查用。
+		// resolveMembers 已经把动态 all、嵌套组、禁用节点过滤全部处理完，
+		// 此处不得再自己去遍历 ProxyGroup/Nodes。
+		g.groupLeafTags[gp.Name] = members
 		out = append(out, g.groupOutbound(gp, members))
 	}
 
@@ -918,7 +936,13 @@ func (g *generator) buildDNS(route *sbRoute) (*sbDNS, error) {
 	}
 
 	// 出站/DNS 服务器地址为域名时的解析来源：优先本机或纯 IP 服务器，避免自引用循环
-	if resolver := pickDNSResolver(cfg.Servers); resolver != "" {
+	// bootstrap 解析器的选择（V9-6）：排序之外还要过跨图可达性判据，
+	// 一台都不能自举时 fail-closed —— 见 ErrNoBootstrapDNS 的说明。
+	resolver, err := g.pickDNSResolver(cfg.Servers)
+	if err != nil {
+		return nil, err
+	}
+	if resolver != "" {
 		route.DefaultDomainResolver = resolver
 	}
 	return dns, nil
@@ -1015,17 +1039,170 @@ func parseTLSDNSAddress(addr, typ string) (host string, port int, path string) {
 	return host, port, ""
 }
 
-// pickDNSResolver 选出用于解析域名的 DNS 服务器 tag：优先 local，其次纯 IP 的 udp/tcp，
-// 避免选中地址本身是域名（需先被解析）的服务器造成循环。
+// ErrNoBootstrapDNS 表示配置里的 DNS 服务器**一台都不能**当 bootstrap 解析器（V9-6）：
+// 每一台候选在建立连接时，最终都要依赖「由它自己提供的域名解析」，形成
+// DNS ↔ 代理出站 的跨图启动依赖。
+//
+// 为什么必须 fail-closed、而不是「省掉 route.default_domain_resolver 继续生成」：
+// 实测（sing-box 1.14.0）把该字段删掉后**仍然卡死** —— 4 次拨号尝试、没有任何解析、
+// 节点永远连不上、内核也不报错。即「省略字段」不等于「改用系统解析器」，唯一 DNS 场景
+// 下内核仍会隐式使用它。把坏配置交给内核只会把错误推迟成「节点一直连不上」。
+//
+// Rejected 逐条给出候选与原因，文案直接面向用户（同 C15 的两个错误类型）。
+type ErrNoBootstrapDNS struct {
+	Rejected []string
+}
+
+func (e ErrNoBootstrapDNS) Error() string {
+	return "当前 DNS 无法作为代理节点域名的启动解析器：" + strings.Join(e.Rejected, "；") +
+		"。请保留一台直连（detour 留空或填 DIRECT）的 DNS，或让 DNS 的出站代理组只包含服务器地址为字面 IP 的节点。"
+}
+
+// pickDNSResolver 选出用于解析域名的 DNS 服务器 tag：优先 local，其次纯 IP 的 udp/tcp。
 //
 // 候选排序复用 dnsCandidateOrder（probe.go）：独立测速的 bootstrap 选择用的是
 // 同一套优先级，只是还要额外过 probe-safe 检查。两处各写一份排序，迟早会分叉。
-func pickDNSResolver(servers []DNSServer) string {
-	order := dnsCandidateOrder(servers)
-	if len(order) == 0 {
-		return ""
+//
+// 排序之外还要过一道**跨图可达性**判据（V9-6）：按顺序取第一个「能自举」的候选，
+// 跳过不能自举的；一个都不行时报 ErrNoBootstrapDNS（fail-closed）。
+// 「能自举」的完整定义见 dnsBootstrapSafe。
+func (g *generator) pickDNSResolver(servers []DNSServer) (string, error) {
+	if len(servers) == 0 {
+		return "", nil
 	}
-	return servers[order[0]].Tag
+	byTag := make(map[string]*DNSServer, len(servers))
+	for i := range servers {
+		byTag[servers[i].Tag] = &servers[i]
+	}
+	var rejected []string
+	for _, idx := range dnsCandidateOrder(servers) {
+		s := &servers[idx]
+		safe, why := g.dnsBootstrapSafe(s, byTag)
+		if safe {
+			return s.Tag, nil
+		}
+		// why 自带「DNS "x" ...」前缀，这里不再重复候选名。
+		rejected = append(rejected, why)
+	}
+	return "", ErrNoBootstrapDNS{Rejected: rejected}
+}
+
+// outboundServerNeedsDNS 判断一个**已经生成好的出站**在建立连接时是否需要域名解析。
+//
+// 判据取自 outbound 的 server 字段，而不是模型里的 Node.Server：
+//   - 没有 server 字段（tor）→ 不需要；
+//   - 空串 → 不需要；
+//   - 字面 IPv4/IPv6（含带 zone 的链路本地地址）→ 不需要（复用 V9-4 的唯一判据）；
+//   - 其余（域名）→ 需要 route.default_domain_resolver。
+func outboundServerNeedsDNS(ob map[string]any) bool {
+	raw, ok := ob["server"]
+	if !ok {
+		return false
+	}
+	host, _ := raw.(string)
+	if host == "" {
+		return false
+	}
+	return !isLiteralIPHost(host)
+}
+
+// outboundServerHost 取出出站写的 server 地址（没有该字段时返回空串）。
+// 只用于把 fail-closed 的报错文案写具体（「节点 HK-01(node.example.com)」），
+// 判断本身一律走 outboundServerNeedsDNS。
+func outboundServerHost(ob map[string]any) string {
+	host, _ := ob["server"].(string)
+	return host
+}
+
+// outboundBootstrapSafe 判断「以某个出站 tag 作为 DNS 的 detour」是否能自举：
+// 该出站（若是代理组，则它**实际解析出来的**每一个 leaf 成员）建立连接时都不能需要
+// 域名解析——否则就绕回了「要先解析域名才能连上解析域名要用的东西」。
+//
+// 组的安全性取的是 resolveMembers 的结果（动态 all、嵌套组、禁用过滤都已在此前算完），
+// 不在本函数里重新遍历 ProxyGroup/Nodes：那是一套会漂移的重复实现。
+//
+// 口径是「**所有**有效 leaf 都必须不依赖 DNS」，不是「当前恰好有一条 IP 路径」：
+// selector 可以在运行期切成员、urltest 的选路也随时序变化，只要存在一个域名型成员，
+// 用户切过去之后 bootstrap 就不成立了。这是稳定不变量。
+func (g *generator) outboundBootstrapSafe(tag string) (bool, string) {
+	if leaves, isGroup := g.groupLeafTags[tag]; isGroup {
+		for _, leaf := range leaves {
+			if g.outboundNeedsDNS[leaf] {
+				return false, fmt.Sprintf("代理组 %q 的成员 %s 的服务器地址是域名",
+					tag, g.describeOutbound(leaf))
+			}
+		}
+		return true, ""
+	}
+	if g.outboundNeedsDNS[tag] {
+		return false, fmt.Sprintf("出站 %s 的服务器地址是域名", g.describeOutbound(tag))
+	}
+	// 其余（direct/block/dns 等保留出站，或任何没有 server 的出站）不依赖解析。
+	return true, ""
+}
+
+// describeOutbound 把出站渲染成面向用户的短描述：有 server 时带上地址。
+func (g *generator) describeOutbound(tag string) string {
+	if host := g.outboundHost[tag]; host != "" {
+		return fmt.Sprintf("%q(%s)", tag, host)
+	}
+	return fmt.Sprintf("%q", tag)
+}
+
+// dnsBootstrapSafe 判断一台 DNS 服务器能否充当 bootstrap 解析器（V9-6）。
+//
+// 两步，缺一不可：
+//  1. **它自己怎么被连上**：detour 指向的出站必须不需要域名解析（见 outboundBootstrapSafe）；
+//  2. **它自己的地址怎么被解析**：地址是域名时必须有一条同样安全的 AddressResolver 链，
+//     递归下去——这是最容易漏掉的「二阶环」。
+//
+// 为什么必须递归（V9-6 的判据不能只看候选自己的 detour）：
+//
+//	doh  = https dns.google, AddressResolver=boot, detour=（直连）
+//	boot = udp 1.1.1.1,     detour=Auto
+//	Auto = 含节点 node.example.com
+//
+// 表面上 doh 是直连、看着安全；但要用 doh 必须先经 boot 解析 dns.google，
+// 而 boot 经 Auto，Auto 又要先解析 node.example.com——仍然成环。
+//
+// V7-8 只保证「纯 DNS 引用图」无环；本函数补的是 **DNS 图 × 出站图** 的联合可达性。
+// 返回的 reason 面向用户，指出具体是哪条链（DNS tag → detour → 组 → 域名型出站）。
+func (g *generator) dnsBootstrapSafe(s *DNSServer, byTag map[string]*DNSServer) (bool, string) {
+	return g.dnsBootstrapSafeRec(s, byTag, nil)
+}
+
+func (g *generator) dnsBootstrapSafeRec(s *DNSServer, byTag map[string]*DNSServer, chain []string) (bool, string) {
+	// 自身成环的兜底：buildDNS 开头的 ValidateDNSResolverGraph 本应先拦住，
+	// 但那一步校验的是「会被输出的整批服务器」，不保证本函数拿到的一定无环。
+	for _, t := range chain {
+		if t == s.Tag {
+			return false, fmt.Sprintf("AddressResolver 链成环: %s -> %s",
+				strings.Join(chain, " -> "), s.Tag)
+		}
+	}
+	if detour := normalizeDNSDetour(s.Detour); detour != "" {
+		if ok, why := g.outboundBootstrapSafe(detour); !ok {
+			return false, fmt.Sprintf("DNS %q 的 detour %q 无法自举：%s", s.Tag, detour, why)
+		}
+	}
+	if !DNSServerNeedsDomainResolver(s) {
+		return true, ""
+	}
+	if s.AddressResolver == "" {
+		return false, fmt.Sprintf(
+			"DNS %q 的地址 %s 是域名但没有 AddressResolver，只能靠 default_domain_resolver 解析自身",
+			s.Tag, dnsServerHost(s))
+	}
+	next, ok := byTag[s.AddressResolver]
+	if !ok {
+		return false, fmt.Sprintf("DNS %q 的 AddressResolver %q 不是已启用的 DNS 服务器",
+			s.Tag, s.AddressResolver)
+	}
+	safe, why := g.dnsBootstrapSafeRec(next, byTag, append(chain, s.Tag))
+	if !safe {
+		return false, fmt.Sprintf("DNS %q 依赖 %q：%s", s.Tag, s.AddressResolver, why)
+	}
+	return true, ""
 }
 
 // splitValues 拆分逗号分隔的多值并去除空白项。

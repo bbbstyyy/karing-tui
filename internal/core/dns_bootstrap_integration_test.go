@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,31 +17,30 @@ import (
 	"github.com/bbbstyyy/karing-tui/internal/platform"
 )
 
-// V9-5 真机判决：V8-1 允许删掉 `local` 之后，「只剩一台经代理组的 DNS」+「代理节点的
-// 服务器地址是域名」会陷入 bootstrap 环 —— 观测结论 **(b)：内核不报错，但在解析阶段
-// 静默卡死**，既不解析节点域名、也永远连不上节点。
+// 真实内核的 bootstrap 安全门禁。
 //
-// 实测四组对照（sing-box 1.14.0，darwin/arm64；`route.final = Auto`，Auto = urltest 含唯一节点）：
+// **历史**（V9-5）：V8-1 允许删掉 `local` 之后，「只剩一台经代理组的 DNS」+「代理节点的
+// 服务器地址是域名」会陷入 bootstrap 环 —— 真机判决结论 **(b)：内核不报错，但在解析阶段
+// 静默卡死**，既不解析节点域名、也永远连不上节点。当时的四组对照为：
 //
 //	组  default_domain_resolver  节点 server   DNS 收到 node.test   节点被真正连上
 //	1   local（直连）            node.test     是                  是        ← V8-1 之前的状态
-//	2   remote（**直连** detour 为空）node.test 是                  是        ← 排除「fixture / udp 传输不支持」这一解释
+//	2   remote（**直连** detour 为空）node.test 是                  是        ← 排除「fixture / udp 传输不支持」
 //	3   remote（**经 Auto**）     node.test    **否**              **否**     ← 缺陷
-//	4   remote（**经 Auto**）     127.0.0.1    否                  是        ← 排除「经 Auto 的 DNS 本身不可用」这一解释
+//	4   remote（**经 Auto**）     127.0.0.1    否                  是        ← 排除「经 Auto 的 DNS 本身不可用」
 //
-// 组 2 与组 4 把病因精确夹逼到「resolver 经代理组」×「该组的节点服务器是域名」这一个组合上，
-// 因此不是「udp over 代理传输不支持」，也不是「detour 到代理组的 DNS 不能用」。
-//
-// 另需注意：内核**不会拒绝启动**（无 FATAL），日志里只有反复的
+// 组 2 与组 4 把病因精确夹逼到「resolver 经代理组」×「该组的节点服务器是域名」这一个组合上。
+// 内核**不会拒绝启动**（无 FATAL），日志里只有反复的
 // `outbound/http[n]: outbound connection to www.gstatic.com:80`，没有任何解析失败的 ERROR
-// —— 用户看到的是「节点一直连不上」，这是比报错更糟的形态（V7-8/V8-1 立的「写库前拦环」
-// 救不了它：这里的环跨了 DNS 与出站两张图，两张图各自都是合法无环的）。
+// —— 比启动报错更难排查。V7-8/V8-1 的「写库前拦环」救不了它：那个环跨了 DNS 与出站两张图，
+// 两张图各自都是合法无环的。
 //
-// 本用例钉住当前观测行为：
-//   - 组 3 的两条断言是**缺陷的判决性证据**：V9-6 落地后必须翻转（届时同步改这里）；
-//   - 组 1/2/4 是**非回归护栏**：尤其组 4 —— 节点是字面 IP 时经 Auto 的 DNS 完全可用，
-//     「一律要求 detour 为空」的粗暴修法会把它改坏。
-func TestRealSingBoxProxyOnlyDNSBootstrapDeadlock(t *testing.T) {
+// **现在（V9-6 之后）本用例的职责变了**：组 3 不再交给内核——生成阶段就 fail-closed
+// （`ErrNoBootstrapDNS`），因此改成断言 `config.Generate` 拒绝；组 1/2/4 继续真启动、
+// 真解析、真拨号，作为「合法形态不得被新判据误伤」的非回归护栏。
+//
+// 长期要守的两件事：① 生成器不会再把这个缺陷形态交给内核；② 合法形态仍能真跑起来。
+func TestRealSingBoxDNSBootstrapSafety(t *testing.T) {
 	src := os.Getenv("SINGBOX_BIN")
 	if src == "" {
 		t.Skip("未设置 SINGBOX_BIN，跳过真实 sing-box 集成测试")
@@ -73,17 +73,18 @@ func TestRealSingBoxProxyOnlyDNSBootstrapDeadlock(t *testing.T) {
 	}
 
 	cases := []struct {
-		name        string
-		dns         []config.DNSServer
-		wantTag     string // 期望被选中的 default_domain_resolver
-		nodeServer  string
-		wantResolve bool // 期望测试 DNS 收到 node.test（节点是字面 IP 时无意义，填 false 且不看）
-		wantDial    bool // 期望节点被真正连上
+		name         string
+		dns          []config.DNSServer
+		wantTag      string // 期望被选中的 default_domain_resolver（wantRejected 为真时不看）
+		nodeServer   string
+		wantResolve  bool // 期望测试 DNS 收到 node.test（节点是字面 IP 时无意义，填 false 且不看）
+		wantDial     bool // 期望节点被真正连上
+		wantRejected bool // 期望在**生成阶段**就 fail-closed（V9-6）
 	}{
-		{"控制组-local直连", withLocal, "local", "node.test", true, true},
-		{"只剩remote但直连", directRemote, "remote", "node.test", true, true},
-		{"只剩remote经Auto-域名节点", proxyRemote, "remote", "node.test", false, false},
-		{"只剩remote经Auto-IP节点", proxyRemote, "remote", "127.0.0.1", false, true},
+		{"控制组-local直连", withLocal, "local", "node.test", true, true, false},
+		{"只剩remote但直连", directRemote, "remote", "node.test", true, true, false},
+		{"只剩remote经Auto-域名节点", proxyRemote, "", "node.test", false, false, true},
+		{"只剩remote经Auto-IP节点", proxyRemote, "remote", "127.0.0.1", false, true, false},
 	}
 
 	for i, tc := range cases {
@@ -97,7 +98,7 @@ func TestRealSingBoxProxyOnlyDNSBootstrapDeadlock(t *testing.T) {
 			settings.PrivateDirect = false
 			snap := config.Snapshot{
 				Settings: settings,
-				Nodes: []*config.Node{{ID: 1, Name: "n", Protocol: "http", Server: tc.nodeServer,
+				Nodes: []*config.Node{{ID: 1, Name: "HK-01", Protocol: "http", Server: tc.nodeServer,
 					Port: proxy.port, Enabled: true}},
 				ProxyGroups: []*config.ProxyGroup{{ID: 1, Name: "Auto", Type: "urltest",
 					TestURL: config.DefaultTestURL, IntervalS: 1,
@@ -111,6 +112,23 @@ func TestRealSingBoxProxyOnlyDNSBootstrapDeadlock(t *testing.T) {
 					Final: tc.dns[len(tc.dns)-1].Tag},
 			}
 			out, err := config.Generate(snap)
+			if tc.wantRejected {
+				// V9-6：缺陷形态必须在**生成阶段**被拒，不再交给内核静默卡死。
+				var noBootstrap config.ErrNoBootstrapDNS
+				if !errors.As(err, &noBootstrap) {
+					t.Fatalf("该形态必须在生成阶段 fail-closed，实得 err=%v（配置 %d 字节）", err, len(out))
+				}
+				if out != nil {
+					t.Error("fail-closed 时不得产出半可用配置")
+				}
+				for _, want := range []string{"remote", "Auto", "HK-01", "node.test"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("错误文案应包含 %q，实得: %v", want, err)
+					}
+				}
+				t.Logf("生成阶段已拒绝: %v", err)
+				return
+			}
 			if err != nil {
 				t.Fatalf("Generate: %v", err)
 			}
