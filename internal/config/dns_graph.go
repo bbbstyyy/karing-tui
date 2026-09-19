@@ -55,3 +55,37 @@ func ValidateDNSResolverGraph(servers []DNSServer) error {
 	}
 	return nil
 }
+
+// ApplyResolverTagCascade 返回一份按「重命名级联」改写后的服务器副本，
+// 复刻 storage.UpdateDNSServerRenamed 里那条
+//
+//	UPDATE dns_servers SET address_resolver = newTag WHERE address_resolver = oldTag
+//
+// 的语义：把所有 AddressResolver == oldTag 的条目改写为 newTag。
+//
+// 为什么必须存在（V9-2）：判环看到的图必须与**提交后**的图一致。改名时级联会在
+// 提交阶段把「指向旧 tag」的边一起改向，若校验侧不镜像这一步，就会漏掉一条边——
+// 实测夹具（A→""、X→A；把 A 改名 C 且 C→X）提交后是 C→X→C，而旧校验认为
+// 「C→X→A（A 不存在）」，放行入库。真实内核只在 run 阶段报
+// "circular server dependency"（check 返回 0）。
+//
+// 顺序约束：调用方必须**先**把被改名的条目替换成候选，**再**调用本函数。
+// 级联 SQL 在行更新之后执行，所以候选自身的 AddressResolver 同样会被改写
+// （该情形已被「不能把自身作为 resolver」挡住，但顺序写反仍会让边界条件与 SQL 漂移）。
+//
+// 总是返回新切片，不复用入参底层数组；不改变除 AddressResolver 之外的任何字段。
+// 注意：只改 Enabled 的过滤与本函数可交换（两者作用在不同字段上），因此调用方
+// 可以先把候选替换进「将生效的那批」，再做级联。
+func ApplyResolverTagCascade(servers []DNSServer, oldTag, newTag string) []DNSServer {
+	out := make([]DNSServer, len(servers))
+	copy(out, servers)
+	if oldTag == "" || oldTag == newTag {
+		return out
+	}
+	for i := range out {
+		if out[i].AddressResolver == oldTag {
+			out[i].AddressResolver = newTag
+		}
+	}
+	return out
+}

@@ -154,7 +154,8 @@ func (m *Manager) AddServer(tag, typ, address, addressResolver, detour string) (
 		}
 	}
 	s.Position = max + 1
-	if err := m.validateResolverGraph(s, 0); err != nil {
+	// 新增：没有旧 tag，改名级联不适用（oldTag 传空）。
+	if err := m.validateResolverGraph(s, 0, ""); err != nil {
 		return nil, err
 	}
 	if err := m.DB.CreateDNSServer(s); err != nil {
@@ -172,7 +173,13 @@ func (m *Manager) AddServer(tag, typ, address, addressResolver, detour string) (
 //
 // 只把**启用**的服务器纳入图：禁用的不进生成配置，也不该拦住用户保存。
 // selfID 为 0 表示新增；否则是「用 candidate 替换 ID=selfID 的那一条」。
-func (m *Manager) validateResolverGraph(candidate *config.DNSServer, selfID int64) error {
+//
+// oldTag 非空且与 candidate.Tag 不同 = 这是一次**改名**，提交阶段会级联改写所有
+// 「指向旧 tag」的条目（V9-2）。此时必须先把候选替换进图、再镜像级联，否则看到的
+// 是「改名前的库 + 改名的自己」，会漏掉一条边而放行进环。（只对启用项做级联与
+// 先全量级联再过滤等价：级联作用在 AddressResolver 上，Enabled 过滤作用在另一个
+// 字段上，两者可交换。）
+func (m *Manager) validateResolverGraph(candidate *config.DNSServer, selfID int64, oldTag string) error {
 	servers, err := m.DB.ListDNSServers()
 	if err != nil {
 		return err
@@ -195,6 +202,9 @@ func (m *Manager) validateResolverGraph(candidate *config.DNSServer, selfID int6
 	}
 	if !replaced && candidate.Enabled {
 		graph = append(graph, *candidate)
+	}
+	if oldTag != "" && oldTag != candidate.Tag {
+		graph = config.ApplyResolverTagCascade(graph, oldTag, candidate.Tag)
 	}
 	return config.ValidateDNSResolverGraph(graph)
 }
@@ -249,7 +259,9 @@ func (m *Manager) UpdateServer(s *config.DNSServer) error {
 		}
 	}
 	// 写库前判环（V7-8）：单条 update 都可能把「A→B」补成环，必须拦住。
-	if err := m.validateResolverGraph(s, s.ID); err != nil {
+	// 传 old.Tag 是为了让校验看到**提交后**的图：改名提交时级联会改写所有
+	// 「指向旧 tag」的条目（V9-2）。
+	if err := m.validateResolverGraph(s, s.ID, old.Tag); err != nil {
 		return err
 	}
 	if old.Tag != s.Tag {
