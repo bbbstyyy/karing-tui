@@ -200,8 +200,11 @@ jobs:
           printf 'proxies:\n  - name: ci-node\n    type: trojan\n    server: 127.0.0.1\n    port: 443\n    password: ci-password\n' > "$RUNNER_TEMP/karing-ci-node.yaml"
           "$RUNNER_TEMP/karing-release/karing" import clash "$RUNNER_TEMP/karing-ci-node.yaml"
           "$RUNNER_TEMP/karing-release/karing" config check
+          # V9-5：把「只有经代理组的 DNS 时，域名型节点会 bootstrap 卡死」也纳入真机门禁。
+          # 该用例目前断言的是**已确认的缺陷行为**（内核不报错、但节点永不被连上）；
+          # V9-6 修复后它的负例断言必须翻转 —— 届时同一处会红，逼出一次有意识的改动。
           SINGBOX_BIN="$KARING_HOME/runtime/bin/sing-box" go test -count=1 ./internal/core \
-            -run 'TestIntegrationRealSingBox|TestRealSingBoxDNSResolverCycle' -v
+            -run 'TestIntegrationRealSingBox|TestRealSingBoxDNSResolverCycle|TestRealSingBoxProxyOnlyDNSBootstrapDeadlock' -v
           # 独立节点测速的临时配置只有**真启动**才能验证合法：实测 sing-box check 对
           # detour=direct（detour to an empty direct outbound）、悬空 domain_resolver
           # （dependency not found）、悬空 detour（outbound detour not found）一律返回 0，
