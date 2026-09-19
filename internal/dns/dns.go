@@ -317,26 +317,44 @@ func (m *Manager) DeleteServer(id int64) error {
 }
 
 // SetServerEnabled 启用/停用 DNS 服务器。
+//
+// 启用方向必须与 AddServer/UpdateServer 走同一套校验（V9-1）：否则用户可以把两条都
+// **停用**的服务器先编成互相引用（停用状态下编辑不做「引用的 resolver 必须启用」检查），
+// 再依次启用，从而把一张「启用项引用停用项」甚至成环的图写进库 ——
+// V7-8 的「环必须在写库之前拦住」正是从这里被绕过的。后果要等到生成配置才暴露，
+// 而报错内容与用户刚才那个「启用」动作看不出关系。
+//
+// 停用方向**刻意不加 validateServer**（不是漏了）：停用是脏数据行唯一的自救动作，
+// 若因为「自身那条悬空/停用的 resolver」而被拒绝，用户会被锁死在「既不能用、也不能停」。
+// 停用只会让生效图变小，造不出环，因此这里连判环也不需要。
+//
+// 两个分支都写规范化后的 candidate 而非原始行：与另两条入口同序（规范化先于校验），
+// 顺带把老库里「字面 IP + 残留 resolver」收敛掉。启用/停用是用户动作，
+// 不是只读路径，写回规范化结果是允许的（V8-1 的「只读路径不写库」说的是 LoadConfig）。
 func (m *Manager) SetServerEnabled(id int64, enabled bool) error {
 	s, err := m.getServer(id)
 	if err != nil {
 		return err
 	}
+	candidate := *s
+	normalizeServerResolver(&candidate)
+	candidate.Enabled = enabled
+
 	if !enabled {
 		cfg, err := m.LoadConfig()
 		if err != nil {
 			return err
 		}
-		if cfg.Final == s.Tag {
-			return fmt.Errorf("DNS 服务器 %q 是当前默认（final）服务器，请先修改默认 DNS", s.Tag)
+		if cfg.Final == candidate.Tag {
+			return fmt.Errorf("DNS 服务器 %q 是当前默认（final）服务器，请先修改默认 DNS", candidate.Tag)
 		}
 		rules, err := m.DB.ListDNSRules()
 		if err != nil {
 			return err
 		}
 		for _, r := range rules {
-			if r.Server == s.Tag {
-				return fmt.Errorf("DNS 规则正在引用服务器 %q，请先修改或删除对应规则", s.Tag)
+			if r.Server == candidate.Tag {
+				return fmt.Errorf("DNS 规则正在引用服务器 %q，请先修改或删除对应规则", candidate.Tag)
 			}
 		}
 		servers, err := m.DB.ListDNSServers()
@@ -345,22 +363,29 @@ func (m *Manager) SetServerEnabled(id int64, enabled bool) error {
 		}
 		for _, other := range servers {
 			// 同 UpdateServer：字面 IP 上的残留 resolver 不构成真实依赖（V8-1）。
-			if other.ID != s.ID &&
+			if other.ID != candidate.ID &&
 				config.DNSServerNeedsDomainResolver(other) &&
-				other.AddressResolver == s.Tag {
-				return fmt.Errorf("DNS 服务器 %q 的 AddressResolver 正在引用 %q，请先修改引用", other.Tag, s.Tag)
+				other.AddressResolver == candidate.Tag {
+				return fmt.Errorf("DNS 服务器 %q 的 AddressResolver 正在引用 %q，请先修改引用", other.Tag, candidate.Tag)
 			}
 		}
+	} else {
+		if err := m.validateServer(&candidate, candidate.ID); err != nil {
+			return err
+		}
+		// 启用不改 tag，oldTag 传空（改名级联不适用）。
+		if err := m.validateResolverGraph(&candidate, candidate.ID, ""); err != nil {
+			return err
+		}
 	}
-	s.Enabled = enabled
-	if err := m.DB.UpdateDNSServer(s); err != nil {
+	if err := m.DB.UpdateDNSServer(&candidate); err != nil {
 		return err
 	}
 	state := "启用"
 	if !enabled {
 		state = "停用"
 	}
-	m.Logf("DNS 服务器 %q 已%s", s.Tag, state)
+	m.Logf("DNS 服务器 %q 已%s", candidate.Tag, state)
 	return nil
 }
 
