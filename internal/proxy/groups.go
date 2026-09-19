@@ -65,7 +65,7 @@ func (m *Manager) UpdateGroup(g *config.ProxyGroup, members []config.ProxyGroupM
 	return nil
 }
 
-// DeleteGroup 删除代理组；被分流组引用时拒绝。
+// DeleteGroup 删除代理组；被分流组或 DNS 服务器的「出站代理组」引用时拒绝。
 func (m *Manager) DeleteGroup(id int64) error {
 	g, err := m.DB.GetProxyGroup(id)
 	if err != nil {
@@ -78,6 +78,26 @@ func (m *Manager) DeleteGroup(id int64) error {
 	for _, rg := range routings {
 		if rg.Target == g.Name {
 			return fmt.Errorf("分流组 %q 正在引用代理组 %q，请先修改其目标", rg.Name, g.Name)
+		}
+	}
+	// DNS 服务器的「出站代理组」（dns_servers.detour）同样按**名字**引用代理组，
+	// 而默认配置里 remote.detour = Auto（V9-3）。不检查就会留下悬空引用，
+	// 直到生成配置才报「Detour 不是已生成的出站」。
+	//
+	// 口径与上面的分流组检查一致：**不看 Enabled**——引用在库里就存在；
+	// 而且 V9-1 之后重新启用那条 DNS 会被 validateServer 拒绝，用户会撞上更难理解的错。
+	//
+	// 数据来源用 m.DB.ListDNSServers()（storage 已有入口），刻意**不** import
+	// internal/dns，也不新增 storage 查询：为一次引用检查引入 proxy → dns 依赖不划算。
+	servers, err := m.DB.ListDNSServers()
+	if err != nil {
+		return err
+	}
+	for _, s := range servers {
+		// `direct`/`DIRECT` 是直连写法，不指向代理组（生成侧由 normalizeDNSDetour 归一）。
+		// 组名不可能叫 direct（reservedTags），这里只是对老库的防御。
+		if s.Detour != "" && s.Detour == g.Name && !strings.EqualFold(s.Detour, "direct") {
+			return fmt.Errorf("DNS 服务器 %q 的「出站代理组」正在引用代理组 %q，请先修改引用", s.Tag, g.Name)
 		}
 	}
 	if err := m.DB.DeleteProxyGroup(id); err != nil {

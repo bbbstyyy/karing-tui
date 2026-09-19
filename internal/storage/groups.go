@@ -87,6 +87,13 @@ func (d *DB) UpdateProxyGroupRenamed(g *config.ProxyGroup, oldName string) error
 	if _, err := tx.Exec(`UPDATE routing_groups SET target=? WHERE target=?`, g.Name, oldName); err != nil {
 		return fmt.Errorf("更新代理组引用失败: %w", err)
 	}
+	// DNS 服务器的「出站代理组」也是按**名字**引用代理组的（V9-3）：
+	// 默认配置里 remote.detour = Auto。不一起改写的话，改名会留下悬空 detour，
+	// 直到生成配置才报「Detour 不是已生成的出站」。
+	// 组名引用全库只有 routing_groups.target 与 dns_servers.detour 两处，改完即闭环。
+	if _, err := tx.Exec(`UPDATE dns_servers SET detour=? WHERE detour=?`, g.Name, oldName); err != nil {
+		return fmt.Errorf("更新 DNS 出站代理组引用失败: %w", err)
+	}
 	if err := replaceGroupMembersTx(tx, g); err != nil {
 		return err
 	}
