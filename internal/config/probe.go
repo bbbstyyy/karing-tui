@@ -3,7 +3,6 @@ package config
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"slices"
 	"strings"
 )
@@ -239,22 +238,20 @@ func probeDetourUsable(detour string) bool {
 	return normalizeDNSDetour(detour) == ""
 }
 
-// probeAddressIsLiteralIP 判断服务器地址是否为字面 IP（自举无需任何解析）。
-func probeAddressIsLiteralIP(s *DNSServer) bool {
-	host := dnsServerHost(s)
-	return host != "" && net.ParseIP(host) != nil
-}
-
 // dnsCandidateOrder 按「最可能自举」的顺序排列服务器下标：
 // local（本机解析）→ 地址为字面 IP 的 udp/tcp → 其余。
 // 与主生成器 pickDNSResolver 的优先级一致，只是探针还要额外过 probe-safe 检查。
+//
+// 「是不是字面 IP」问的是 `dnsServerHostIsLiteralIP`（dns_semantics.go）——全仓唯一判据。
+// 这里曾经有一份自己的 `net.ParseIP` 副本（V9-4 删除），它认不出带 zone 的 IPv6，
+// 于是 `[fe80::1%en0]:53` 被排到域名之后。别再写第三份。
 func dnsCandidateOrder(servers []DNSServer) []int {
 	var local, literalIP, rest []int
 	for i := range servers {
 		switch s := &servers[i]; {
 		case s.Type == "local":
 			local = append(local, i)
-		case (s.Type == "udp" || s.Type == "tcp") && probeAddressIsLiteralIP(s):
+		case (s.Type == "udp" || s.Type == "tcp") && dnsServerHostIsLiteralIP(s):
 			literalIP = append(literalIP, i)
 		default:
 			rest = append(rest, i)

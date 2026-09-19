@@ -33,6 +33,25 @@ func TestDNSServerNeedsDomainResolver(t *testing.T) {
 		{name: "https 域名 URL", server: &DNSServer{Type: "https", Address: "https://dns.google/dns-query"}, needs: true},
 		{name: "tls 域名 + 端口", server: &DNSServer{Type: "tls", Address: "cloudflare-dns.com:853"}, needs: true},
 		{name: "非 local 但地址为空", server: &DNSServer{Type: "udp", Address: ""}, needs: false},
+		// V9-4：带 zone 的（链路本地）IPv6 同样是**字面 IP**，不存在「域名 → IP」这一步。
+		// `net.ParseIP` 认不出 zone 写法，于是这类地址曾被当成域名——后果与 V8-1 修掉的
+		// 那一类完全同形（假依赖参与环检测/依赖阻断、输出无意义的 domain_resolver）。
+		{name: "udp 带 zone 的 IPv6 + 端口", server: &DNSServer{Type: "udp", Address: "[fe80::1%en0]:53"}, needs: false},
+		{name: "tcp 带 zone 的 IPv6", server: &DNSServer{Type: "tcp", Address: "[fe80::1%en0]:53"}, needs: false},
+		// 裸写（无方括号）的 zone IPv6：纯语义上仍是字面 IP。注意它当前**进不了库**
+		// ——`validateServerAddress` 对含多个冒号的裸串要求 host 能被 net.ParseIP 解析，
+		// 本项刻意不动那个语法门（见 §9 偏差 3），所以这一行记录的是语义边界。
+		{name: "udp 裸 zone IPv6（当前不可入库，仅记录语义）", server: &DNSServer{Type: "udp", Address: "fe80::1%en0"}, needs: false},
+		{name: "https 带 zone 的 IPv6 URL（%25 转义）", server: &DNSServer{Type: "https", Address: "https://[fe80::1%25lo0]/dns-query"}, needs: false},
+		// URL 里 zone 的 `%` 必须写成 `%25`，否则 `url.Parse` 直接报
+		// `invalid URL escape "%en"`（实测）。那种写法进不了库——`validateServerAddress`
+		// 对含 "://" 的地址会因 url.Parse 失败而拒绝，所以这里不需要（也不应该）为它
+		// 定义一个「期望」：它根本不是可达状态。
+		{name: "tls 带 zone 的 IPv6 URL（%25 转义）", server: &DNSServer{Type: "tls", Address: "tls://[fe80::1%25en0]:853"}, needs: false},
+		// 边界（记录现状，不是本轮目标）：zone 写在 IPv4 上不是合法地址，
+		// `netip.ParseAddr` 与 `net.ParseIP` **都**认不出 → 仍按域名处理。
+		// 该输入今天能被 `validateServerAddress` 存进去（无冒号即当主机名），行为与改动前一致。
+		{name: "zone 写法用在 IPv4 上（两者都不认，按域名处理）", server: &DNSServer{Type: "udp", Address: "192.168.1.1%en0"}, needs: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
