@@ -57,6 +57,28 @@ func TestLogWriterStabilityRecovery(t *testing.T) {
 	}
 }
 
+func TestLogWriterStabilityConcurrent(t *testing.T) {
+	buf := NewLogBuf(64)
+	w := NewLogWriter(&failingLogDisk{err: errors.New("disk full")}, buf)
+	var wg sync.WaitGroup
+	for writer := 0; writer < 8; writer++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				if n, err := w.Write([]byte("entry\n")); err != nil || n != 6 {
+					t.Errorf("Write: %d, %v", n, err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if buf.Version() != 4001 || len(buf.Tail(0)) != 64 {
+		t.Fatal("concurrent disk failure lost output or duplicated outage warnings")
+	}
+}
+
 // A real child fills stdout beyond pipe capacity. The old MultiWriter stops
 // draining on a disk error; the resilient sink lets the child finish normally.
 func TestLogWriterStabilitySubprocess(t *testing.T) {
@@ -69,7 +91,7 @@ func TestLogWriterStabilitySubprocess(t *testing.T) {
 			cmd.WaitDelay = 2 * time.Second
 			disk := &failingLogDisk{err: errors.New("injected disk failure")}
 			buf := NewLogBuf(32)
-			var output io.Writer = io.MultiWriter(disk, buf)
+			output := io.MultiWriter(disk, buf)
 			if resilient {
 				output = NewLogWriter(disk, buf)
 			}

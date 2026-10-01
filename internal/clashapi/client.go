@@ -87,7 +87,10 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("clash API %s 返回 %d", path, resp.StatusCode)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	if resp.ContentLength > maxAPIResponseBytes {
+		return errAPIResponseTooLarge
+	}
+	return decodeAPIResponse(resp.Body, out)
 }
 
 // urlTestHistory clash API 的延迟记录（数组至多一项）。
@@ -127,8 +130,15 @@ func (c *Client) Proxies(ctx context.Context) (map[string]ProxyInfo, error) {
 
 // Connections 返回流量累计与活跃连接数。
 func (c *Client) Connections(ctx context.Context) (Connections, error) {
-	stats, _, err := c.DetailedConnections(ctx)
-	return stats, err
+	var raw struct {
+		UploadTotal   int64           `json:"uploadTotal"`
+		DownloadTotal int64           `json:"downloadTotal"`
+		Connections   connectionCount `json:"connections"`
+	}
+	if err := c.get(ctx, "/connections", &raw); err != nil {
+		return Connections{}, err
+	}
+	return Connections{UploadTotal: raw.UploadTotal, DownloadTotal: raw.DownloadTotal, Count: int(raw.Connections)}, nil
 }
 
 // Select 切换 selector 组的当前出站。

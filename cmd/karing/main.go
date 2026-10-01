@@ -28,50 +28,44 @@ func main() {
 		os.Exit(cli.Run(os.Args[1:], os.Stdout, os.Stderr))
 	}
 
+	if err := runTUI(func(app *application.App) error {
+		_, err := tea.NewProgram(tui.NewRoot(app), tea.WithAltScreen()).Run()
+		return err
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+// Return through deferred cleanup before main exits, including terminal errors.
+func runTUI(run func(*application.App) error) error {
 	paths, err := platform.NewPaths()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "初始化数据目录失败:", err)
-		os.Exit(1)
+		return fmt.Errorf("初始化数据目录失败: %w", err)
 	}
-
 	app, err := application.NewExclusive(paths)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "初始化应用失败:", err)
-		os.Exit(1)
+		return fmt.Errorf("初始化应用失败: %w", err)
 	}
 	defer app.Close()
-
-	// KARING_HOME 指向了与本应用无关的既有非空目录时，把它交给应用日志
-	// （Logs 页可见）。这里只取一次、启动阶段记录，不在 View() 里做任何
-	// 文件系统检查，也不向 stderr 打印——TUI 会立刻进入 alt-screen，
-	// 打上去的字符会被覆盖掉。
 	if paths.RootWarning != "" {
 		app.AppLog.AppendLine("警告: " + paths.RootWarning)
 	}
-
-	// 启动时生成一次配置，保证 Dashboard 有配置状态可展示。
 	if err := app.GenerateConfig(context.Background()); err != nil {
-		// err 已带「生成配置失败:」前缀（application.generateConfig），不再叠加。
-		// 首次安装尚无节点时这里会记录 onboarding 引导，配置状态保持「未生成」。
 		app.AppLog.AppendLine(err.Error())
 	}
-
-	// 订阅自动更新（间隔为 0 时立即返回）。
 	autoCtx, cancelAuto := context.WithCancel(context.Background())
 	autoDone := make(chan struct{})
 	go func() {
 		defer close(autoDone)
 		app.StartAutoUpdate(autoCtx)
 	}()
-
-	program := tea.NewProgram(tui.NewRoot(app), tea.WithAltScreen())
-	if _, err := program.Run(); err != nil {
+	defer func() {
 		cancelAuto()
 		<-autoDone
-		fmt.Fprintln(os.Stderr, "TUI 运行失败:", err)
-		os.Exit(1)
+	}()
+	if err := run(app); err != nil {
+		return fmt.Errorf("TUI 运行失败: %w", err)
 	}
-	// 先停止并等待自动更新循环，确保它不再访问 DB，再由 defer 关闭应用。
-	cancelAuto()
-	<-autoDone
+	return nil
 }
