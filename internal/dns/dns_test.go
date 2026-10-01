@@ -69,11 +69,20 @@ func TestEnsureDefaultDNSRoutesRemoteThroughAutoGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var remote *config.DNSServer
+	var local, remote *config.DNSServer
 	for _, s := range servers {
-		if s.Tag == "remote" {
+		switch s.Tag {
+		case "local":
+			local = s
+		case "remote":
 			remote = s
 		}
+	}
+	if local == nil {
+		t.Fatal("默认 DNS 缺少 local")
+	}
+	if local.Type != "udp" || local.Address != "114.114.114.114" {
+		t.Fatalf("默认 local 类型/地址不符: %+v", local)
 	}
 	if remote == nil {
 		t.Fatal("默认 DNS 缺少 remote")
