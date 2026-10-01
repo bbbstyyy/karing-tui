@@ -1,0 +1,40 @@
+name: Stability
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive reviewed source
+        run: git archive --format=tar.gz -o "$RUNNER_TEMP/review-source.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: review-source
+          path: ${{ runner.temp }}/review-source.tar.gz
+          retention-days: 2
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Repeat lifecycle and concurrency tests
+        run: |
+          set -o pipefail
+          go test -race -count=5 -timeout=15m ./internal/core ./internal/headless ./internal/tui/... ./internal/clashapi ./internal/subscription ./internal/storage 2>&1 | tee stability.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stability-results
+          path: stability.log
+          if-no-files-found: ignore
+          retention-days: 7
