@@ -137,8 +137,11 @@ func (m *Manager) Start(ctx context.Context, configPath string) error {
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(runCtx, bin, "run", "-c", configPath, "-D", m.paths.Cache)
-	cmd.Stdout = io.MultiWriter(logFile, m.Output)
-	cmd.Stderr = io.MultiWriter(logFile, m.Output)
+	// Use the same sink for both streams. Disk failures must not stop the
+	// os/exec pipe reader or propagate SIGPIPE back into the running core.
+	output := NewLogWriter(logFile, m.Output)
+	cmd.Stdout = output
+	cmd.Stderr = output
 	setPgid(cmd)
 
 	exited := make(chan struct{})

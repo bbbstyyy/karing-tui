@@ -2,32 +2,35 @@ package core
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sync"
 )
 
-// 日志轮转默认参数：单文件上限与保留份数。
 const (
-	DefaultLogMaxBytes int64 = 5 << 20 // 5 MiB
+	DefaultLogMaxBytes int64 = 5 << 20
 	DefaultLogKeep           = 3
 )
 
-// RotateWriter 追加写日志文件，超过 maxBytes 后轮转：
-// name → name.1 → … → name.keep（超出保留份数的最旧文件被覆盖删除）。
+// RotateWriter bounds both the active file and its retained backups. A failed
+// rotation is reported and retried by the next Write; it never leaves a closed
+// descriptor masquerading as an open log file.
 type RotateWriter struct {
 	mu       sync.Mutex
 	path     string
 	maxBytes int64
 	keep     int
-
-	f    *os.File
-	size int64
+	f        *os.File
+	size     int64
+	closed   bool
 }
 
-// NewRotateWriter 打开（必要时创建）日志文件。
 func NewRotateWriter(path string, maxBytes int64, keep int) (*RotateWriter, error) {
 	if keep < 1 {
 		keep = 1
+	}
+	if maxBytes <= 0 {
+		maxBytes = DefaultLogMaxBytes
 	}
 	w := &RotateWriter{path: path, maxBytes: maxBytes, keep: keep}
 	if err := w.open(); err != nil {
@@ -50,37 +53,69 @@ func (w *RotateWriter) open() error {
 	return nil
 }
 
-// Write 实现 io.Writer；写入前超过大小上限则先轮转。
 func (w *RotateWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.f == nil {
-		return 0, fmt.Errorf("日志文件已关闭")
+	if w.closed {
+		return 0, fmt.Errorf("日志文件已关闭: %w", os.ErrClosed)
 	}
-	if w.size > 0 && w.size+int64(len(p)) > w.maxBytes {
-		if err := w.rotate(); err != nil {
+	if w.f == nil {
+		if err := w.open(); err != nil {
 			return 0, err
 		}
 	}
-	n, err := w.f.Write(p)
-	w.size += int64(n)
-	return n, err
+	written := 0
+	for len(p) > 0 {
+		if w.size > 0 && int64(len(p)) > w.maxBytes-w.size {
+			if err := w.rotate(); err != nil {
+				return written, err
+			}
+		}
+		// A single large Write must not bypass the per-file size limit.
+		chunk := int(min(int64(len(p)), w.maxBytes-w.size))
+		n, err := w.f.Write(p[:chunk])
+		w.size += int64(n)
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if n != chunk {
+			return written, io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return written, nil
 }
 
-// rotate 关闭当前文件并整体移位：.2→.3、.1→.2、name→.1，然后重新打开。
 func (w *RotateWriter) rotate() error {
-	w.f.Close()
-	for i := w.keep - 1; i >= 1; i-- {
-		_ = os.Rename(fmt.Sprintf("%s.%d", w.path, i), fmt.Sprintf("%s.%d", w.path, i+1))
+	if w.f != nil {
+		err := w.f.Close()
+		w.f = nil
+		if err != nil {
+			return err
+		}
 	}
-	_ = os.Rename(w.path, w.path+".1")
+	for i := w.keep - 1; i >= 1; i-- {
+		source := fmt.Sprintf("%s.%d", w.path, i)
+		if _, err := os.Lstat(source); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		if err := os.Rename(source, fmt.Sprintf("%s.%d", w.path, i+1)); err != nil {
+			return fmt.Errorf("轮转日志失败: %w", err)
+		}
+	}
+	if err := os.Rename(w.path, w.path+".1"); err != nil {
+		return fmt.Errorf("轮转日志失败: %w", err)
+	}
 	return w.open()
 }
 
-// Close 关闭当前日志文件。
 func (w *RotateWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.closed = true
 	if w.f == nil {
 		return nil
 	}
