@@ -25,8 +25,8 @@ type ProxyInfo struct {
 // Connections 流量与连接快照。
 type Connections struct {
 	UploadTotal   int64 // 进程启动以来累计上行字节
-	DownloadTotal int64 // 进程启动以来累计下行字节
-	Count         int   // 当前活跃连接数
+	DownloadTotal int64
+	Count         int // 当前活跃连接数
 }
 
 // Connection 是 Clash API /connections 的稳定子集，便于 headless 诊断脚本使用。
@@ -168,6 +168,11 @@ func (c *Client) GroupDelay(ctx context.Context, group, testURL string, timeoutM
 	var out map[string]int64
 	if err := c.get(ctx, "/group/"+url.PathEscape(group)+"/delay?"+q.Encode(), &out); err != nil {
 		return nil, err
+	}
+	// sing-box 对普通代理组会把每个超时/失败成员从结果里省略；
+	// 因此“HTTP 200 + 空对象”表示本轮没有任何成功延迟，不是测速成功。
+	if len(out) == 0 {
+		return nil, fmt.Errorf("代理组 %q 测速无成功结果（节点超时或不可用）", group)
 	}
 	return out, nil
 }
