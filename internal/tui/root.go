@@ -19,30 +19,13 @@ type pageMsg struct {
 	Msg  tea.Msg
 }
 
-// 下面两条消息替换了原先每 200ms 自我续期的全局 frame tick。旧实现无论
-// 状态是否变化都会走一遍 Update → View，空闲态约 8 次/秒（叠加 Dashboard
-// 与 Logs 各自的 timer），并且每次都重渲当前可见页。新实现只由状态驱动：
-//
-//	spinnerMsg   — 仅当有任务在跑时按 200ms 续期，驱动进度计数与 spinner；
-//	transientMsg — 仅当仍有过期倒计时中的瞬时文案时唤醒一次，用于收尾重绘。
-//
-// 两者都不再无条件续期：没有任务、也没有待过期文案时，Root 不持有任何定时器。
-
-// spinnerMsg 是任务进行中的进度重绘节拍。
+// Root owns at most one pending spinner and one pending expiry timer.
+// A pending flag is cleared only when that timer's message arrives: tea.Tick
+// cannot be cancelled just because a task or its visible feedback has ended.
 type spinnerMsg struct{}
-
-// transientMsg 是展示窗口到期后的收尾重绘。
 type transientMsg struct{}
 
-// spinnerInterval 与旧的 frame tick 保持一致的节拍，使任务进行中的
-// 进度显示（spinner 帧、N/M 计数）与改动前完全同步。
 const spinnerInterval = 200 * time.Millisecond
-
-// transientWindow 是页面瞬时文案的展示上限（notice / 成功结果 / 操作反馈）。
-//
-// Root 在 Update 阶段看不到新开的窗口：反馈窗口要等页面的 View 渲染时
-// 才由 feedback() 记录起点。因此这里按上限保守地排一次收尾重绘；到期时
-// 若窗口仍未结束（通常是几毫秒的渲染延迟），会按实际剩余时间再续一次。
 const transientWindow = 8 * time.Second
 
 func spinnerCmd() tea.Cmd {
@@ -65,13 +48,9 @@ type RootModel struct {
 	showActions            bool
 	actions                []pages.Action
 	actionList             components.SimpleList
-	// spinner 标记任务进度节拍是否在途，refreshing 标记收尾重绘是否在途。
-	// 二者的唯一作用是防止同一种唤醒被重复排定（例如一次按键与一次在途
-	// 定时器叠加，会把节拍翻倍）。
-	spinner    bool
-	refreshing bool
-	// pageTouched 记录本次消息是否真的进了页面，用于决定要不要排收尾重绘。
-	pageTouched bool
+	spinner                bool
+	refreshing             bool
+	pageTouched            bool
 }
 
 func NewRoot(app *application.App) RootModel {
@@ -112,42 +91,39 @@ func (m RootModel) Init() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// Update 是对 update 的薄包装：合并本次需要排定的唤醒命令。
-//
-// 只有「消息确实进了某个页面」（见 touch）时才排一次收尾重绘：覆盖层
-// （帮助/确认/操作菜单）自己消费按键，不会开启页面展示窗口，因此不排期。
-// 这同时让 Update 保持「返回 nil 命令 = 什么都没做」的既有语义。
 func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	next, cmd := m.update(msg)
 	switch msg.(type) {
 	case spinnerMsg:
-		// 本次节拍已到达，交给下面的 wakeup 按任务状态决定是否续期。
 		next.spinner = false
 	case transientMsg:
 		next.refreshing = false
+	}
+	if next.quitting {
+		return next, cmd
+	}
+
+	wake, spinner, refreshing := next.wakeup()
+	next.spinner, next.refreshing = spinner, refreshing
+	// Some feedback windows are first established by the following View.
+	// Reserve one conservative cleanup timer only when no expiry is pending.
+	// Internal wakeups and resizing do not open a feedback window.
+	switch msg.(type) {
+	case spinnerMsg, transientMsg, tea.WindowSizeMsg:
 	default:
-		// 页面可能刚刚开启一个展示窗口，但 Root 在 Update 阶段还看不到它
-		// （反馈窗口要等页面 View 时才开始计时），因此按窗口上限保守排一次。
 		if next.pageTouched && !next.refreshing {
 			next.refreshing = true
-			cmd = tea.Batch(cmd, transientCmd(transientWindow))
+			wake = tea.Batch(wake, transientCmd(transientWindow))
 		}
 	}
 	next.pageTouched = false
-	wake, spinner, refreshing := next.wakeup()
-	next.spinner, next.refreshing = spinner, refreshing
 	return next, tea.Batch(cmd, wake)
 }
 
-// touch 记录本次消息确实进入了页面。收尾重绘只在这种情况下才排定，
-// 见 Update 的说明。
 func (m *RootModel) touch() { m.pageTouched = true }
 
-// switchTo 把可见页切到 idx：先向旧页发 DeactivateMsg（带 timer 的页面据此
-// 停止续期），再向新页发 ActivateMsg（页面据此刷新数据并启动新一代 tick）。
-//
-// 所有切页入口都必须走这里——快捷键、NavigateMsg 与后续新增的入口；
-// 只发 ActivateMsg 会让旧页的 timer 继续在后台空转。
+// switchTo deactivates the old page before activating the new page, so hidden
+// pages cannot keep renewing their polling timers.
 func (m *RootModel) switchTo(idx int) tea.Cmd {
 	if idx < 0 || idx >= len(m.pages) {
 		return nil
@@ -165,28 +141,26 @@ func (m *RootModel) switchTo(idx int) tea.Cmd {
 	return tea.Batch(stop, start)
 }
 
-// wakeup 按当前状态决定是否排定一个一次性唤醒。三个布尔返回值的含义：
-// 唤醒命令、spinner 定时器是否在途、收尾重绘是否在途。
+// wakeup schedules missing timers without forgetting timers already in flight.
+// Spinner and expiry ownership are independent: task completion must not clear
+// an outstanding spinner, and repeated page messages must not duplicate expiry.
 func (m RootModel) wakeup() (tea.Cmd, bool, bool) {
-	if m.taskRunning() {
-		// 任务进行中：进度计数与 spinner 需要持续重绘（与改动前同节拍）。
-		if m.spinner {
-			return nil, true, m.refreshing
+	spinner, refreshing := m.spinner, m.refreshing
+	var cmds []tea.Cmd
+	if m.taskRunning() && !spinner {
+		cmds = append(cmds, spinnerCmd())
+		spinner = true
+	}
+	if !refreshing {
+		if d, ok := m.deadline(); ok {
+			cmds = append(cmds, transientCmd(time.Until(d)))
+			refreshing = true
 		}
-		return spinnerCmd(), true, m.refreshing
 	}
-	if !m.refreshing {
-		return nil, false, false
-	}
-	d, ok := m.deadline()
-	if !ok {
-		return nil, false, false
-	}
-	return transientCmd(time.Until(d)), false, true
+	return tea.Batch(cmds...), spinner, refreshing
 }
 
-// taskRunning 报告是否有任意页面正在执行任务。Root 的底部任务行与各页
-// 的进度文案都要靠它决定是否需要 spinner 节拍，因此检查全部页面而不只是当前页。
+// taskRunning checks all pages, including background tasks on hidden pages.
 func (m RootModel) taskRunning() bool {
 	for _, p := range m.pages {
 		if task, ok := p.(interface{ TaskStatus() (bool, string) }); ok {
@@ -198,7 +172,6 @@ func (m RootModel) taskRunning() bool {
 	return false
 }
 
-// deadline 返回最早仍会到期的展示窗口；没有任何窗口待过期时 ok 为 false。
 func (m RootModel) deadline() (time.Time, bool) {
 	now := time.Now()
 	var best time.Time
@@ -222,11 +195,14 @@ func (m RootModel) deadline() (time.Time, bool) {
 }
 
 func (m RootModel) update(msg tea.Msg) (RootModel, tea.Cmd) {
-	if _, ok := msg.(transientMsg); ok {
-		// 收尾重绘到达时顺手清掉已过期的通知，避免它一直占用底部行。
+	switch msg.(type) {
+	case spinnerMsg:
+		return m, nil
+	case transientMsg:
 		if m.notice != "" && !time.Now().Before(m.noticeUntil) {
 			m.notice = ""
 		}
+		return m, nil
 	}
 	if nav, ok := msg.(pages.NavigateMsg); ok {
 		return m, route(max(0, min(nav.Page, len(m.pages)-1)), m.switchTo(nav.Page))
