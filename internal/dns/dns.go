@@ -72,7 +72,7 @@ func (m *Manager) EnsureDefaultDNS() error {
 		if len(servers) > 0 {
 			return nil
 		}
-		local := &config.DNSServer{Tag: "local", Type: "udp", Address: "223.5.5.5", Enabled: true, Position: 0}
+		local := &config.DNSServer{Tag: "local", Type: "udp", Address: "114.114.114.114", Enabled: true, Position: 0}
 		if err := m.DB.CreateDNSServerTx(tx, local); err != nil {
 			return err
 		}
