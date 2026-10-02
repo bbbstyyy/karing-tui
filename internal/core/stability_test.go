@@ -13,7 +13,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf8"
 )
 
 type failingLogDisk struct {
@@ -174,30 +173,38 @@ exit 1
 	}
 }
 
-func TestLogBufStabilityBoundedRecords(t *testing.T) {
+func TestLogBufStabilityPreservesWholeRecords(t *testing.T) {
 	buf := NewLogBuf(8)
-	long := strings.Repeat("\u4e2d", MaxLogLineBytes)
-	for i := 0; i < 128; i++ {
+	long := strings.Repeat("中", retainedLogBytesPerLine)
+	for i := 0; i < 4; i++ {
 		buf.AppendLine(long)
 	}
 	first, version, snapshot := buf.Snapshot()
-	if first != 120 || version != 128 || len(snapshot) != 8 {
-		t.Fatalf("unstable line identities: %d, %d, %d", first, version, len(snapshot))
+	if first != 2 || version != 4 || len(snapshot) != 2 {
+		t.Fatalf("soft byte budget did not rotate whole records: %d, %d, %d", first, version, len(snapshot))
 	}
 	for _, line := range snapshot {
-		if len(line) > MaxLogLineBytes || !utf8.ValidString(line) || !strings.HasSuffix(line, " [truncated]") {
-			t.Fatal("oversized log was not bounded at a UTF-8 boundary")
+		if line != long {
+			t.Fatal("long log record was modified instead of rotated whole")
 		}
 	}
-	for i := 0; i < 1000; i++ {
-		buf.AppendLine("new record")
+	huge := strings.Repeat("x", buf.maxBytes+1024)
+	buf.AppendLine(huge)
+	if got := buf.Tail(1); len(got) != 1 || got[0] != huge {
+		t.Fatal("record larger than the soft byte target was truncated")
 	}
-	if !strings.HasSuffix(snapshot[0], " [truncated]") {
-		t.Fatal("a previously returned snapshot changed after buffer rollover")
+	buf.AppendLine("next")
+	if got := buf.Tail(0); len(got) != 1 || got[0] != "next" || buf.retainedBytes > buf.maxBytes {
+		t.Fatal("oversized record was not rotated out by the next record")
 	}
-	buf.AppendLine("https://user:password@example.com/secret?token=private " + long)
-	if strings.Contains(buf.Tail(1)[0], "password") || strings.Contains(buf.Tail(1)[0], "private") {
-		t.Fatal("truncation bypassed credential redaction")
+	secret := "https://user:password@example.com/secret?token=private " + strings.Repeat("z", retainedLogBytesPerLine+1024)
+	buf.AppendLine(secret)
+	got := buf.Tail(1)[0]
+	if strings.Contains(got, "password") || strings.Contains(got, "private") {
+		t.Fatal("whole-record retention bypassed credential redaction")
+	}
+	if !strings.HasSuffix(got, strings.Repeat("z", 64)) {
+		t.Fatal("redacted long record was truncated")
 	}
 }
 

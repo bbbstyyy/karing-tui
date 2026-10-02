@@ -2,31 +2,34 @@ package core
 
 import (
 	"bytes"
-	"strings"
 	"sync"
-	"unicode/utf8"
 
 	"github.com/bbbstyyy/karing-tui/internal/redact"
 )
 
-// MaxLogLineBytes bounds retained memory as well as the number of lines.
-// Oversized records are still written in full to the rotating disk log.
-const MaxLogLineBytes = 16 << 10
+// Keep the ordinary recent-log payload near the previous 16 KiB-per-line bound
+// without changing a log record's contents. Oversized individual records are
+// preserved whole; later records rotate them out instead of truncating them.
+const retainedLogBytesPerLine = 16 << 10
 
-// LogBuf is a thread-safe, bounded recent-log buffer.
+// LogBuf is a thread-safe recent-log buffer bounded by both record count and a
+// soft total-byte target. A single record may exceed that target because records
+// are never shortened.
 type LogBuf struct {
-	mu      sync.Mutex
-	lines   []string
-	max     int
-	drop    int
-	version uint64
+	mu            sync.Mutex
+	lines         []string
+	max           int
+	maxBytes      int
+	retainedBytes int
+	drop          int
+	version       uint64
 }
 
 func NewLogBuf(max int) *LogBuf {
 	if max <= 0 {
 		max = 500
 	}
-	return &LogBuf{max: max}
+	return &LogBuf{max: max, maxBytes: max * retainedLogBytesPerLine}
 }
 
 // Write avoids allocating a split slice proportional to the incoming payload.
@@ -49,26 +52,22 @@ func (b *LogBuf) Write(p []byte) (int, error) {
 }
 
 func (b *LogBuf) AppendLine(line string) {
-	// Redact before truncation so a cut credential cannot escape redaction.
 	line = redact.Text(line)
-	if len(line) > MaxLogLineBytes {
-		const suffix = " [truncated]"
-		end := MaxLogLineBytes - len(suffix)
-		for end > 0 && !utf8.RuneStart(line[end]) {
-			end--
-		}
-		line = line[:end] + suffix
-	}
-	// Do not retain a large backing string through a short substring.
-	line = strings.Clone(line)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.lines) >= b.max {
+
+	lineBytes := len(line)
+	// Rotate whole records only. This keeps ordinary long-running memory bounded
+	// while ensuring a long diagnostic record is never silently shortened.
+	for len(b.lines) > 0 &&
+		(len(b.lines) >= b.max || b.retainedBytes+lineBytes > b.maxBytes) {
+		b.retainedBytes -= len(b.lines[0])
 		b.lines[0] = ""
 		b.lines = b.lines[1:]
 		b.drop++
 	}
 	b.lines = append(b.lines, line)
+	b.retainedBytes += lineBytes
 	b.version++
 }
 
