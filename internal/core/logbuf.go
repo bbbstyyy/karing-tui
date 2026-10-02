@@ -1,74 +1,90 @@
 package core
 
 import (
-	"github.com/bbbstyyy/karing-tui/internal/redact"
-	"strings"
+	"bytes"
 	"sync"
+
+	"github.com/bbbstyyy/karing-tui/internal/redact"
 )
 
-// LogBuf 是线程安全的定长日志环形缓冲，供 TUI 实时查看最近日志。
+// Keep the ordinary recent-log payload near the previous 16 KiB-per-line bound
+// without changing a log record's contents. Oversized individual records are
+// preserved whole; later records rotate them out instead of truncating them.
+const retainedLogBytesPerLine = 16 << 10
+
+// LogBuf is a thread-safe recent-log buffer bounded by both record count and a
+// soft total-byte target. A single record may exceed that target because records
+// are never shortened.
 type LogBuf struct {
-	mu      sync.Mutex
-	lines   []string
-	max     int
-	drop    int    // 因缓冲满而丢弃的总行数（即 Snapshot 的绝对行号基准）
-	version uint64 // 单调递增写入计数：每次 AppendLine 自增（含回绕挤掉的写入）
+	mu            sync.Mutex
+	lines         []string
+	max           int
+	maxBytes      int
+	retainedBytes int
+	drop          int
+	version       uint64
 }
 
-// NewLogBuf 创建容量为 max 行的日志缓冲。
 func NewLogBuf(max int) *LogBuf {
 	if max <= 0 {
 		max = 500
 	}
-	return &LogBuf{max: max}
+	return &LogBuf{max: max, maxBytes: max * retainedLogBytesPerLine}
 }
 
-// Write 实现 io.Writer，按行拆分写入（用于挂接进程输出）。
+// Write avoids allocating a split slice proportional to the incoming payload.
 func (b *LogBuf) Write(p []byte) (int, error) {
-	for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
-		if line != "" {
-			b.AppendLine(line)
+	n := len(p)
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		if i < 0 {
+			i = len(p)
 		}
+		if i > 0 {
+			b.AppendLine(string(p[:i]))
+		}
+		if i == len(p) {
+			break
+		}
+		p = p[i+1:]
 	}
-	return len(p), nil
+	return n, nil
 }
 
-// AppendLine 追加一行日志。
 func (b *LogBuf) AppendLine(line string) {
 	line = redact.Text(line)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.lines) >= b.max {
+
+	lineBytes := len(line)
+	// Rotate whole records only. This keeps ordinary long-running memory bounded
+	// while ensuring a long diagnostic record is never silently shortened.
+	for len(b.lines) > 0 &&
+		(len(b.lines) >= b.max || b.retainedBytes+lineBytes > b.maxBytes) {
+		b.retainedBytes -= len(b.lines[0])
+		b.lines[0] = ""
 		b.lines = b.lines[1:]
 		b.drop++
 	}
 	b.lines = append(b.lines, line)
+	b.retainedBytes += lineBytes
 	b.version++
 }
 
-// Snapshot returns absolute line identities, content, and a monotonically
-// increasing write counter under the same lock. Anchors remain stable when new
-// lines arrive or the ring buffer wraps.
-//
-// version 在每次 AppendLine 后自增（回绕那次写入同样自增，drop 另计）：
-// 调用方（logs 页）用它做增量缓存的失效键——C11 之前 drop 只在回绕时变化，
-// 无法表达「有新行写入」，非回绕的追加会被误判为「无变化」。
+// Snapshot returns stable absolute line identities and a write counter under
+// the same lock; its returned slice is independent of future writes.
 func (b *LogBuf) Snapshot() (first int, version uint64, lines []string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.drop, b.version, append([]string(nil), b.lines...)
 }
 
-// Version 返回当前写入计数。供调用方做增量缓存的廉价预检（C11）：只读
-// 一个整数、不拷贝内容；内容本身以 Snapshot 为准（两次加锁之间可能又有
-// 写入，以 Snapshot 返回的 version 为权威值）。
 func (b *LogBuf) Version() uint64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.version
 }
 
-// Tail 返回最近 n 行日志；n <= 0 表示全部。
 func (b *LogBuf) Tail(n int) []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -80,7 +96,6 @@ func (b *LogBuf) Tail(n int) []string {
 	return out
 }
 
-// Dropped 返回被丢弃的行数（提示用户查看完整日志文件）。
 func (b *LogBuf) Dropped() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()

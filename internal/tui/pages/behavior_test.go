@@ -1137,6 +1137,46 @@ func TestLogsFilterMatchesReferenceImplementation(t *testing.T) {
 	}
 }
 
+func TestLogsWrapLongRecordsWithoutTruncation(t *testing.T) {
+	app := pageFixture(t)
+	app.AppLog = core.NewLogBuf(1000)
+	l := NewLogs(app)
+	l.SetSize(24, 8)
+	line := "\x1b[32mINFO\x1b[0m prefix " + strings.Repeat("0123456789", 30) + " TAIL"
+	app.AppLog.AppendLine(line)
+	l.Update(ActivateMsg{})
+	if len(l.cachedHits) != 1 {
+		t.Fatalf("expected one logical log record, got %d", len(l.cachedHits))
+	}
+	rows := l.wrapped(l.cachedHits[0])
+	if len(rows) <= l.visible() {
+		t.Fatal("fixture did not exceed one viewport")
+	}
+	var plainRows []string
+	for _, row := range rows {
+		plainRows = append(plainRows, ansi.Strip(row))
+		if components.DisplayWidth(row) > l.width {
+			t.Fatalf("wrapped row exceeds width %d: %q", l.width, row)
+		}
+	}
+	if got, want := strings.Join(plainRows, ""), ansi.Strip(line); got != want {
+		t.Fatalf("wrapped log lost content: got %q, want %q", got, want)
+	}
+
+	l.Update(tea.KeyMsg{Type: tea.KeyHome})
+	if pos := l.positions[0]; pos.anchor != l.cachedHits[0].id || pos.row != 0 || pos.following {
+		t.Fatalf("Home did not move to the first wrapped row: %+v", pos)
+	}
+	l.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	if pos := l.positions[0]; pos.anchor != l.cachedHits[0].id || pos.row == 0 || pos.following {
+		t.Fatalf("PgDown did not scroll inside the long record: %+v", pos)
+	}
+	l.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	if view := ansi.Strip(l.View()); !strings.Contains(view, "TAIL") {
+		t.Fatalf("following view did not show the end of the wrapped log:\n%s", view)
+	}
+}
+
 // C11：锚点被轮转挤出缓冲时，钳制与「更早日志已轮转」提示必须发生在
 // Update 侧（refresh），View 只读状态——旧行为在 View 里改写锚点，
 // 同一状态两次渲染字节不同；双渲染字节一致即证明副作用已移出 View。

@@ -1,0 +1,41 @@
+name: Stability
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preserve the tested source
+        run: git archive --format=tar.gz -o review-source.tar.gz HEAD
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Repeat deterministic stress and subprocess fault injection
+        run: |
+          set -o pipefail
+          go test -race -count=3 -timeout=5m -run Stability ./cmd/karing ./internal/core ./internal/tui ./internal/clashapi 2>&1 | tee stability-focused.log
+      - name: Repeat lifecycle and concurrency integration tests
+        run: |
+          set -o pipefail
+          go test -race -count=3 -timeout=15m ./... 2>&1 | tee stability-all.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stability-results
+          path: |
+            stability-*.log
+            review-source.tar.gz
+          if-no-files-found: ignore
+          retention-days: 7

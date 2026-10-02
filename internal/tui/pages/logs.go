@@ -18,6 +18,7 @@ import (
 
 type logPosition struct {
 	anchor    int
+	row       int
 	following bool
 	// rotated 表示锚点行已被轮转挤出缓冲、锚点被钳到最旧行。C11 起由
 	// refresh 在 Update 侧维护，View 只读它显示「更早日志已轮转」；导航、
@@ -35,7 +36,6 @@ type LogsPage struct {
 	base
 	source                      int
 	positions                   [2]logPosition
-	horizontal                  int
 	query, previousQuery, level string
 	search                      textinput.Model
 	typing                      bool
@@ -132,36 +132,33 @@ func (l *LogsPage) handleMsg(msg tea.Msg) tea.Cmd {
 		case "f":
 			l.level = nextCycle([]string{"", "debug", "info", "warn", "error"}, l.level)
 			l.positions[l.source].rotated = false
-		case "alt+left":
-			l.horizontal = max(0, l.horizontal-10)
-		case "alt+right":
-			l.horizontal += 10
 		case "G", "end":
 			l.positions[l.source].following = true
+			l.positions[l.source].row = 0
 			l.positions[l.source].rotated = false
 		case "up", "k", "down", "j", "pgup", "pgdown", "home", "g":
 			hits := l.hits()
 			if len(hits) == 0 {
 				return nil
 			}
-			pos := &l.positions[l.source]
-			index := l.topIndex(hits)
+			if key == "home" || key == "g" {
+				pos := &l.positions[l.source]
+				pos.anchor = hits[0].id
+				pos.row = 0
+				pos.following = false
+				pos.rotated = false
+				break
+			}
+			delta := 1
 			switch key {
 			case "up", "k":
-				index--
-			case "down", "j":
-				index++
+				delta = -1
 			case "pgup":
-				index -= l.visible()
+				delta = -l.visible()
 			case "pgdown":
-				index += l.visible()
-			case "home", "g":
-				index = 0
+				delta = l.visible()
 			}
-			index = max(0, min(index, max(0, len(hits)-l.visible())))
-			pos.anchor = hits[index].id
-			pos.following = false
-			pos.rotated = false
+			l.movePosition(hits, delta)
 		}
 	default:
 		if l.typing {
@@ -220,19 +217,22 @@ func (l *LogsPage) refresh() {
 	}
 
 	queryLower := strings.ToLower(l.query)
+	filtering := l.query != "" || l.level != ""
 	var hits []logLine
 	for i, line := range lines {
 		id := first + i
-		p, ok := plain[id]
-		if !ok {
-			p = strings.ToLower(ansi.Strip(line))
-			plain[id] = p
-		}
-		if l.query != "" && !strings.Contains(p, queryLower) {
-			continue
-		}
-		if l.level != "" && !strings.Contains(p, l.level) {
-			continue
+		if filtering {
+			p, ok := plain[id]
+			if !ok {
+				p = strings.ToLower(ansi.Strip(line))
+				plain[id] = p
+			}
+			if l.query != "" && !strings.Contains(p, queryLower) {
+				continue
+			}
+			if l.level != "" && !strings.Contains(p, l.level) {
+				continue
+			}
 		}
 		hits = append(hits, logLine{id: id, text: line})
 	}
@@ -243,25 +243,109 @@ func (l *LogsPage) refresh() {
 	pos := &l.positions[l.source]
 	if len(hits) > 0 && !pos.following && pos.anchor < hits[0].id {
 		pos.anchor = hits[0].id
+		pos.row = 0
 		pos.rotated = true
 	}
 }
 
-func (l *LogsPage) topIndex(hits []logLine) int {
+func (l *LogsPage) wrapped(hit logLine) []string {
+	return strings.Split(components.Wrap(hit.text, max(1, l.width)), "\n")
+}
+
+func (l *LogsPage) tailPosition(hits []logLine) (int, int) {
+	remaining := l.visible()
+	for i := len(hits) - 1; i >= 0; i-- {
+		rows := l.wrapped(hits[i])
+		if len(rows) >= remaining {
+			return i, len(rows) - remaining
+		}
+		remaining -= len(rows)
+	}
+	return 0, 0
+}
+
+func (l *LogsPage) topPosition(hits []logLine) (int, int) {
+	if len(hits) == 0 {
+		return 0, 0
+	}
 	pos := l.positions[l.source]
 	if pos.following {
-		return max(0, len(hits)-l.visible())
+		return l.tailPosition(hits)
 	}
-	// hits 按 id 升序（构造保证）：二分定位第一个 id >= 锚点的行。
-	// 原实现线性扫描整个结果集，每次按键和每帧渲染都扫一遍。
-	// 锚点被查询/级别过滤出结果集时（idx 落到末尾），与旧行为一致贴底。
-	idx, _ := slices.BinarySearchFunc(hits, pos.anchor, func(h logLine, target int) int {
+	idx, found := slices.BinarySearchFunc(hits, pos.anchor, func(h logLine, target int) int {
 		return cmp.Compare(h.id, target)
 	})
-	if idx < len(hits) {
-		return idx
+	if idx >= len(hits) {
+		return l.tailPosition(hits)
 	}
-	return max(0, len(hits)-l.visible())
+	if !found {
+		return idx, 0
+	}
+	rows := l.wrapped(hits[idx])
+	return idx, max(0, min(pos.row, len(rows)-1))
+}
+
+func (l *LogsPage) movePosition(hits []logLine, delta int) {
+	if len(hits) == 0 {
+		return
+	}
+	idx, row := l.topPosition(hits)
+	for delta < 0 {
+		if row > 0 {
+			step := min(row, -delta)
+			row -= step
+			delta += step
+			continue
+		}
+		if idx == 0 {
+			break
+		}
+		idx--
+		row = len(l.wrapped(hits[idx])) - 1
+		delta++
+	}
+	for delta > 0 {
+		rows := l.wrapped(hits[idx])
+		if row+1 < len(rows) {
+			step := min(delta, len(rows)-1-row)
+			row += step
+			delta -= step
+			continue
+		}
+		if idx+1 >= len(hits) {
+			break
+		}
+		idx++
+		row = 0
+		delta--
+	}
+	tailIdx, tailRow := l.tailPosition(hits)
+	if idx > tailIdx || (idx == tailIdx && row > tailRow) {
+		idx, row = tailIdx, tailRow
+	}
+	pos := &l.positions[l.source]
+	pos.anchor = hits[idx].id
+	pos.row = row
+	pos.following = false
+	pos.rotated = false
+}
+
+func (l *LogsPage) renderWindow(hits []logLine) []string {
+	if len(hits) == 0 {
+		return nil
+	}
+	idx, row := l.topPosition(hits)
+	out := make([]string, 0, l.visible())
+	for idx < len(hits) && len(out) < l.visible() {
+		rows := l.wrapped(hits[idx])
+		if row < len(rows) {
+			end := min(len(rows), row+l.visible()-len(out))
+			out = append(out, rows[row:end]...)
+		}
+		idx++
+		row = 0
+	}
+	return out
 }
 
 func (l *LogsPage) View() string {
@@ -285,16 +369,11 @@ func (l *LogsPage) View() string {
 	hits := l.cachedHits
 	body := "暂无匹配日志；c 清除过滤。"
 	if len(hits) > 0 {
-		start := l.topIndex(hits)
-		var lines []string
-		for _, hit := range hits[start:min(len(hits), start+l.visible())] {
-			lines = append(lines, ansi.Cut(hit.text, l.horizontal, l.horizontal+max(1, l.width)))
-		}
-		body = strings.Join(lines, "\n")
+		body = strings.Join(l.renderWindow(hits), "\n")
 		if !pos.following && pos.rotated {
 			head += " · 更早日志已轮转"
 		}
 	}
-	footer := "[/] 来源 · ↑/↓ PgUp/PgDn 回看 · Home 最早 · End/G 跟随\n/ 搜索 · f 级别 · c 清除 · Alt+←/→ 查看长行"
+	footer := "[/] 来源 · ↑/↓ PgUp/PgDn 回看 · Home 最早 · End/G 跟随\n/ 搜索 · f 级别 · c 清除 · 长日志自动换行"
 	return components.Clip(styles.Title.Render(head), l.width) + "\n" + components.Fit(body, l.width, l.visible()) + "\n" + styles.Dim.Render(footer)
 }
