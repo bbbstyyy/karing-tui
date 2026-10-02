@@ -1,0 +1,100 @@
+name: Release v0.8.0
+
+on:
+  push:
+    branches:
+      - release/v0.8.0
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-v0.8.0
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, integrate and publish v0.8.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VERSION: v0.8.0
+      TARGET_SHA: bf8970284933a4e4e015522215d6d0da2f3bcf64
+    steps:
+      - name: Checkout verified main commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Refuse duplicate release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo "$VERSION tag already exists" >&2
+            exit 1
+          fi
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$VERSION release already exists" >&2
+            exit 1
+          fi
+
+      - name: Build official release packages
+        run: ./scripts/build-release.sh "$VERSION"
+
+      - name: Validate package checksums
+        run: |
+          set -eu
+          cd "dist/karing-tui-$VERSION"
+          sha256sum -c checksums.txt
+
+      - name: Verify packaged core, config and real sing-box lifecycle
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/karing-release"
+          tar -xzf "dist/karing-tui-$VERSION/karing-tui-$VERSION-linux-amd64.tar.gz" -C "$RUNNER_TEMP/karing-release"
+          export KARING_HOME="$RUNNER_TEMP/karing-release-home"
+          "$RUNNER_TEMP/karing-release/karing" version
+          "$RUNNER_TEMP/karing-release/karing" backup export "$RUNNER_TEMP/karing-init-backup"
+          "$RUNNER_TEMP/karing-release/karing" status --json
+          test -x "$KARING_HOME/runtime/bin/sing-box"
+          if "$RUNNER_TEMP/karing-release/karing" config check; then
+            echo "无可用节点时 config check 不应成功" >&2
+            exit 1
+          fi
+          printf 'proxies:\n  - name: ci-node\n    type: trojan\n    server: 127.0.0.1\n    port: 443\n    password: ci-password\n' > "$RUNNER_TEMP/karing-ci-node.yaml"
+          "$RUNNER_TEMP/karing-release/karing" import clash "$RUNNER_TEMP/karing-ci-node.yaml"
+          "$RUNNER_TEMP/karing-release/karing" config check
+          SINGBOX_BIN="$KARING_HOME/runtime/bin/sing-box" go test -count=1 ./internal/core \
+            -run 'TestIntegrationRealSingBox|TestRealSingBoxDNSResolverCycle|TestRealSingBoxDNSBootstrapSafety' -v
+          SINGBOX_BIN="$KARING_HOME/runtime/bin/sing-box" go test -count=1 ./internal/proxy -run TestLatencyProbe -v
+
+      - name: Verify read-only failure leaves fresh home untouched
+        run: |
+          set -eu
+          export KARING_HOME="$RUNNER_TEMP/karing-fresh"
+          if "$RUNNER_TEMP/karing-release/karing" status --json; then
+            echo "未初始化时 status 不应成功" >&2
+            exit 1
+          fi
+          test ! -e "$KARING_HOME/karing.db"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create "$VERSION" \
+            dist/*/*.tar.gz \
+            dist/*/checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_SHA" \
+            --title "v0.8.0 长期运行稳定性与日志体验专项" \
+            --generate-notes \
+            --latest
