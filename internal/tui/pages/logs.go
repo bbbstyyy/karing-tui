@@ -217,19 +217,22 @@ func (l *LogsPage) refresh() {
 	}
 
 	queryLower := strings.ToLower(l.query)
+	filtering := l.query != "" || l.level != ""
 	var hits []logLine
 	for i, line := range lines {
 		id := first + i
-		p, ok := plain[id]
-		if !ok {
-			p = strings.ToLower(ansi.Strip(line))
-			plain[id] = p
-		}
-		if l.query != "" && !strings.Contains(p, queryLower) {
-			continue
-		}
-		if l.level != "" && !strings.Contains(p, l.level) {
-			continue
+		if filtering {
+			p, ok := plain[id]
+			if !ok {
+				p = strings.ToLower(ansi.Strip(line))
+				plain[id] = p
+			}
+			if l.query != "" && !strings.Contains(p, queryLower) {
+				continue
+			}
+			if l.level != "" && !strings.Contains(p, l.level) {
+				continue
+			}
 		}
 		hits = append(hits, logLine{id: id, text: line})
 	}
