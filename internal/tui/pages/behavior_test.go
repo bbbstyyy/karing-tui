@@ -1139,6 +1139,7 @@ func TestLogsFilterMatchesReferenceImplementation(t *testing.T) {
 
 func TestLogsWrapLongRecordsWithoutTruncation(t *testing.T) {
 	app := pageFixture(t)
+	app.AppLog = core.NewLogBuf(1000)
 	l := NewLogs(app)
 	l.SetSize(24, 8)
 	line := "\x1b[32mINFO\x1b[0m prefix " + strings.Repeat("0123456789", 30) + " TAIL"
