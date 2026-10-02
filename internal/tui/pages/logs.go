@@ -150,11 +150,12 @@ func (l *LogsPage) handleMsg(msg tea.Msg) tea.Cmd {
 				break
 			}
 			delta := 1
-			if key == "up" || key == "k" {
+			switch key {
+			case "up", "k":
 				delta = -1
-			} else if key == "pgup" {
+			case "pgup":
 				delta = -l.visible()
-			} else if key == "pgdown" {
+			case "pgdown":
 				delta = l.visible()
 			}
 			l.movePosition(hits, delta)
