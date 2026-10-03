@@ -245,3 +245,19 @@ func TestGlobalOverlayViewsStayInsideTerminal(t *testing.T) {
 		}
 	}
 }
+
+func TestActionMenuPageDownUsesOverlayViewport(t *testing.T) {
+	m, _ := rootFixture(t)
+	send(&m, tea.KeyMsg{Type: tea.KeyCtrlO})
+	if !m.showActions {
+		t.Fatal("Ctrl+O did not open action menu")
+	}
+	if m.actionList.Height <= 3 {
+		t.Fatalf("action list height was not initialized from terminal: %d", m.actionList.Height)
+	}
+	before := m.actionList.Cursor
+	send(&m, tea.KeyMsg{Type: tea.KeyPgDown})
+	if m.actionList.Cursor <= before+1 {
+		t.Fatalf("action PgDown moved only %d row(s); overlay viewport height was not used", m.actionList.Cursor-before)
+	}
+}
