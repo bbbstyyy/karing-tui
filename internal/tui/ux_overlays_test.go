@@ -271,3 +271,36 @@ func TestActionMenuPageDownUsesOverlayViewport(t *testing.T) {
 		t.Fatalf("action PgDown moved only %d row(s); overlay viewport height was not used", m.actionList.Cursor-before)
 	}
 }
+
+func TestSetupChecklistRespectsSubscriptionEnabledState(t *testing.T) {
+	m, app := rootFixture(t)
+	sub := &config.Subscription{Name: "fixture-sub", URL: "https://example.invalid/sub"}
+	if err := app.DB.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.DB.CreateNode(&config.Node{
+		SubscriptionID: sub.ID, Name: "sub-node", Protocol: "shadowsocks",
+		Server: "127.0.0.1", Port: 8388, Enabled: true,
+		Metadata: map[string]any{"method": "aes-128-gcm", "password": "pw"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sub.Enabled = false
+	if err := app.DB.UpdateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+
+	send(&m, pages.ActivateMsg{})
+	if view := ansi.Strip(m.View()); !strings.Contains(view, "[ ] 准备可用节点") {
+		t.Fatal("node from disabled subscription was incorrectly treated as usable")
+	}
+
+	sub.Enabled = true
+	if err := app.DB.UpdateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	send(&m, pages.ActivateMsg{})
+	if view := ansi.Strip(m.View()); !strings.Contains(view, "[x] 准备可用节点") {
+		t.Fatal("enabled subscription node was not recognized as usable")
+	}
+}
