@@ -168,3 +168,4 @@ SING_BOX_SOURCE="$PWD/sing-box" \
 Karing TUI 主项目以 **GPL-3.0-or-later** 发布：你可以按照 GNU GPL 第 3 版，或自行选择任何后续版本的条款使用、修改及分发。完整许可见 [LICENSE](LICENSE)。
 
 项目参考 [Karing](https://github.com/KaringX/karing) 的产品设计，使用 [sing-box](https://github.com/SagerNet/sing-box) 作为独立运行的代理核心。第三方资源保留各自版权与许可，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。本项目与 KaringX、SagerNet 无官方隶属关系。
+\n- `Ctrl+P`：全局命令面板，可搜索页面与操作\n- `Ctrl+T`：全局任务中心，查看后台任务与最近结果
