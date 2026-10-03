@@ -86,3 +86,18 @@ func TestRootFooterAdvertisesNewGlobalTools(t *testing.T) {
 		t.Fatal("footer does not advertise command palette and task center")
 	}
 }
+
+func TestGlobalOverlaysRenderWhenOpened(t *testing.T) {
+	m, _ := rootFixture(t)
+
+	send(&m, tea.KeyMsg{Type: tea.KeyCtrlP})
+	if view := m.View(); !strings.Contains(view, "命令面板") || !strings.Contains(view, "搜索页面或操作") {
+		t.Fatal("command palette state is open but overlay is not rendered")
+	}
+
+	send(&m, tea.KeyMsg{Type: tea.KeyEsc})
+	send(&m, tea.KeyMsg{Type: tea.KeyCtrlT})
+	if view := m.View(); !strings.Contains(view, "任务中心") || !strings.Contains(view, "所有页面的后台任务与最近结果") {
+		t.Fatal("task center state is open but overlay is not rendered")
+	}
+}
