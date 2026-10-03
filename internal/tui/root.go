@@ -425,6 +425,12 @@ func (m RootModel) View() string {
 		m.actionList.Width, m.actionList.Height = w-4, h-7
 		content = styles.HelpOverlay.Width(w - 2).Render("操作 · " + m.pages[m.current].Title() + "\n" + m.actionList.View("暂无操作") + "\nEnter 执行 · Esc 返回")
 	}
+	if m.showPalette {
+		content = m.paletteView(w, h)
+	}
+	if m.showTasks {
+		content = m.taskCenterView(w, h)
+	}
 	if m.confirm.Active {
 		m.confirm.Width, m.confirm.Height = w, h-3
 		content = m.confirm.View()
