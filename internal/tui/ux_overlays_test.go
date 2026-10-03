@@ -5,6 +5,10 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/bbbstyyy/karing-tui/internal/config"
+	"github.com/bbbstyyy/karing-tui/internal/tui/pages"
 )
 
 func TestCommandPaletteSearchesAcrossPagesAndExecutes(t *testing.T) {
@@ -99,5 +103,145 @@ func TestGlobalOverlaysRenderWhenOpened(t *testing.T) {
 	send(&m, tea.KeyMsg{Type: tea.KeyCtrlT})
 	if view := m.View(); !strings.Contains(view, "任务中心") || !strings.Contains(view, "所有页面的后台任务与最近结果") {
 		t.Fatal("task center state is open but overlay is not rendered")
+	}
+}
+
+func TestCommandPalettePageDownUsesOverlayViewport(t *testing.T) {
+	m, _ := rootFixture(t)
+	send(&m, tea.KeyMsg{Type: tea.KeyCtrlP})
+	if m.paletteList.Height <= 3 {
+		t.Fatalf("palette list height was not initialized from terminal: %d", m.paletteList.Height)
+	}
+	before := m.paletteList.Cursor
+	send(&m, tea.KeyMsg{Type: tea.KeyPgDown})
+	if m.paletteList.Cursor <= before+1 {
+		t.Fatalf("PgDown moved only %d row(s); overlay viewport height was not used", m.paletteList.Cursor-before)
+	}
+}
+
+func TestGlobalOverlaySizesFollowTerminalResize(t *testing.T) {
+	m, _ := rootFixture(t)
+	send(&m, tea.KeyMsg{Type: tea.KeyCtrlP})
+	oldListHeight := m.paletteList.Height
+	oldInputWidth := m.paletteInput.Width
+
+	send(&m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	if m.paletteList.Height <= oldListHeight {
+		t.Fatalf("palette height did not grow after resize: %d -> %d", oldListHeight, m.paletteList.Height)
+	}
+	if m.paletteInput.Width <= oldInputWidth {
+		t.Fatalf("palette input width did not grow after resize: %d -> %d", oldInputWidth, m.paletteInput.Width)
+	}
+
+	send(&m, tea.KeyMsg{Type: tea.KeyEsc})
+	send(&m, tea.KeyMsg{Type: tea.KeyCtrlT})
+	if m.taskList.Height != 32 {
+		t.Fatalf("task center height = %d, want 32 for 120x40 terminal", m.taskList.Height)
+	}
+}
+
+type taskLifecyclePage struct {
+	activations   int
+	deactivations int
+	active        bool
+}
+
+func (p *taskLifecyclePage) Title() string { return "task-life" }
+func (p *taskLifecyclePage) Init() tea.Cmd { return nil }
+func (p *taskLifecyclePage) View() string  { return "" }
+func (p *taskLifecyclePage) Editing() bool { return false }
+func (p *taskLifecyclePage) TaskStatus() (bool, string) {
+	return false, "最近任务"
+}
+func (p *taskLifecyclePage) Update(msg tea.Msg) (pages.Page, tea.Cmd) {
+	switch msg.(type) {
+	case pages.ActivateMsg:
+		p.activations++
+		p.active = true
+	case pages.DeactivateMsg:
+		p.deactivations++
+		p.active = false
+	}
+	return p, nil
+}
+
+func TestTaskCenterEnterOnCurrentPageDoesNotReactivate(t *testing.T) {
+	p := &taskLifecyclePage{}
+	m := RootModel{pages: []pages.Page{p}}
+	runCmds(t, &m, m.Init())
+	send(&m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	if p.activations != 1 {
+		t.Fatalf("initial activations = %d, want 1", p.activations)
+	}
+
+	send(&m, tea.KeyMsg{Type: tea.KeyCtrlT})
+	send(&m, tea.KeyMsg{Type: tea.KeyEnter})
+	if p.activations != 1 || p.deactivations != 0 {
+		t.Fatalf("same-page task navigation restarted lifecycle: activations=%d deactivations=%d", p.activations, p.deactivations)
+	}
+}
+
+func TestGlobalOverlaysDoNotStealFormInput(t *testing.T) {
+	m, _ := rootFixture(t)
+	send(&m, runeKey("2"))
+	send(&m, runeKey("a"))
+	if !m.pages[m.current].Editing() {
+		t.Fatal("fixture did not enter subscription form")
+	}
+
+	send(&m, tea.KeyMsg{Type: tea.KeyCtrlP})
+	send(&m, tea.KeyMsg{Type: tea.KeyCtrlT})
+	if m.showPalette || m.showTasks {
+		t.Fatal("global overlays opened while a form owned keyboard input")
+	}
+}
+
+func TestSetupChecklistRequiresEnabledUsableNode(t *testing.T) {
+	m, app := rootFixture(t)
+	if err := app.DB.CreateNode(&config.Node{
+		Name: "disabled", Protocol: "shadowsocks", Server: "127.0.0.1", Port: 8388,
+		Enabled: false, Metadata: map[string]any{"method": "aes-128-gcm", "password": "pw"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	send(&m, pages.ActivateMsg{})
+	view := ansi.Strip(m.View())
+	if !strings.Contains(view, "[ ] 准备可用节点") {
+		t.Fatal("disabled node was incorrectly treated as usable in setup checklist")
+	}
+
+	nodes, err := app.DB.ListNodes(0)
+	if err != nil || len(nodes) != 1 {
+		t.Fatalf("ListNodes: %v / %d", err, len(nodes))
+	}
+	nodes[0].Enabled = true
+	if err := app.DB.UpdateNode(nodes[0]); err != nil {
+		t.Fatal(err)
+	}
+	send(&m, pages.ActivateMsg{})
+	view = ansi.Strip(m.View())
+	if !strings.Contains(view, "[x] 准备可用节点") {
+		t.Fatal("enabled manual node was not recognized by setup checklist")
+	}
+}
+
+func TestGlobalOverlayViewsStayInsideTerminal(t *testing.T) {
+	m, _ := rootFixture(t)
+	for _, size := range [][2]int{{60, 18}, {80, 24}, {120, 30}} {
+		send(&m, tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		for _, key := range []tea.KeyType{tea.KeyCtrlP, tea.KeyCtrlT} {
+			send(&m, tea.KeyMsg{Type: key})
+			view := m.View()
+			lines := strings.Split(view, "\n")
+			if len(lines) != size[1] {
+				t.Fatalf("%dx%d overlay height = %d", size[0], size[1], len(lines))
+			}
+			for _, line := range lines {
+				if ansi.StringWidth(line) > size[0] {
+					t.Fatalf("%dx%d overlay exceeds width: %q", size[0], size[1], line)
+				}
+			}
+			send(&m, tea.KeyMsg{Type: tea.KeyEsc})
+		}
 	}
 }
