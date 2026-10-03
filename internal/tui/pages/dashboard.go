@@ -40,10 +40,6 @@ type Dashboard struct {
 	base
 	status          core.Status
 	lastErr         error // 最近一次操作错误
-	configGenerated bool
-	checkedAt       time.Time
-	checkErr        error
-
 	// 内部模型（未运行时展示持久化的组选择）
 	subs   []*config.Subscription
 	groups []*config.ProxyGroup
@@ -109,7 +105,6 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 		// Root delivers the single refresh chain even while another page is open.
 		d.reloadModel()
 		d.status = d.app.Core.Status()
-		d.configGenerated, d.checkedAt, d.checkErr = d.app.ConfigStatus()
 		return d, d.startTick(dashboardTickInterval)
 	case DeactivateMsg:
 		// 切走即停：请求自愈与测速超时都由激活中的 tick 驱动，
@@ -134,7 +129,6 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 		}
 		d.tickCount++
 		d.status = d.app.Core.Status()
-		d.configGenerated, d.checkedAt, d.checkErr = d.app.ConfigStatus()
 		if d.tickCount%5 == 1 { // 每 5 秒刷新订阅与组（本地 DB 查询）
 			d.reloadModel()
 		}
@@ -461,15 +455,31 @@ func (d *Dashboard) View() string {
 	return body + "\n" + d.details.View(detail, d.width, viewH) + "\n" + styles.Dim.Render(footer)
 }
 
+func (d *Dashboard) hasUsableNode() bool {
+	enabledSubs := make(map[int64]bool, len(d.subs))
+	for _, sub := range d.subs {
+		enabledSubs[sub.ID] = sub.Enabled
+	}
+	for _, node := range d.nodes {
+		if node == nil || !node.Enabled {
+			continue
+		}
+		if node.SubscriptionID == config.ManualSubscriptionID || enabledSubs[node.SubscriptionID] {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *Dashboard) setupChecklist() string {
 	type step struct {
 		done bool
 		text string
 		next string
 	}
-	hasNodes := len(d.nodes) > 0
+	hasNodes := d.hasUsableNode()
 	hasGroups := len(d.groups) > 0
-	configReady := d.configGenerated && d.checkErr == nil
+	configReady := d.app.ConfigReadyForApply()
 	running := d.status.State == core.StateRunning
 	steps := []step{
 		{hasNodes, "准备可用节点", "2 订阅与节点 → a 添加订阅，或 ] → i 导入节点"},
@@ -489,7 +499,7 @@ func (d *Dashboard) setupChecklist() string {
 		}
 		lines = append(lines, line)
 	}
-	if running {
+	if hasNodes && hasGroups && configReady && running {
 		lines = append(lines, "  已完成基础设置 · Ctrl+P 可搜索全部操作 · Ctrl+T 查看后台任务")
 	}
 	return strings.Join(lines, "\n")
