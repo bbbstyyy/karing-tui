@@ -187,4 +187,3 @@ func (m RootModel) taskCenterView(width, height int) string {
 		"\nEnter 前往来源页 · v 查看结果 · f 重试失败项 · Esc 关闭"
 	return styles.HelpOverlay.Width(width - 2).Render(body)
 }
-
