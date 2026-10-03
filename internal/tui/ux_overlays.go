@@ -189,4 +189,3 @@ func (m RootModel) taskCenterView(width, height int) string {
 	return styles.HelpOverlay.Width(width - 2).Render(body)
 }
 
-func _paletteTeaCmdCompatibility() tea.Cmd { return nil }
