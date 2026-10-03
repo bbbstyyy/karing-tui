@@ -7,7 +7,6 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/bbbstyyy/karing-tui/internal/tui/components"
 	"github.com/bbbstyyy/karing-tui/internal/tui/pages"
 	"github.com/bbbstyyy/karing-tui/internal/tui/styles"
 )
