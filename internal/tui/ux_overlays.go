@@ -28,13 +28,13 @@ func (m *RootModel) resizeGlobalOverlays() {
 		height = 24
 	}
 	contentWidth := max(1, width-1)
+	m.actionList.Width = max(1, contentWidth-4)
+	m.actionList.Height = max(3, height-7)
 	m.paletteList.Width = max(1, contentWidth-4)
 	m.paletteList.Height = max(3, height-9)
 	m.taskList.Width = max(1, contentWidth-4)
 	m.taskList.Height = max(3, height-8)
-	if m.paletteInput.Width >= 0 {
-		m.paletteInput.Width = max(1, contentWidth-6)
-	}
+	m.paletteInput.Width = max(1, contentWidth-6)
 }
 
 func (m *RootModel) openPalette() tea.Cmd {
