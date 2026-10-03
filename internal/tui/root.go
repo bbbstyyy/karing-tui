@@ -322,7 +322,7 @@ func (m RootModel) update(msg tea.Msg) (RootModel, tea.Cmd) {
 				m.openTaskCenter()
 				return m, nil
 			case keys.Menu:
-				m.openActionMenu(nil)
+				_ = m.openActionMenu(nil)
 				return m, nil
 			case keys.Help:
 				m.showHelp = true
