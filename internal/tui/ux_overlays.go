@@ -165,11 +165,8 @@ func (m *RootModel) openActionMenu(preselect *pages.Action) bool {
 			label += "（" + action.Disabled + "）"
 		}
 		m.actionList.Items = append(m.actionList.Items, label)
-		if preselect != nil {
-			if fresh, ok := matchingAction(m.pages[m.current], *preselect); ok &&
-				action.Key == fresh.Key && action.Label == fresh.Label {
-				selected = i
-			}
+		if preselect != nil && action.Key == preselect.Key && action.Label == preselect.Label {
+			selected = i
 		}
 	}
 	if preselect != nil && selected < 0 {
