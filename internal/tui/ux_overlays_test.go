@@ -11,7 +11,7 @@ import (
 	"github.com/bbbstyyy/karing-tui/internal/tui/pages"
 )
 
-func TestCommandPaletteSearchesAcrossPagesAndExecutes(t *testing.T) {
+func TestCommandPaletteCrossPageActionRevalidatesBeforeExecution(t *testing.T) {
 	m, _ := rootFixture(t)
 	send(&m, tea.KeyMsg{Type: tea.KeyCtrlP})
 	if !m.showPalette {
@@ -28,13 +28,23 @@ func TestCommandPaletteSearchesAcrossPagesAndExecutes(t *testing.T) {
 	}
 	send(&m, tea.KeyMsg{Type: tea.KeyEnter})
 	if m.showPalette {
-		t.Fatal("command palette did not close after execution")
+		t.Fatal("command palette did not close after cross-page selection")
 	}
 	if m.current != 1 {
 		t.Fatalf("palette command did not navigate to profiles page: %d", m.current)
 	}
+	if !m.showActions {
+		t.Fatal("cross-page action was executed without target-page revalidation")
+	}
+	if m.actionList.Cursor >= len(m.actions) || m.actions[m.actionList.Cursor].Label != "添加订阅" {
+		t.Fatal("target-page action menu did not focus the requested command")
+	}
+	if m.pages[m.current].Editing() {
+		t.Fatal("cross-page action ran before explicit confirmation in fresh context")
+	}
+	send(&m, tea.KeyMsg{Type: tea.KeyEnter})
 	if !m.pages[m.current].Editing() {
-		t.Fatal("palette command did not execute add subscription action")
+		t.Fatal("revalidated add subscription action did not execute")
 	}
 }
 
