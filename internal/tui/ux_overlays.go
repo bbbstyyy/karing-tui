@@ -138,7 +138,7 @@ func (m *RootModel) handlePaletteKey(key tea.KeyMsg) (tea.Cmd, bool) {
 	}
 }
 
-func (m *RootModel) openActionMenu(preselect *pages.Action) {
+func (m *RootModel) openActionMenu(preselect *pages.Action) bool {
 	m.actions = pages.Actions(m.pages[m.current])
 	m.actionList = components.SimpleList{}
 	m.resizeGlobalOverlays()
@@ -153,10 +153,15 @@ func (m *RootModel) openActionMenu(preselect *pages.Action) {
 			selected = i
 		}
 	}
+	if preselect != nil && selected < 0 {
+		m.showActions = false
+		return false
+	}
 	if selected >= 0 {
 		m.actionList.Cursor = selected
 	}
 	m.showActions = true
+	return true
 }
 
 func (m *RootModel) openTaskCenter() {
