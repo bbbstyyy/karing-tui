@@ -322,17 +322,7 @@ func (m RootModel) update(msg tea.Msg) (RootModel, tea.Cmd) {
 				m.openTaskCenter()
 				return m, nil
 			case keys.Menu:
-				m.actions = pages.Actions(m.pages[m.current])
-				m.actionList = components.SimpleList{}
-				m.resizeGlobalOverlays()
-				for _, a := range m.actions {
-					label := a.Key + " · " + a.Label
-					if a.Disabled != "" {
-						label += "（" + a.Disabled + "）"
-					}
-					m.actionList.Items = append(m.actionList.Items, label)
-				}
-				m.showActions = true
+				m.openActionMenu(nil)
 				return m, nil
 			case keys.Help:
 				m.showHelp = true
