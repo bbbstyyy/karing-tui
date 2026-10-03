@@ -38,8 +38,8 @@ type testDoneMsg struct {
 // 并提供核心启停、配置生成与组测速操作。
 type Dashboard struct {
 	base
-	status          core.Status
-	lastErr         error // 最近一次操作错误
+	status  core.Status
+	lastErr error // 最近一次操作错误
 	// 内部模型（未运行时展示持久化的组选择）
 	subs   []*config.Subscription
 	groups []*config.ProxyGroup
