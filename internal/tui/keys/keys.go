@@ -30,6 +30,8 @@ const (
 	Advanced   = "ctrl+g"
 	Help       = "?"
 	Menu       = "ctrl+o"
+	Palette    = "ctrl+p"
+	Tasks      = "ctrl+t"
 	Apply      = "ctrl+a"
 	Cancel     = "esc"
 	Enter      = "enter"
@@ -129,6 +131,10 @@ func Message(key string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyCtrlE}
 	case "ctrl+o":
 		return tea.KeyMsg{Type: tea.KeyCtrlO}
+	case "ctrl+p":
+		return tea.KeyMsg{Type: tea.KeyCtrlP}
+	case "ctrl+t":
+		return tea.KeyMsg{Type: tea.KeyCtrlT}
 	case "alt+enter":
 		return tea.KeyMsg{Type: tea.KeyEnter, Alt: true}
 	}
@@ -141,6 +147,8 @@ var Global = []Binding{
 	{Key: Focus, Label: "切换列表与详情焦点", Aliases: []string{FocusBack}},
 	{Key: "[/]", Label: "切换子页签"},
 	{Key: Menu, Label: "当前对象操作菜单"},
+	{Key: Palette, Label: "全局命令面板"},
+	{Key: Tasks, Label: "全局任务中心"},
 	{Key: Apply, Label: "生成、校验并应用配置"},
 	{Key: Help, Label: "打开或关闭帮助"},
 	{Key: "q/Ctrl+C", Label: "退出；运行中确认停机影响"},

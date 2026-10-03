@@ -419,6 +419,19 @@ func (a *App) ConfigStatus() (generated bool, lastCheckAt time.Time, lastCheckEr
 	return a.configGenerated, a.lastCheckAt, a.lastCheckErr
 }
 
+// ConfigReadyForApply reports whether the generated file matches the latest
+// saved model revision and that exact generation has passed sing-box check.
+// A generated-but-unchecked file, a failed check, or any later saved edit is
+// deliberately not considered ready.
+func (a *App) ConfigReadyForApply() bool {
+	a.configStateMu.RLock()
+	defer a.configStateMu.RUnlock()
+	return a.configGenerated &&
+		a.revision == a.generatedRevision &&
+		!a.lastCheckAt.IsZero() &&
+		a.lastCheckErr == nil
+}
+
 // MarkConfigDirty records a model change without waiting for network or core
 // operations. UI feedback must remain responsive while a config is checked.
 func (a *App) MarkConfigDirty() {

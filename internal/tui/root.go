@@ -3,15 +3,17 @@ package tui
 
 import (
 	"fmt"
-	"github.com/bbbstyyy/karing-tui/internal/tui/keys"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/bbbstyyy/karing-tui/internal/application"
 	"github.com/bbbstyyy/karing-tui/internal/tui/components"
+	"github.com/bbbstyyy/karing-tui/internal/tui/keys"
 	"github.com/bbbstyyy/karing-tui/internal/tui/pages"
 	"github.com/bbbstyyy/karing-tui/internal/tui/styles"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 type pageMsg struct {
@@ -48,6 +50,13 @@ type RootModel struct {
 	showActions            bool
 	actions                []pages.Action
 	actionList             components.SimpleList
+	showPalette            bool
+	paletteInput           textinput.Model
+	paletteCommands        []paletteCommand
+	paletteList            components.SimpleList
+	showTasks              bool
+	taskList               components.SimpleList
+	taskPages              []int
 	spinner                bool
 	refreshing             bool
 	pageTouched            bool
@@ -115,6 +124,9 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			next.refreshing = true
 			wake = tea.Batch(wake, transientCmd(transientWindow))
 		}
+	}
+	if next.showTasks {
+		next.refreshTaskCenter()
 	}
 	next.pageTouched = false
 	return next, tea.Batch(cmd, wake)
@@ -231,6 +243,7 @@ func (m RootModel) update(msg tea.Msg) (RootModel, tea.Cmd) {
 	}
 	if size, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width, m.height = size.Width, size.Height
+		m.resizeGlobalOverlays()
 		var cmds []tea.Cmd
 		for i := range m.pages {
 			m.touch()
@@ -254,6 +267,12 @@ func (m RootModel) update(msg tea.Msg) (RootModel, tea.Cmd) {
 		return m, nil
 	}
 	if key, ok := msg.(tea.KeyMsg); ok {
+		if cmd, handled := m.handlePaletteKey(key); handled {
+			return m, cmd
+		}
+		if cmd, handled := m.handleTaskCenterKey(key); handled {
+			return m, cmd
+		}
 		if m.confirm.Active {
 			_, cmd := m.confirm.Update(key)
 			return m, cmd
@@ -297,17 +316,13 @@ func (m RootModel) update(msg tea.Msg) (RootModel, tea.Cmd) {
 		}
 		if !m.pages[m.current].Editing() {
 			switch key.String() {
+			case keys.Palette:
+				return m, m.openPalette()
+			case keys.Tasks:
+				m.openTaskCenter()
+				return m, nil
 			case keys.Menu:
-				m.actions = pages.Actions(m.pages[m.current])
-				m.actionList = components.SimpleList{}
-				for _, a := range m.actions {
-					label := a.Key + " · " + a.Label
-					if a.Disabled != "" {
-						label += "（" + a.Disabled + "）"
-					}
-					m.actionList.Items = append(m.actionList.Items, label)
-				}
-				m.showActions = true
+				_ = m.openActionMenu(nil)
 				return m, nil
 			case keys.Help:
 				m.showHelp = true
@@ -399,8 +414,13 @@ func (m RootModel) View() string {
 			m.help.View(body, w-4, h-9) + "\n↑/↓ PgUp/PgDn 滚动 · ?/q/Esc 关闭")
 	}
 	if m.showActions {
-		m.actionList.Width, m.actionList.Height = w-4, h-7
 		content = styles.HelpOverlay.Width(w - 2).Render("操作 · " + m.pages[m.current].Title() + "\n" + m.actionList.View("暂无操作") + "\nEnter 执行 · Esc 返回")
+	}
+	if m.showPalette {
+		content = m.paletteView(w, h)
+	}
+	if m.showTasks {
+		content = m.taskCenterView(w, h)
 	}
 	if m.confirm.Active {
 		m.confirm.Width, m.confirm.Height = w, h-3
@@ -464,6 +484,6 @@ func (m RootModel) statusBar(width int) string {
 		state = "运行中"
 	}
 	left := m.pages[m.current].Title() + " · " + state
-	right := "1–7 切页 · Ctrl+O 操作 · ? 帮助"
+	right := "1–7 切页 · Ctrl+P 命令 · Ctrl+T 任务 · ? 帮助"
 	return styles.StatusBar.Render(components.Pad(left, max(0, width-1-components.DisplayWidth(right))) + " " + right)
 }
