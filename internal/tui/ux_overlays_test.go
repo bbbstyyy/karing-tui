@@ -315,3 +315,24 @@ func TestActionMenuRejectsMissingPaletteTarget(t *testing.T) {
 		t.Fatal("missing palette target fell back to an unrelated action")
 	}
 }
+
+func TestCommandPaletteCurrentPageActionExecutesDirectly(t *testing.T) {
+	m, _ := rootFixture(t)
+	send(&m, runeKey("2"))
+	if m.current != 1 {
+		t.Fatalf("failed to enter profiles page: %d", m.current)
+	}
+
+	send(&m, tea.KeyMsg{Type: tea.KeyCtrlP})
+	for _, r := range "添加订阅" {
+		send(&m, runeKey(string(r)))
+	}
+	send(&m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.showPalette || m.showActions {
+		t.Fatal("same-page palette action should execute directly")
+	}
+	if !m.pages[m.current].Editing() {
+		t.Fatal("same-page palette action did not open subscription form")
+	}
+}
