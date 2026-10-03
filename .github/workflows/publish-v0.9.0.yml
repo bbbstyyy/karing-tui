@@ -1,0 +1,59 @@
+name: Publish v0.9.0
+
+on:
+  push:
+    branches:
+      - release/v0.9.0-publish
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for validated main CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          while :; do
+            status="$(gh api repos/${GITHUB_REPOSITORY}/actions/runs/37129082534 --jq .status)"
+            conclusion="$(gh api repos/${GITHUB_REPOSITORY}/actions/runs/37129082534 --jq '.conclusion // ""')"
+            echo "main CI: status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              test "$conclusion" = "success"
+              break
+            fi
+            sleep 15
+          done
+
+      - uses: actions/checkout@v4
+        with:
+          ref: 766a0299d3dd6a73ddac5f7c4862d11db9e5f6f8
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build v0.9.0 release packages
+        run: ./scripts/build-release.sh v0.9.0
+
+      - name: Verify checksums
+        run: |
+          cd dist/karing-tui-v0.9.0
+          sha256sum -c checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.9.0
+          target_commitish: 766a0299d3dd6a73ddac5f7c4862d11db9e5f6f8
+          name: v0.9.0 TUI 易用性升级
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/karing-tui-v0.9.0/*.tar.gz
+            dist/karing-tui-v0.9.0/checksums.txt
