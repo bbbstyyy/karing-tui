@@ -324,6 +324,7 @@ func (m RootModel) update(msg tea.Msg) (RootModel, tea.Cmd) {
 			case keys.Menu:
 				m.actions = pages.Actions(m.pages[m.current])
 				m.actionList = components.SimpleList{}
+				m.resizeGlobalOverlays()
 				for _, a := range m.actions {
 					label := a.Key + " · " + a.Label
 					if a.Disabled != "" {
@@ -423,7 +424,6 @@ func (m RootModel) View() string {
 			m.help.View(body, w-4, h-9) + "\n↑/↓ PgUp/PgDn 滚动 · ?/q/Esc 关闭")
 	}
 	if m.showActions {
-		m.actionList.Width, m.actionList.Height = w-4, h-7
 		content = styles.HelpOverlay.Width(w - 2).Render("操作 · " + m.pages[m.current].Title() + "\n" + m.actionList.View("暂无操作") + "\nEnter 执行 · Esc 返回")
 	}
 	if m.showPalette {
