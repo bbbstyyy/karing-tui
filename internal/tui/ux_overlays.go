@@ -88,6 +88,15 @@ func (m *RootModel) rebuildPalette() {
 	}
 }
 
+func matchingAction(page pages.Page, requested pages.Action) (pages.Action, bool) {
+	for _, action := range pages.Actions(page) {
+		if action.Key == requested.Key && action.Label == requested.Label {
+			return action, true
+		}
+	}
+	return pages.Action{}, false
+}
+
 func (m *RootModel) handlePaletteKey(key tea.KeyMsg) (tea.Cmd, bool) {
 	if !m.showPalette {
 		return nil, false
@@ -122,7 +131,14 @@ func (m *RootModel) handlePaletteKey(key tea.KeyMsg) (tea.Cmd, bool) {
 			return cmd, true
 		}
 		if entry.HasAction {
-			next, cmd := m.update(entry.Action.Message())
+			fresh, ok := matchingAction(m.pages[m.current], entry.Action)
+			if !ok || fresh.Disabled != "" {
+				m.rebuildPalette()
+				m.showPalette = true
+				_ = m.paletteInput.Focus()
+				return nil, true
+			}
+			next, cmd := m.update(fresh.Message())
 			*m = next
 			return cmd, true
 		}
@@ -149,8 +165,11 @@ func (m *RootModel) openActionMenu(preselect *pages.Action) bool {
 			label += "（" + action.Disabled + "）"
 		}
 		m.actionList.Items = append(m.actionList.Items, label)
-		if preselect != nil && action.Key == preselect.Key && action.Label == preselect.Label {
-			selected = i
+		if preselect != nil {
+			if fresh, ok := matchingAction(m.pages[m.current], *preselect); ok &&
+				action.Key == fresh.Key && action.Label == fresh.Label {
+				selected = i
+			}
 		}
 	}
 	if preselect != nil && selected < 0 {
