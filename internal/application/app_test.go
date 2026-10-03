@@ -287,3 +287,38 @@ exit 1
 		t.Fatalf("RestartCore 未将最新数据库节点写入配置: %s", out)
 	}
 }
+
+func TestConfigReadyForApplyRequiresCurrentSuccessfulCheck(t *testing.T) {
+	app, _ := setupApp(t)
+
+	app.configStateMu.Lock()
+	app.configGenerated = true
+	app.generatedRevision = app.revision
+	app.lastCheckAt = time.Time{}
+	app.lastCheckErr = nil
+	app.configStateMu.Unlock()
+	if app.ConfigReadyForApply() {
+		t.Fatal("generated but unchecked config was reported ready")
+	}
+
+	app.configStateMu.Lock()
+	app.lastCheckAt = time.Now()
+	app.configStateMu.Unlock()
+	if !app.ConfigReadyForApply() {
+		t.Fatal("current generated config with successful check was not reported ready")
+	}
+
+	app.MarkConfigDirty()
+	if app.ConfigReadyForApply() {
+		t.Fatal("saved edits after validation did not invalidate readiness")
+	}
+
+	app.configStateMu.Lock()
+	app.generatedRevision = app.revision
+	app.lastCheckAt = time.Now()
+	app.lastCheckErr = context.Canceled
+	app.configStateMu.Unlock()
+	if app.ConfigReadyForApply() {
+		t.Fatal("failed config check was reported ready")
+	}
+}
