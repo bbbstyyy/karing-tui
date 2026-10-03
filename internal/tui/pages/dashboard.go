@@ -109,6 +109,7 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 		// Root delivers the single refresh chain even while another page is open.
 		d.reloadModel()
 		d.status = d.app.Core.Status()
+		d.configGenerated, d.checkedAt, d.checkErr = d.app.ConfigStatus()
 		return d, d.startTick(dashboardTickInterval)
 	case DeactivateMsg:
 		// 切走即停：请求自愈与测速超时都由激活中的 tick 驱动，
@@ -455,16 +456,43 @@ func (d *Dashboard) View() string {
 	if d.lastErr != nil {
 		footer = styles.Err.Render(components.Clip("操作失败: "+d.lastErr.Error(), max(0, d.width-10))+" · ! 详情") + "\n" + footer
 	}
-	detail := d.groupLines() + "\n\n" + d.subLines()
-	if len(d.nodes) == 0 {
-		step := "第一步：2 订阅与节点 → a 添加订阅；或 ] 全部节点 → i 导入"
-		if len(d.subs) > 0 {
-			step = "下一步：2 选择订阅 → u 更新，或编辑后保存并更新"
-		}
-		detail = step + "\n节点就绪后 Ctrl+A 应用并启动；3 选择代理组，6 查看日志。\n\n" + detail
-	}
+	detail := d.setupChecklist() + "\n\n" + d.groupLines() + "\n\n" + d.subLines()
 	viewH := max(1, d.height-len(strings.Split(body, "\n"))-len(strings.Split(footer, "\n")))
 	return body + "\n" + d.details.View(detail, d.width, viewH) + "\n" + styles.Dim.Render(footer)
+}
+
+func (d *Dashboard) setupChecklist() string {
+	type step struct {
+		done bool
+		text string
+		next string
+	}
+	hasNodes := len(d.nodes) > 0
+	hasGroups := len(d.groups) > 0
+	configReady := d.configGenerated && d.checkErr == nil
+	running := d.status.State == core.StateRunning
+	steps := []step{
+		{hasNodes, "准备可用节点", "2 订阅与节点 → a 添加订阅，或 ] → i 导入节点"},
+		{hasGroups, "配置代理组", "3 代理组 → a 新建代理组"},
+		{configReady, "生成并校验配置", "Ctrl+A 生成、校验并应用"},
+		{running, "启动代理核心", "Ctrl+A 应用并启动"},
+	}
+	lines := []string{"快速设置:"}
+	for _, s := range steps {
+		mark := "[ ]"
+		if s.done {
+			mark = "[x]"
+		}
+		line := "  " + mark + " " + s.text
+		if !s.done {
+			line += " · " + s.next
+		}
+		lines = append(lines, line)
+	}
+	if running {
+		lines = append(lines, "  已完成基础设置 · Ctrl+P 可搜索全部操作 · Ctrl+T 查看后台任务")
+	}
+	return strings.Join(lines, "\n")
 }
 
 // trafficLine 渲染流量统计行。
