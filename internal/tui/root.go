@@ -12,6 +12,7 @@ import (
 	"github.com/bbbstyyy/karing-tui/internal/tui/pages"
 	"github.com/bbbstyyy/karing-tui/internal/tui/styles"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/bubbles/textinput"
 )
 
 type pageMsg struct {
@@ -48,6 +49,13 @@ type RootModel struct {
 	showActions            bool
 	actions                []pages.Action
 	actionList             components.SimpleList
+	showPalette            bool
+	paletteInput           textinput.Model
+	paletteCommands        []paletteCommand
+	paletteList            components.SimpleList
+	showTasks              bool
+	taskList               components.SimpleList
+	taskPages              []int
 	spinner                bool
 	refreshing             bool
 	pageTouched            bool
@@ -115,6 +123,9 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			next.refreshing = true
 			wake = tea.Batch(wake, transientCmd(transientWindow))
 		}
+	}
+	if next.showTasks {
+		next.refreshTaskCenter()
 	}
 	next.pageTouched = false
 	return next, tea.Batch(cmd, wake)
@@ -254,6 +265,12 @@ func (m RootModel) update(msg tea.Msg) (RootModel, tea.Cmd) {
 		return m, nil
 	}
 	if key, ok := msg.(tea.KeyMsg); ok {
+		if cmd, handled := m.handlePaletteKey(key); handled {
+			return m, cmd
+		}
+		if cmd, handled := m.handleTaskCenterKey(key); handled {
+			return m, cmd
+		}
 		if m.confirm.Active {
 			_, cmd := m.confirm.Update(key)
 			return m, cmd
@@ -297,6 +314,11 @@ func (m RootModel) update(msg tea.Msg) (RootModel, tea.Cmd) {
 		}
 		if !m.pages[m.current].Editing() {
 			switch key.String() {
+			case keys.Palette:
+				return m, m.openPalette()
+			case keys.Tasks:
+				m.openTaskCenter()
+				return m, nil
 			case keys.Menu:
 				m.actions = pages.Actions(m.pages[m.current])
 				m.actionList = components.SimpleList{}
@@ -464,6 +486,6 @@ func (m RootModel) statusBar(width int) string {
 		state = "运行中"
 	}
 	left := m.pages[m.current].Title() + " · " + state
-	right := "1–7 切页 · Ctrl+O 操作 · ? 帮助"
+	right := "1–7 切页 · Ctrl+P 命令 · Ctrl+T 任务 · ? 帮助"
 	return styles.StatusBar.Render(components.Pad(left, max(0, width-1-components.DisplayWidth(right))) + " " + right)
 }
