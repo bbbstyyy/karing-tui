@@ -19,6 +19,24 @@ type paletteCommand struct {
 	Search    string
 }
 
+func (m *RootModel) resizeGlobalOverlays() {
+	width, height := m.width, m.height
+	if width <= 0 {
+		width = 80
+	}
+	if height <= 0 {
+		height = 24
+	}
+	contentWidth := max(1, width-1)
+	m.paletteList.Width = max(1, contentWidth-4)
+	m.paletteList.Height = max(3, height-9)
+	m.taskList.Width = max(1, contentWidth-4)
+	m.taskList.Height = max(3, height-8)
+	if m.paletteInput.Width >= 0 {
+		m.paletteInput.Width = max(1, contentWidth-6)
+	}
+}
+
 func (m *RootModel) openPalette() tea.Cmd {
 	m.showActions, m.showHelp, m.showTasks = false, false, false
 	m.showPalette = true
@@ -26,6 +44,7 @@ func (m *RootModel) openPalette() tea.Cmd {
 	m.paletteInput.Placeholder = "搜索页面或操作"
 	m.paletteInput.Prompt = "> "
 	m.paletteInput.CharLimit = 64
+	m.resizeGlobalOverlays()
 	cmd := m.paletteInput.Focus()
 	m.rebuildPalette()
 	return cmd
@@ -118,6 +137,7 @@ func (m *RootModel) handlePaletteKey(key tea.KeyMsg) (tea.Cmd, bool) {
 func (m *RootModel) openTaskCenter() {
 	m.showActions, m.showHelp, m.showPalette = false, false, false
 	m.showTasks = true
+	m.resizeGlobalOverlays()
 	m.refreshTaskCenter()
 }
 
@@ -166,13 +186,15 @@ func (m *RootModel) handleTaskCenterKey(key tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		idx := m.taskPages[m.taskList.Cursor]
 		m.showTasks = false
+		if idx == m.current {
+			return nil, true
+		}
 		return route(idx, m.switchTo(idx)), true
 	}
 	return nil, true
 }
 
 func (m RootModel) paletteView(width, height int) string {
-	m.paletteList.Width, m.paletteList.Height = max(1, width-4), max(3, height-9)
 	input := m.paletteInput.View()
 	body := "命令面板 · 输入关键字筛选页面与操作\n" + input + "\n" +
 		m.paletteList.View("没有匹配的命令") +
@@ -181,9 +203,8 @@ func (m RootModel) paletteView(width, height int) string {
 }
 
 func (m RootModel) taskCenterView(width, height int) string {
-	m.taskList.Width, m.taskList.Height = max(1, width-4), max(3, height-8)
 	body := "任务中心 · 所有页面的后台任务与最近结果\n" +
 		m.taskList.View("暂无任务") +
-		"\nEnter 前往来源页 · v 查看结果 · f 重试失败项 · Esc 关闭"
+		"\nEnter 前往来源页；到来源页后 v 看结果 / f 重试失败项 · Esc 关闭"
 	return styles.HelpOverlay.Width(width - 2).Render(body)
 }
