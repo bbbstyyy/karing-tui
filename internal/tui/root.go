@@ -3,16 +3,17 @@ package tui
 
 import (
 	"fmt"
-	"github.com/bbbstyyy/karing-tui/internal/tui/keys"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/bbbstyyy/karing-tui/internal/application"
 	"github.com/bbbstyyy/karing-tui/internal/tui/components"
+	"github.com/bbbstyyy/karing-tui/internal/tui/keys"
 	"github.com/bbbstyyy/karing-tui/internal/tui/pages"
 	"github.com/bbbstyyy/karing-tui/internal/tui/styles"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/bubbles/textinput"
 )
 
 type pageMsg struct {
