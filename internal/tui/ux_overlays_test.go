@@ -304,3 +304,14 @@ func TestSetupChecklistRespectsSubscriptionEnabledState(t *testing.T) {
 		t.Fatal("enabled subscription node was not recognized as usable")
 	}
 }
+
+func TestActionMenuRejectsMissingPaletteTarget(t *testing.T) {
+	m, _ := rootFixture(t)
+	missing := pages.Action{Key: "z", Label: "已失效操作"}
+	if m.openActionMenu(&missing) {
+		t.Fatal("action menu accepted a palette action that no longer exists")
+	}
+	if m.showActions {
+		t.Fatal("missing palette target fell back to an unrelated action")
+	}
+}
