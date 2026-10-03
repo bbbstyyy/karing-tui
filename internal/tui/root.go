@@ -243,6 +243,7 @@ func (m RootModel) update(msg tea.Msg) (RootModel, tea.Cmd) {
 	}
 	if size, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width, m.height = size.Width, size.Height
+		m.resizeGlobalOverlays()
 		var cmds []tea.Cmd
 		for i := range m.pages {
 			m.touch()
