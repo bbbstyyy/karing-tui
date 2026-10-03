@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/bbbstyyy/karing-tui/internal/tui/components"
 	"github.com/bbbstyyy/karing-tui/internal/tui/pages"
 	"github.com/bbbstyyy/karing-tui/internal/tui/styles"
 )
@@ -113,16 +114,19 @@ func (m *RootModel) handlePaletteKey(key tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		m.showPalette = false
 		m.paletteInput.Blur()
-		var cmds []tea.Cmd
 		if entry.Page != m.current {
-			cmds = append(cmds, route(entry.Page, m.switchTo(entry.Page)))
+			cmd := route(entry.Page, m.switchTo(entry.Page))
+			if entry.HasAction {
+				m.openActionMenu(&entry.Action)
+			}
+			return cmd, true
 		}
 		if entry.HasAction {
 			next, cmd := m.update(entry.Action.Message())
 			*m = next
-			cmds = append(cmds, cmd)
+			return cmd, true
 		}
-		return tea.Batch(cmds...), true
+		return nil, true
 	default:
 		before := m.paletteInput.Value()
 		var cmd tea.Cmd
@@ -132,6 +136,27 @@ func (m *RootModel) handlePaletteKey(key tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		return cmd, true
 	}
+}
+
+func (m *RootModel) openActionMenu(preselect *pages.Action) {
+	m.actions = pages.Actions(m.pages[m.current])
+	m.actionList = components.SimpleList{}
+	m.resizeGlobalOverlays()
+	selected := -1
+	for i, action := range m.actions {
+		label := action.Key + " · " + action.Label
+		if action.Disabled != "" {
+			label += "（" + action.Disabled + "）"
+		}
+		m.actionList.Items = append(m.actionList.Items, label)
+		if preselect != nil && action.Key == preselect.Key && action.Label == preselect.Label {
+			selected = i
+		}
+	}
+	if selected >= 0 {
+		m.actionList.Cursor = selected
+	}
+	m.showActions = true
 }
 
 func (m *RootModel) openTaskCenter() {
