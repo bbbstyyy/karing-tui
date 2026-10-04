@@ -38,7 +38,7 @@ func decodeAPIResponse(body io.Reader, out any) error {
 }
 
 // connectionCount discards metadata instead of constructing an entire graph of
-// maps, slices and strings for a dashboard that only needs a connection count.
+// maps, slices and strings for callers that only need a connection count.
 type connectionCount int
 
 func (c *connectionCount) UnmarshalJSON(data []byte) error {
