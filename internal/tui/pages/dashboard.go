@@ -125,7 +125,19 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 	case ActivateMsg:
 		// Root delivers the single refresh chain even while another page is open.
 		d.reloadModel()
-		d.status = d.app.Core.Status()
+		current := d.app.Core.Status()
+		// 隐藏期间核心可能退出或被外部重启。若仍保留上一实例的 API 快照，
+		// 重新进入概览的第一帧会短暂显示旧节点/旧流量，直到下一次 tick 才纠正。
+		if current.State != core.StateRunning ||
+			(!d.groupTrafficInstance.IsZero() && !current.StartedAt.Equal(d.groupTrafficInstance)) {
+			d.apiOK = false
+			d.havePrev = false
+			d.upSpeed, d.downSpeed = 0, 0
+			d.upTotal, d.downTotal, d.conns = 0, 0, 0
+			d.proxies = nil
+			d.resetGroupTraffic()
+		}
+		d.status = current
 		return d, d.startTick(dashboardTickInterval)
 	case DeactivateMsg:
 		// 切走即停：请求自愈与测速超时都由激活中的 tick 驱动，
