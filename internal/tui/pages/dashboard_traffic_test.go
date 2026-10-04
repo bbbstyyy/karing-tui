@@ -1,6 +1,7 @@
 package pages
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -95,5 +96,28 @@ func TestDashboardTrafficGroupIndexPrunesRemovedGroups(t *testing.T) {
 	}
 	if _, ok := d.groupTrafficNames["New"]; !ok {
 		t.Fatal("new group missing from traffic name index")
+	}
+}
+
+func TestDashboardTrafficUpdateSteadyStateAllocations(t *testing.T) {
+	d := &Dashboard{groups: []*config.ProxyGroup{{Name: "Auto"}}}
+	instance := time.Now()
+	conns := make([]clashapi.TrafficConnection, 512)
+	for i := range conns {
+		conns[i] = clashapi.TrafficConnection{
+			ID:       "conn-" + strconv.Itoa(i),
+			Upload:   int64(i + 1),
+			Download: int64(i + 2),
+			Chains:   []string{"node", "Auto"},
+		}
+	}
+	// 两次预热让交替复用的两张连接基线 map 都拥有足够容量。
+	d.updateGroupTraffic(instance, conns)
+	d.updateGroupTraffic(instance, conns)
+
+	if allocs := testing.AllocsPerRun(20, func() {
+		d.updateGroupTraffic(instance, conns)
+	}); allocs != 0 {
+		t.Fatalf("steady-state traffic update allocates: %.1f allocs/run", allocs)
 	}
 }
