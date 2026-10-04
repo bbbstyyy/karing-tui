@@ -72,3 +72,26 @@ func TestDashboardTrafficCounterRollbackUsesCurrentValue(t *testing.T) {
 		t.Fatalf("rollback should start a fresh counter epoch, got %+v", got)
 	}
 }
+
+func TestDashboardTrafficGroupIndexPrunesRemovedGroups(t *testing.T) {
+	d := &Dashboard{
+		groups: []*config.ProxyGroup{{Name: "Auto"}, {Name: "Old"}},
+		groupTraffic: map[string]groupTrafficStat{
+			"Auto": {Upload: 10},
+			"Old":  {Upload: 20},
+		},
+	}
+	d.refreshGroupTrafficNames()
+	d.groups = []*config.ProxyGroup{{Name: "Auto"}, {Name: "New"}}
+	d.refreshGroupTrafficNames()
+
+	if _, ok := d.groupTraffic["Old"]; ok {
+		t.Fatal("removed group left stale traffic state behind")
+	}
+	if _, ok := d.groupTrafficNames["Old"]; ok {
+		t.Fatal("removed group left stale name index behind")
+	}
+	if _, ok := d.groupTrafficNames["New"]; !ok {
+		t.Fatal("new group missing from traffic name index")
+	}
+}
