@@ -379,7 +379,7 @@ func (d *Dashboard) resetGroupTraffic() {
 	d.groupTrafficInstance = time.Time{}
 }
 
-// refreshGroupTrafficNames 重建运行时代理组名索引，并清掉已删除/改名组的陈旧统计。
+// refreshGroupTrafficNames 重建当前配置模型的代理组名索引，并清掉已删除/改名组的陈旧统计。
 func (d *Dashboard) refreshGroupTrafficNames() {
 	if d.groupTrafficNames == nil {
 		d.groupTrafficNames = make(map[string]struct{}, len(d.groups))
