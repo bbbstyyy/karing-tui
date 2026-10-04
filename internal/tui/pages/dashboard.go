@@ -23,6 +23,7 @@ type snapMsg struct {
 	startedAt time.Time
 	sampledAt time.Time
 	conns     clashapi.Connections
+	traffic   []clashapi.TrafficConnection
 	proxies   map[string]clashapi.ProxyInfo
 	err       error
 }
@@ -32,6 +33,17 @@ type testDoneMsg struct {
 	id        uint64
 	startedAt time.Time
 	err       error
+}
+
+type groupTrafficStat struct {
+	Upload      int64
+	Download    int64
+	Connections int
+}
+
+type connTrafficSample struct {
+	Upload   int64
+	Download int64
 }
 
 // Dashboard 展示运行状态、流量统计、代理组当前节点、订阅状态与配置状态，
@@ -57,6 +69,15 @@ type Dashboard struct {
 	prevAt    time.Time
 	havePrev  bool
 	proxies   map[string]clashapi.ProxyInfo
+
+	// 按代理组做采样累计。Clash API 只暴露当前活跃连接，因此完全发生在两次
+	// 采样之间的短连接无法归属；UI 明确标为“采样”，避免把它误解为精确账单。
+	// 热路径复用 map，避免按秒轮询时产生与连接数成正比的临时 map 分配。
+	groupTraffic         map[string]groupTrafficStat
+	groupTrafficNames    map[string]struct{}
+	connTraffic          map[string]connTrafficSample
+	nextConnTraffic      map[string]connTrafficSample
+	groupTrafficInstance time.Time
 
 	fetching       bool
 	fetchStartedAt time.Time
@@ -104,7 +125,19 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 	case ActivateMsg:
 		// Root delivers the single refresh chain even while another page is open.
 		d.reloadModel()
-		d.status = d.app.Core.Status()
+		current := d.app.Core.Status()
+		// 隐藏期间核心可能退出或被外部重启。若仍保留上一实例的 API 快照，
+		// 重新进入概览的第一帧会短暂显示旧节点/旧流量，直到下一次 tick 才纠正。
+		if current.State != core.StateRunning ||
+			(!d.groupTrafficInstance.IsZero() && !current.StartedAt.Equal(d.groupTrafficInstance)) {
+			d.apiOK = false
+			d.havePrev = false
+			d.upSpeed, d.downSpeed = 0, 0
+			d.upTotal, d.downTotal, d.conns = 0, 0, 0
+			d.proxies = nil
+			d.resetGroupTraffic()
+		}
+		d.status = current
 		return d, d.startTick(dashboardTickInterval)
 	case DeactivateMsg:
 		// 切走即停：请求自愈与测速超时都由激活中的 tick 驱动，
@@ -147,6 +180,7 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 			d.upSpeed, d.downSpeed = 0, 0
 			d.upTotal, d.downTotal, d.conns = 0, 0, 0
 			d.proxies = nil
+			d.resetGroupTraffic()
 		} else if client := d.app.ClashClient(); client != nil && !d.fetching {
 			d.fetching = true
 			d.fetchStartedAt = time.Now()
@@ -187,6 +221,7 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 		d.upTotal, d.downTotal, d.conns =
 			msg.conns.UploadTotal, msg.conns.DownloadTotal, msg.conns.Count
 		d.proxies = msg.proxies
+		d.updateGroupTraffic(msg.startedAt, msg.traffic, msg.proxies)
 		d.apiOK = true
 		return d, nil
 
@@ -238,6 +273,7 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 				d.upSpeed, d.downSpeed = 0, 0
 				d.upTotal, d.downTotal, d.conns = 0, 0, 0
 				d.proxies = nil
+				d.resetGroupTraffic()
 			}
 		}
 		return d, nil
@@ -307,6 +343,7 @@ func (d *Dashboard) reloadModel() {
 	}
 	if groups, err := d.app.DB.ListProxyGroups(); err == nil {
 		d.groups = groups
+		d.refreshGroupTrafficNames()
 	}
 	if nodes, err := d.app.DB.ListNodes(0); err == nil {
 		d.nodes = make(map[int64]*config.Node, len(nodes))
@@ -325,12 +362,108 @@ func (d *Dashboard) fetchSnapshot(client *clashapi.Client) tea.Cmd {
 		ctx, cancel := context.WithTimeout(d.app.BackgroundContext(), 3*time.Second)
 		defer cancel()
 		m := snapMsg{id: id, startedAt: startedAt}
-		if m.conns, m.err = client.Connections(ctx); m.err == nil {
+		if m.conns, m.traffic, m.err = client.TrafficConnections(ctx); m.err == nil {
 			m.proxies, m.err = client.Proxies(ctx)
 		}
 		m.sampledAt = time.Now()
 		return m
 	}
+}
+
+func (d *Dashboard) resetGroupTraffic() {
+	// 核心生命周期结束时释放连接基线 map 的峰值容量；同一实例内仍由
+	// updateGroupTraffic 交替复用两张 map，兼顾稳态零分配与长期驻留内存。
+	d.groupTraffic = nil
+	d.connTraffic = nil
+	d.nextConnTraffic = nil
+	d.groupTrafficInstance = time.Time{}
+}
+
+// refreshGroupTrafficNames 重建当前配置模型的代理组名索引，并清掉已删除/改名组的陈旧统计。
+func (d *Dashboard) refreshGroupTrafficNames() {
+	if d.groupTrafficNames == nil {
+		d.groupTrafficNames = make(map[string]struct{}, len(d.groups))
+	} else {
+		clear(d.groupTrafficNames)
+	}
+	for _, g := range d.groups {
+		d.groupTrafficNames[g.Name] = struct{}{}
+	}
+	for name := range d.groupTraffic {
+		if _, ok := d.groupTrafficNames[name]; !ok {
+			delete(d.groupTraffic, name)
+		}
+	}
+}
+
+func (d *Dashboard) updateGroupTraffic(instance time.Time, conns []clashapi.TrafficConnection, proxies map[string]clashapi.ProxyInfo) {
+	if !d.groupTrafficInstance.Equal(instance) {
+		d.resetGroupTraffic()
+		d.groupTrafficInstance = instance
+	}
+	if d.groupTrafficNames == nil {
+		d.refreshGroupTrafficNames()
+	}
+	if d.groupTraffic == nil {
+		d.groupTraffic = make(map[string]groupTrafficStat, len(d.groups))
+	}
+	if d.connTraffic == nil {
+		d.connTraffic = make(map[string]connTrafficSample, len(conns))
+	}
+	if d.nextConnTraffic == nil {
+		d.nextConnTraffic = make(map[string]connTrafficSample, len(conns))
+	} else {
+		clear(d.nextConnTraffic)
+	}
+
+	for _, g := range d.groups {
+		stat := d.groupTraffic[g.Name]
+		stat.Connections = 0
+		d.groupTraffic[g.Name] = stat
+	}
+
+	for _, conn := range conns {
+		prev, seen := d.connTraffic[conn.ID]
+		upDelta, downDelta := conn.Upload, conn.Download
+		if seen && conn.Upload >= prev.Upload {
+			upDelta = conn.Upload - prev.Upload
+		}
+		if seen && conn.Download >= prev.Download {
+			downDelta = conn.Download - prev.Download
+		}
+		d.nextConnTraffic[conn.ID] = connTrafficSample{Upload: conn.Upload, Download: conn.Download}
+
+		for i, tag := range conn.Chains {
+			if _, ok := d.groupTrafficNames[tag]; !ok {
+				continue
+			}
+			// DB 可以先于运行核心发生改名/新增；此时旧核心里的节点 tag
+			// 可能恰好等于新组名。只有 /proxies 同时证明该 tag 是运行时组
+			// （组对象才带 all 字段）时才允许归属，避免未应用配置期间误记。
+			proxy, ok := proxies[tag]
+			if !ok || proxy.All == nil {
+				continue
+			}
+			// 正常 sing-box 出站链不会重复；仍对异常输入去重，但用小切片扫描，
+			// 避免为每条连接分配一个临时 map。
+			duplicate := false
+			for _, previousTag := range conn.Chains[:i] {
+				if previousTag == tag {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
+				continue
+			}
+			stat := d.groupTraffic[tag]
+			stat.Upload += upDelta
+			stat.Download += downDelta
+			stat.Connections++
+			d.groupTraffic[tag] = stat
+		}
+	}
+	d.connTraffic, d.nextConnTraffic = d.nextConnTraffic, d.connTraffic
 }
 
 // startGroupTest 对全部代理组触发 clash API 测速（仅运行中可用）。
@@ -529,7 +662,12 @@ func (d *Dashboard) groupLines() string {
 		if i > 0 {
 			b.WriteString("\n           ")
 		}
-		fmt.Fprintf(&b, "%-14s [%-7s] → %s", g.Name, g.Type, d.groupTarget(g))
+		traffic := ""
+		if d.status.State == core.StateRunning && d.apiOK {
+			stat := d.groupTraffic[g.Name]
+			traffic = fmt.Sprintf(" · 采样 ↑%s ↓%s · %d连接", humanBytes(stat.Upload), humanBytes(stat.Download), stat.Connections)
+		}
+		fmt.Fprintf(&b, "%-14s [%-7s] → %s%s", g.Name, g.Type, d.groupTarget(g), traffic)
 	}
 	return b.String()
 }
