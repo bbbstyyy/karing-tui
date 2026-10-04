@@ -41,6 +41,15 @@ type Connection struct {
 	RulePayload string   `json:"rulePayload,omitempty"`
 }
 
+// TrafficConnection 是 Dashboard 流量统计需要的轻量连接视图。
+// 不解析 metadata，避免每秒轮询时构造大量动态 map/slice。
+type TrafficConnection struct {
+	ID       string   `json:"id,omitempty"`
+	Upload   int64    `json:"upload,omitempty"`
+	Download int64    `json:"download,omitempty"`
+	Chains   []string `json:"chains,omitempty"`
+}
+
 // DetailedConnections 返回累计流量与当前连接详情。
 func (c *Client) DetailedConnections(ctx context.Context) (Connections, []Connection, error) {
 	var raw struct {
@@ -126,6 +135,19 @@ func (c *Client) Proxies(ctx context.Context) (map[string]ProxyInfo, error) {
 		out[tag] = info
 	}
 	return out, nil
+}
+
+// TrafficConnections 返回流量累计与轻量连接详情，供 Dashboard 按代理组归属流量。
+func (c *Client) TrafficConnections(ctx context.Context) (Connections, []TrafficConnection, error) {
+	var raw struct {
+		UploadTotal   int64               `json:"uploadTotal"`
+		DownloadTotal int64               `json:"downloadTotal"`
+		Connections   []TrafficConnection `json:"connections"`
+	}
+	if err := c.get(ctx, "/connections", &raw); err != nil {
+		return Connections{}, nil, err
+	}
+	return Connections{UploadTotal: raw.UploadTotal, DownloadTotal: raw.DownloadTotal, Count: len(raw.Connections)}, raw.Connections, nil
 }
 
 // Connections 返回流量累计与活跃连接数。
