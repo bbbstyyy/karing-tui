@@ -29,3 +29,22 @@ func TestTrafficConnectionsParsesOnlyTrafficFields(t *testing.T) {
 		t.Fatalf("chains = %+v", conns)
 	}
 }
+
+func TestProxiesPreservesRuntimeGroupMarker(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"proxies":{"node":{"type":"Trojan","name":"node","history":[]},"Auto":{"type":"Selector","name":"Auto","now":"node","all":["node"],"history":[]}}}`)
+	}))
+	defer server.Close()
+
+	c := &Client{base: server.URL, hc: server.Client()}
+	proxies, err := c.Proxies(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proxies["node"].All != nil {
+		t.Fatalf("plain outbound unexpectedly marked as group: %+v", proxies["node"])
+	}
+	if proxies["Auto"].All == nil || len(proxies["Auto"].All) != 1 || proxies["Auto"].All[0] != "node" {
+		t.Fatalf("runtime group marker lost: %+v", proxies["Auto"])
+	}
+}
