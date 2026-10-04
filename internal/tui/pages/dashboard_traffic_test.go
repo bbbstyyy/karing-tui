@@ -19,13 +19,15 @@ func TestDashboardTracksTrafficPerProxyGroup(t *testing.T) {
 	instance := time.Now()
 
 	d.updateGroupTraffic(instance, []clashapi.TrafficConnection{
-		{ID: "a", Upload: 100, Download: 200, Chains: []string{"node-1", "AI", "Auto", "AI"}},
-		{ID: "b", Upload: 30, Download: 40, Chains: []string{"node-2", "Auto"}},
+		// karing-tui 会把嵌套组展开成 leaf 节点，因此正常运行时一条连接只
+		// 归属实际出现在 sing-box chain 里的组。重复 Auto 用来钉住防御性去重。
+		{ID: "a", Upload: 100, Download: 200, Chains: []string{"node-1", "Auto", "Auto"}},
+		{ID: "b", Upload: 30, Download: 40, Chains: []string{"node-2", "AI"}},
 	})
-	if got := d.groupTraffic["AI"]; got != (groupTrafficStat{Upload: 100, Download: 200, Connections: 1}) {
+	if got := d.groupTraffic["AI"]; got != (groupTrafficStat{Upload: 30, Download: 40, Connections: 1}) {
 		t.Fatalf("AI first sample = %+v", got)
 	}
-	if got := d.groupTraffic["Auto"]; got != (groupTrafficStat{Upload: 130, Download: 240, Connections: 2}) {
+	if got := d.groupTraffic["Auto"]; got != (groupTrafficStat{Upload: 100, Download: 200, Connections: 1}) {
 		t.Fatalf("Auto first sample = %+v", got)
 	}
 	if got := d.groupTraffic["Unused"]; got != (groupTrafficStat{}) {
@@ -36,13 +38,13 @@ func TestDashboardTracksTrafficPerProxyGroup(t *testing.T) {
 	// its current counters. The vanished connection keeps its accumulated bytes but
 	// is no longer counted as active.
 	d.updateGroupTraffic(instance, []clashapi.TrafficConnection{
-		{ID: "a", Upload: 150, Download: 260, Chains: []string{"node-1", "AI", "Auto"}},
+		{ID: "a", Upload: 150, Download: 260, Chains: []string{"node-1", "Auto"}},
 		{ID: "c", Upload: 10, Download: 20, Chains: []string{"node-3", "AI"}},
 	})
-	if got := d.groupTraffic["AI"]; got != (groupTrafficStat{Upload: 160, Download: 280, Connections: 2}) {
+	if got := d.groupTraffic["AI"]; got != (groupTrafficStat{Upload: 40, Download: 60, Connections: 1}) {
 		t.Fatalf("AI second sample = %+v", got)
 	}
-	if got := d.groupTraffic["Auto"]; got != (groupTrafficStat{Upload: 180, Download: 300, Connections: 1}) {
+	if got := d.groupTraffic["Auto"]; got != (groupTrafficStat{Upload: 150, Download: 260, Connections: 1}) {
 		t.Fatalf("Auto second sample = %+v", got)
 	}
 
