@@ -23,6 +23,7 @@ type snapMsg struct {
 	startedAt time.Time
 	sampledAt time.Time
 	conns     clashapi.Connections
+	traffic   []clashapi.TrafficConnection
 	proxies   map[string]clashapi.ProxyInfo
 	err       error
 }
@@ -32,6 +33,17 @@ type testDoneMsg struct {
 	id        uint64
 	startedAt time.Time
 	err       error
+}
+
+type groupTrafficStat struct {
+	Upload      int64
+	Download    int64
+	Connections int
+}
+
+type connTrafficSample struct {
+	Upload   int64
+	Download int64
 }
 
 // Dashboard 展示运行状态、流量统计、代理组当前节点、订阅状态与配置状态，
@@ -57,6 +69,12 @@ type Dashboard struct {
 	prevAt    time.Time
 	havePrev  bool
 	proxies   map[string]clashapi.ProxyInfo
+
+	// 按代理组累计流量。连接的 upload/download 是连接生命周期累计值，
+	// 因此这里保存上一采样值并按增量归属，连接关闭后累计值仍然保留。
+	groupTraffic         map[string]groupTrafficStat
+	connTraffic          map[string]connTrafficSample
+	groupTrafficInstance time.Time
 
 	fetching       bool
 	fetchStartedAt time.Time
@@ -147,6 +165,7 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 			d.upSpeed, d.downSpeed = 0, 0
 			d.upTotal, d.downTotal, d.conns = 0, 0, 0
 			d.proxies = nil
+			d.resetGroupTraffic()
 		} else if client := d.app.ClashClient(); client != nil && !d.fetching {
 			d.fetching = true
 			d.fetchStartedAt = time.Now()
@@ -186,6 +205,7 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 			msg.conns.UploadTotal, msg.conns.DownloadTotal, now, true
 		d.upTotal, d.downTotal, d.conns =
 			msg.conns.UploadTotal, msg.conns.DownloadTotal, msg.conns.Count
+		d.updateGroupTraffic(msg.startedAt, msg.traffic)
 		d.proxies = msg.proxies
 		d.apiOK = true
 		return d, nil
@@ -238,6 +258,7 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 				d.upSpeed, d.downSpeed = 0, 0
 				d.upTotal, d.downTotal, d.conns = 0, 0, 0
 				d.proxies = nil
+				d.resetGroupTraffic()
 			}
 		}
 		return d, nil
@@ -325,12 +346,70 @@ func (d *Dashboard) fetchSnapshot(client *clashapi.Client) tea.Cmd {
 		ctx, cancel := context.WithTimeout(d.app.BackgroundContext(), 3*time.Second)
 		defer cancel()
 		m := snapMsg{id: id, startedAt: startedAt}
-		if m.conns, m.err = client.Connections(ctx); m.err == nil {
+		if m.conns, m.traffic, m.err = client.TrafficConnections(ctx); m.err == nil {
 			m.proxies, m.err = client.Proxies(ctx)
 		}
 		m.sampledAt = time.Now()
 		return m
 	}
+}
+
+func (d *Dashboard) resetGroupTraffic() {
+	d.groupTraffic = nil
+	d.connTraffic = nil
+	d.groupTrafficInstance = time.Time{}
+}
+
+func (d *Dashboard) updateGroupTraffic(instance time.Time, conns []clashapi.TrafficConnection) {
+	if !d.groupTrafficInstance.Equal(instance) {
+		d.groupTraffic = make(map[string]groupTrafficStat, len(d.groups))
+		d.connTraffic = make(map[string]connTrafficSample, len(conns))
+		d.groupTrafficInstance = instance
+	}
+	if d.groupTraffic == nil {
+		d.groupTraffic = make(map[string]groupTrafficStat, len(d.groups))
+	}
+	if d.connTraffic == nil {
+		d.connTraffic = make(map[string]connTrafficSample, len(conns))
+	}
+
+	groupNames := make(map[string]struct{}, len(d.groups))
+	for _, g := range d.groups {
+		groupNames[g.Name] = struct{}{}
+		stat := d.groupTraffic[g.Name]
+		stat.Connections = 0
+		d.groupTraffic[g.Name] = stat
+	}
+
+	next := make(map[string]connTrafficSample, len(conns))
+	for _, conn := range conns {
+		prev, seen := d.connTraffic[conn.ID]
+		upDelta, downDelta := conn.Upload, conn.Download
+		if seen && conn.Upload >= prev.Upload {
+			upDelta = conn.Upload - prev.Upload
+		}
+		if seen && conn.Download >= prev.Download {
+			downDelta = conn.Download - prev.Download
+		}
+		next[conn.ID] = connTrafficSample{Upload: conn.Upload, Download: conn.Download}
+
+		counted := make(map[string]struct{}, len(conn.Chains))
+		for _, tag := range conn.Chains {
+			if _, ok := groupNames[tag]; !ok {
+				continue
+			}
+			if _, duplicate := counted[tag]; duplicate {
+				continue
+			}
+			counted[tag] = struct{}{}
+			stat := d.groupTraffic[tag]
+			stat.Upload += upDelta
+			stat.Download += downDelta
+			stat.Connections++
+			d.groupTraffic[tag] = stat
+		}
+	}
+	d.connTraffic = next
 }
 
 // startGroupTest 对全部代理组触发 clash API 测速（仅运行中可用）。
@@ -529,7 +608,12 @@ func (d *Dashboard) groupLines() string {
 		if i > 0 {
 			b.WriteString("\n           ")
 		}
-		fmt.Fprintf(&b, "%-14s [%-7s] → %s", g.Name, g.Type, d.groupTarget(g))
+		traffic := ""
+		if d.status.State == core.StateRunning && d.apiOK {
+			stat := d.groupTraffic[g.Name]
+			traffic = fmt.Sprintf(" · ↑%s ↓%s · %d连接", humanBytes(stat.Upload), humanBytes(stat.Download), stat.Connections)
+		}
+		fmt.Fprintf(&b, "%-14s [%-7s] → %s%s", g.Name, g.Type, d.groupTarget(g), traffic)
 	}
 	return b.String()
 }
