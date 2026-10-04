@@ -220,8 +220,8 @@ func (d *Dashboard) Update(msg tea.Msg) (Page, tea.Cmd) {
 			msg.conns.UploadTotal, msg.conns.DownloadTotal, now, true
 		d.upTotal, d.downTotal, d.conns =
 			msg.conns.UploadTotal, msg.conns.DownloadTotal, msg.conns.Count
-		d.updateGroupTraffic(msg.startedAt, msg.traffic)
 		d.proxies = msg.proxies
+		d.updateGroupTraffic(msg.startedAt, msg.traffic, msg.proxies)
 		d.apiOK = true
 		return d, nil
 
@@ -396,7 +396,7 @@ func (d *Dashboard) refreshGroupTrafficNames() {
 	}
 }
 
-func (d *Dashboard) updateGroupTraffic(instance time.Time, conns []clashapi.TrafficConnection) {
+func (d *Dashboard) updateGroupTraffic(instance time.Time, conns []clashapi.TrafficConnection, proxies map[string]clashapi.ProxyInfo) {
 	if !d.groupTrafficInstance.Equal(instance) {
 		d.resetGroupTraffic()
 		d.groupTrafficInstance = instance
@@ -435,6 +435,13 @@ func (d *Dashboard) updateGroupTraffic(instance time.Time, conns []clashapi.Traf
 
 		for i, tag := range conn.Chains {
 			if _, ok := d.groupTrafficNames[tag]; !ok {
+				continue
+			}
+			// DB 可以先于运行核心发生改名/新增；此时旧核心里的节点 tag
+			// 可能恰好等于新组名。只有 /proxies 同时证明该 tag 是运行时组
+			// （组对象才带 all 字段）时才允许归属，避免未应用配置期间误记。
+			proxy, ok := proxies[tag]
+			if !ok || proxy.All == nil {
 				continue
 			}
 			// 正常 sing-box 出站链不会重复；仍对异常输入去重，但用小切片扫描，
