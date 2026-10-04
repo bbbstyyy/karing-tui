@@ -359,9 +359,11 @@ func (d *Dashboard) fetchSnapshot(client *clashapi.Client) tea.Cmd {
 }
 
 func (d *Dashboard) resetGroupTraffic() {
-	clear(d.groupTraffic)
-	clear(d.connTraffic)
-	clear(d.nextConnTraffic)
+	// 核心生命周期结束时释放连接基线 map 的峰值容量；同一实例内仍由
+	// updateGroupTraffic 交替复用两张 map，兼顾稳态零分配与长期驻留内存。
+	d.groupTraffic = nil
+	d.connTraffic = nil
+	d.nextConnTraffic = nil
 	d.groupTrafficInstance = time.Time{}
 }
 
