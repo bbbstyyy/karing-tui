@@ -70,10 +70,13 @@ type Dashboard struct {
 	havePrev  bool
 	proxies   map[string]clashapi.ProxyInfo
 
-	// 按代理组累计流量。连接的 upload/download 是连接生命周期累计值，
-	// 因此这里保存上一采样值并按增量归属，连接关闭后累计值仍然保留。
+	// 按代理组做采样累计。Clash API 只暴露当前活跃连接，因此完全发生在两次
+	// 采样之间的短连接无法归属；UI 明确标为“采样”，避免把它误解为精确账单。
+	// 热路径复用 map，避免按秒轮询时产生与连接数成正比的临时 map 分配。
 	groupTraffic         map[string]groupTrafficStat
+	groupTrafficNames    map[string]struct{}
 	connTraffic          map[string]connTrafficSample
+	nextConnTraffic      map[string]connTrafficSample
 	groupTrafficInstance time.Time
 
 	fetching       bool
@@ -328,6 +331,7 @@ func (d *Dashboard) reloadModel() {
 	}
 	if groups, err := d.app.DB.ListProxyGroups(); err == nil {
 		d.groups = groups
+		d.refreshGroupTrafficNames()
 	}
 	if nodes, err := d.app.DB.ListNodes(0); err == nil {
 		d.nodes = make(map[int64]*config.Node, len(nodes))
@@ -355,16 +359,36 @@ func (d *Dashboard) fetchSnapshot(client *clashapi.Client) tea.Cmd {
 }
 
 func (d *Dashboard) resetGroupTraffic() {
-	d.groupTraffic = nil
-	d.connTraffic = nil
+	clear(d.groupTraffic)
+	clear(d.connTraffic)
+	clear(d.nextConnTraffic)
 	d.groupTrafficInstance = time.Time{}
+}
+
+// refreshGroupTrafficNames 重建运行时代理组名索引，并清掉已删除/改名组的陈旧统计。
+func (d *Dashboard) refreshGroupTrafficNames() {
+	if d.groupTrafficNames == nil {
+		d.groupTrafficNames = make(map[string]struct{}, len(d.groups))
+	} else {
+		clear(d.groupTrafficNames)
+	}
+	for _, g := range d.groups {
+		d.groupTrafficNames[g.Name] = struct{}{}
+	}
+	for name := range d.groupTraffic {
+		if _, ok := d.groupTrafficNames[name]; !ok {
+			delete(d.groupTraffic, name)
+		}
+	}
 }
 
 func (d *Dashboard) updateGroupTraffic(instance time.Time, conns []clashapi.TrafficConnection) {
 	if !d.groupTrafficInstance.Equal(instance) {
-		d.groupTraffic = make(map[string]groupTrafficStat, len(d.groups))
-		d.connTraffic = make(map[string]connTrafficSample, len(conns))
+		d.resetGroupTraffic()
 		d.groupTrafficInstance = instance
+	}
+	if d.groupTrafficNames == nil {
+		d.refreshGroupTrafficNames()
 	}
 	if d.groupTraffic == nil {
 		d.groupTraffic = make(map[string]groupTrafficStat, len(d.groups))
@@ -372,16 +396,18 @@ func (d *Dashboard) updateGroupTraffic(instance time.Time, conns []clashapi.Traf
 	if d.connTraffic == nil {
 		d.connTraffic = make(map[string]connTrafficSample, len(conns))
 	}
+	if d.nextConnTraffic == nil {
+		d.nextConnTraffic = make(map[string]connTrafficSample, len(conns))
+	} else {
+		clear(d.nextConnTraffic)
+	}
 
-	groupNames := make(map[string]struct{}, len(d.groups))
 	for _, g := range d.groups {
-		groupNames[g.Name] = struct{}{}
 		stat := d.groupTraffic[g.Name]
 		stat.Connections = 0
 		d.groupTraffic[g.Name] = stat
 	}
 
-	next := make(map[string]connTrafficSample, len(conns))
 	for _, conn := range conns {
 		prev, seen := d.connTraffic[conn.ID]
 		upDelta, downDelta := conn.Upload, conn.Download
@@ -391,17 +417,24 @@ func (d *Dashboard) updateGroupTraffic(instance time.Time, conns []clashapi.Traf
 		if seen && conn.Download >= prev.Download {
 			downDelta = conn.Download - prev.Download
 		}
-		next[conn.ID] = connTrafficSample{Upload: conn.Upload, Download: conn.Download}
+		d.nextConnTraffic[conn.ID] = connTrafficSample{Upload: conn.Upload, Download: conn.Download}
 
-		counted := make(map[string]struct{}, len(conn.Chains))
-		for _, tag := range conn.Chains {
-			if _, ok := groupNames[tag]; !ok {
+		for i, tag := range conn.Chains {
+			if _, ok := d.groupTrafficNames[tag]; !ok {
 				continue
 			}
-			if _, duplicate := counted[tag]; duplicate {
+			// 正常 sing-box 出站链不会重复；仍对异常输入去重，但用小切片扫描，
+			// 避免为每条连接分配一个临时 map。
+			duplicate := false
+			for _, previousTag := range conn.Chains[:i] {
+				if previousTag == tag {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
 				continue
 			}
-			counted[tag] = struct{}{}
 			stat := d.groupTraffic[tag]
 			stat.Upload += upDelta
 			stat.Download += downDelta
@@ -409,7 +442,7 @@ func (d *Dashboard) updateGroupTraffic(instance time.Time, conns []clashapi.Traf
 			d.groupTraffic[tag] = stat
 		}
 	}
-	d.connTraffic = next
+	d.connTraffic, d.nextConnTraffic = d.nextConnTraffic, d.connTraffic
 }
 
 // startGroupTest 对全部代理组触发 clash API 测速（仅运行中可用）。
@@ -611,7 +644,7 @@ func (d *Dashboard) groupLines() string {
 		traffic := ""
 		if d.status.State == core.StateRunning && d.apiOK {
 			stat := d.groupTraffic[g.Name]
-			traffic = fmt.Sprintf(" · ↑%s ↓%s · %d连接", humanBytes(stat.Upload), humanBytes(stat.Download), stat.Connections)
+			traffic = fmt.Sprintf(" · 采样 ↑%s ↓%s · %d连接", humanBytes(stat.Upload), humanBytes(stat.Download), stat.Connections)
 		}
 		fmt.Fprintf(&b, "%-14s [%-7s] → %s%s", g.Name, g.Type, d.groupTarget(g), traffic)
 	}
