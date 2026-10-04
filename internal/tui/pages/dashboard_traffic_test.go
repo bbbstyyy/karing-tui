@@ -9,7 +9,6 @@ import (
 	"github.com/bbbstyyy/karing-tui/internal/config"
 )
 
-
 func trafficProxyGroups(names ...string) map[string]clashapi.ProxyInfo {
 	out := make(map[string]clashapi.ProxyInfo, len(names))
 	for _, name := range names {
